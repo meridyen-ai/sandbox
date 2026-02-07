@@ -180,6 +180,23 @@ data_sharing:
   max_visualization_data_points: 10000
 
 # -----------------------------------------------------------------------------
+# Authentication Configuration
+# -----------------------------------------------------------------------------
+authentication:
+  # AI_Assistants_MVP database connection for API key validation
+  # This database contains the api_keys table for authentication
+  # Use environment variable: SANDBOX_AUTHENTICATION__MVP_DATABASE_URL
+  mvp_api_url: "http://localhost:8000"
+  api_timeout: 5.0
+
+
+  # Enable API key authentication (recommended for production)
+  enable_api_key_auth: true
+
+  # Allow JWT authentication (legacy, for platform communication)
+  allow_jwt_auth: true
+
+# -----------------------------------------------------------------------------
 # Platform Connection (Hybrid Mode)
 # -----------------------------------------------------------------------------
 platform:

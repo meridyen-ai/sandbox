@@ -1,10 +1,7 @@
 import axios from 'axios'
-import type { Connection, ConnectionConfig, SchemaData, TableSampleData } from '../types'
+import type { Connection, ConnectionConfig, SchemaData, TableSampleData, HandlerInfo } from '../types'
 
 const API_BASE_URL = '/api/v1'
-
-// For now, using a demo token. In production, this should come from authentication
-const DEMO_TOKEN = 'demo-token'
 
 const api = axios.create({
   baseURL: API_BASE_URL,
@@ -13,14 +10,35 @@ const api = axios.create({
   },
 })
 
-// Add authorization header to all requests
+// Add API key header to all requests
 api.interceptors.request.use((config) => {
-  const token = localStorage.getItem('sandbox_token') || DEMO_TOKEN
-  if (token) {
-    config.headers.Authorization = `Bearer ${token}`
+  const apiKey = localStorage.getItem('sandbox_api_key')
+  if (apiKey) {
+    config.headers['X-API-Key'] = apiKey
   }
   return config
 })
+
+// Handle authentication errors
+api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error.response?.status === 401) {
+      // Clear invalid API key and redirect to login
+      localStorage.removeItem('sandbox_api_key')
+      window.location.href = '/login'
+    }
+    return Promise.reject(error)
+  }
+)
+
+export const handlersApi = {
+  // List all available database handlers
+  list: async (): Promise<HandlerInfo[]> => {
+    const response = await api.get('/handlers')
+    return response.data.handlers
+  },
+}
 
 export const connectionsApi = {
   // List all connections

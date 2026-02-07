@@ -8,7 +8,7 @@ version = "1.0.0"
 description = "Secure execution sandbox for Meridyen.ai platform"
 readme = "README.md"
 requires-python = ">=3.11"
-license = "Proprietary"
+license = { text = "Proprietary" }
 authors = [
     { name = "Meridyen.ai", email = "engineering@meridyen.ai" }
 ]

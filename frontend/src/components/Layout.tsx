@@ -1,8 +1,16 @@
-import { Outlet, Link, useLocation } from 'react-router-dom'
-import { Database, Settings } from 'lucide-react'
+import { Outlet, Link, useLocation, useNavigate } from 'react-router-dom'
+import { Database, Settings, LogOut, Key } from 'lucide-react'
+import { useAuth } from '../contexts/AuthContext'
 
 export function Layout() {
   const location = useLocation()
+  const navigate = useNavigate()
+  const { logout, apiKey } = useAuth()
+
+  const handleLogout = () => {
+    logout()
+    navigate('/login')
+  }
 
   return (
     <div className="min-h-screen flex flex-col">
@@ -29,8 +37,21 @@ export function Layout() {
               </nav>
             </div>
             <div className="flex items-center space-x-4">
-              <button className="p-2 rounded-md text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700">
-                <Settings className="w-5 h-5" />
+              {/* API Key Indicator */}
+              <div className="hidden md:flex items-center space-x-2 px-3 py-1 bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded-lg">
+                <Key className="w-4 h-4 text-green-600 dark:text-green-400" />
+                <span className="text-xs font-medium text-green-700 dark:text-green-300">
+                  {apiKey?.substring(0, 10)}...
+                </span>
+              </div>
+
+              <button
+                onClick={handleLogout}
+                className="flex items-center space-x-2 px-3 py-2 rounded-md text-sm font-medium text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700"
+                title="Logout"
+              >
+                <LogOut className="w-4 h-4" />
+                <span className="hidden sm:inline">Logout</span>
               </button>
             </div>
           </div>

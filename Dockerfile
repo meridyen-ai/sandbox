@@ -33,6 +33,7 @@ WORKDIR /build
 
 # Copy only requirements first for better caching
 COPY pyproject.toml ./
+COPY README.md ./
 COPY src/sandbox/__init__.py src/sandbox/
 
 # Create virtual environment and install dependencies

@@ -135,5 +135,10 @@ def main() -> None:
         sys.exit(1)
 
 
+
+# Export app for uvicorn --reload
+app = create_rest_app()
+
+
 if __name__ == "__main__":
     main()

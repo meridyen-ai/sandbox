@@ -70,18 +70,7 @@ class HandlerInfo:
             "description": self.description,
             "icon": self.icon,
             "available": self.available,
-            "connection_args": [
-                {
-                    "name": arg.name,
-                    "type": arg.type,
-                    "label": arg.label,
-                    "description": arg.description,
-                    "required": arg.required,
-                    "secret": arg.secret,
-                    "default": arg.default,
-                }
-                for arg in (self.connection_args or [])
-            ],
+            "connection_args": [arg.to_dict() for arg in (self.connection_args or [])],
         }
 
 

@@ -1,0 +1,94 @@
+# =============================================================================
+# Docker Compose - Development Override
+# =============================================================================
+# Development configuration with hot reloading for both backend and frontend
+#
+# Usage:
+#   docker compose -f docker-compose.hybrid.yaml -f docker-compose.dev.yaml up
+#
+# Or simply:
+#   make dev-full
+
+services:
+  # ---------------------------------------------------------------------------
+  # Backend Sandbox with Hot Reload
+  # ---------------------------------------------------------------------------
+  sandbox:
+    build:
+      target: development
+      context: .
+    container_name: meridyen-sandbox-dev
+
+    # Override command to use uvicorn with --reload
+    command: >
+      sh -c "
+        cd /app/src &&
+        uvicorn sandbox.main:app
+          --host 0.0.0.0
+          --port 8080
+          --reload
+          --reload-dir /app/src/sandbox
+          --log-level debug
+      "
+
+    environment:
+      - SANDBOX_ENVIRONMENT=development
+      - SANDBOX_DEBUG=true
+      - PYTHONUNBUFFERED=1
+      # Skip cloud registration in development (use airgapped mode)
+      - SANDBOX_EXECUTION_MODE=airgapped
+      # Disable TLS for development
+      - SANDBOX_PLATFORM__MTLS_ENABLED=false
+      # Authentication configuration
+      - SANDBOX_AUTHENTICATION__MVP_API_URL=http://host.docker.internal:18000
+      - SANDBOX_AUTHENTICATION__API_TIMEOUT=5.0
+      - SANDBOX_AUTHENTICATION__ENABLE_API_KEY_AUTH=true
+
+    # Mount source code for hot reload
+    volumes:
+      - ./src:/app/src:rw
+      - ./config:/app/config:ro
+      - ./tests:/app/tests:ro
+      # Exclude Python cache directories
+      - /app/src/sandbox/__pycache__
+
+    # Development doesn't need resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: "4G"
+
+  # ---------------------------------------------------------------------------
+  # Frontend with Vite Hot Module Replacement (HMR)
+  # ---------------------------------------------------------------------------
+  frontend:
+    image: node:20-alpine
+    container_name: meridyen-sandbox-frontend
+    working_dir: /app
+
+    command: sh -c "npm install && npm run dev"
+
+    ports:
+      - "5175:5173"  # Vite dev server
+
+    environment:
+      - NODE_ENV=development
+      - VITE_API_URL=http://localhost:8081
+
+    volumes:
+      - ./frontend:/app:rw
+      - /app/node_modules  # Named volume for node_modules
+
+    networks:
+      - sandbox-network
+
+    depends_on:
+      - sandbox
+
+    stdin_open: true
+    tty: true
+
+volumes:
+  # Named volume for node_modules to persist across rebuilds
+  frontend_node_modules:

@@ -192,6 +192,18 @@ class PlatformConnectionConfig(BaseModel):
     ca_cert_path: str | None = Field(None, description="CA certificate path")
 
 
+class AuthenticationConfig(BaseModel):
+    """Configuration for sandbox authentication."""
+
+    mvp_api_url: str = Field(
+        "http://localhost:8000",
+        description="AI_Assistants_MVP API URL for key validation"
+    )
+    api_timeout: float = Field(5.0, description="API request timeout in seconds", ge=1.0, le=30.0)
+    enable_api_key_auth: bool = Field(True, description="Enable API key authentication")
+    allow_jwt_auth: bool = Field(True, description="Allow JWT authentication (legacy)")
+
+
 class LocalLLMConfig(BaseModel):
     """Configuration for local LLM (air-gapped mode)."""
 
@@ -245,6 +257,7 @@ class SandboxConfig(BaseSettings):
     resource_limits: ResourceLimitsConfig = Field(default_factory=ResourceLimitsConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     data_sharing: DataSharingConfig = Field(default_factory=DataSharingConfig)
+    authentication: AuthenticationConfig = Field(default_factory=AuthenticationConfig)
     platform: PlatformConnectionConfig = Field(default_factory=PlatformConnectionConfig)
     local_llm: LocalLLMConfig = Field(default_factory=LocalLLMConfig)
 

@@ -6,7 +6,8 @@
 
 import React, { useEffect, useState } from "react";
 import { Loader2, AlertCircle, Search, Database } from "lucide-react";
-import { listHandlers, HandlerInfo } from "../../utils/dataConnectorsApi";
+import { handlersApi } from "../../utils/api";
+import type { HandlerInfo } from "../../types";
 import { useTranslation } from "../../hooks/useTranslation";
 
 // Map handler names to icon file names in /icons/databases/
@@ -90,7 +91,7 @@ export const DataSourceSelector: React.FC<DataSourceSelectorProps> = ({
     setLoading(true);
     setError(null);
     try {
-      const data = await listHandlers();
+      const data = await handlersApi.list();
       setHandlers(data);
     } catch (err) {
       setError(err instanceof Error ? err.message : t("dataSources.failedToLoad") || "Failed to load data sources");

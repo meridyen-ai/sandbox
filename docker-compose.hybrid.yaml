@@ -23,7 +23,7 @@ services:
     restart: unless-stopped
 
     ports:
-      - "${SANDBOX_REST_PORT:-8080}:8080"
+      - "${SANDBOX_REST_PORT:-8081}:8080"
       - "${SANDBOX_GRPC_PORT:-50051}:50051"
       - "${SANDBOX_METRICS_PORT:-9090}:9090"
 
@@ -84,6 +84,8 @@ networks:
   sandbox-network:
     driver: bridge
   # Connect to your existing database network
+  # Set DATABASE_NETWORK_EXTERNAL=true if you want to use an existing external network
   client-database-network:
-    external: true
+    external: ${DATABASE_NETWORK_EXTERNAL:-false}
     name: ${DATABASE_NETWORK:-client-databases}
+    driver: bridge

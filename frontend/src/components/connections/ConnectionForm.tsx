@@ -14,18 +14,14 @@ import {
   Database,
   ChevronRight,
 } from "lucide-react";
-import {
-  HandlerInfo,
-  ConnectionArg,
-  createConnection,
-} from "../../utils/dataConnectorsApi";
+import { connectionsApi } from "../../utils/api";
+import type { HandlerInfo, ConnectionArg } from "../../types";
 import { useTranslation } from "../../hooks/useTranslation";
 
 interface ConnectionFormProps {
   handler: HandlerInfo;
-  workspaceId: number;
   onBack: () => void;
-  onSuccess?: (connectionId: number, connectionName: string) => void;
+  onSuccess?: (connectionId: string, connectionName: string) => void;
   existingConnectionName?: string;
 }
 
@@ -137,23 +133,32 @@ export const ConnectionForm: React.FC<ConnectionFormProps> = ({
     setError(null);
 
     try {
-      const result = await createConnection(workspaceId, {
-        handler_type: handler.name,
-        name: connectionName,
-        connection_args: buildConnectionArgs(),
-      });
+      // Build connection config from form values
+      const connectionArgs = buildConnectionArgs();
 
-      if (result.success && result.connection_id) {
+      const connectionConfig = {
+        name: connectionName,
+        db_type: handler.name,
+        host: connectionArgs.host as string || '',
+        port: parseInt(connectionArgs.port as string || '5432'),
+        database: connectionArgs.database as string || '',
+        username: connectionArgs.user as string || connectionArgs.username as string || '',
+        password: connectionArgs.password as string || '',
+        schema_name: connectionArgs.schema as string || connectionArgs.schema_name as string,
+        ssl_enabled: connectionArgs.ssl_enabled as boolean ?? true,
+      };
+
+      const result = await connectionsApi.create(connectionConfig);
+
+      if (result.id) {
         setTestResult({
           success: true,
           message: t("dataSources.connectionSuccess") || "Connection successful!",
         });
         // Delay success callback to show the success message
         setTimeout(() => {
-          onSuccess?.(result.connection_id!, connectionName);
+          onSuccess?.(result.id, connectionName);
         }, 1000);
-      } else if (!result.success) {
-        setError(result.message || t("dataSources.errors.connectFailed") || "Failed to connect");
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : t("dataSources.errors.saveFailed") || "Failed to save connection");

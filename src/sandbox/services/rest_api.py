@@ -116,33 +116,84 @@ class CapabilitiesResponse(BaseModel):
 
 async def verify_sandbox_token(
     authorization: str | None = Header(None, alias="Authorization"),
+    x_api_key: str | None = Header(None, alias="X-API-Key"),
 ) -> dict[str, Any]:
-    """Verify sandbox token from Authorization header."""
+    """
+    Verify sandbox authentication token.
+
+    Supports two authentication methods:
+    1. Sandbox API Key (sb_*) - Preferred method for user authentication
+       - Header: Authorization: Bearer sb_xxx OR X-API-Key: sb_xxx
+       - Validates against AI_Assistants_MVP database
+
+    2. JWT Token (legacy) - For platform-to-sandbox communication
+       - Header: Authorization: Bearer <jwt_token>
+       - Used for internal platform communication
+
+    Returns:
+        Dict with workspace_id, user_id, and other context
+    """
+    from sandbox.auth.sandbox_auth import get_authenticator
+
     config = get_config()
 
-    if not authorization:
-        raise AuthenticationError("Authorization header required")
+    # Try X-API-Key header first
+    api_key = x_api_key
 
-    if not authorization.startswith("Bearer "):
-        raise AuthenticationError("Invalid authorization format")
+    # Fall back to Authorization header
+    if not api_key and authorization:
+        if authorization.startswith("Bearer "):
+            api_key = authorization[7:]
+        else:
+            raise AuthenticationError("Invalid authorization format. Use 'Bearer <token>'")
 
-    token = authorization[7:]
+    if not api_key:
+        raise AuthenticationError("Authentication required. Provide X-API-Key or Authorization header")
 
+    # Check if it's a sandbox API key (sb_* prefix)
+    if api_key.startswith("sb_"):
+        authenticator = get_authenticator()
+        if not authenticator:
+            raise AuthenticationError("Sandbox authenticator not initialized")
+
+        workspace_context = await authenticator.verify_sandbox_key(api_key)
+        if not workspace_context:
+            raise AuthenticationError("Invalid or inactive sandbox API key")
+
+        # Return workspace context
+        return {
+            "auth_type": "sandbox_api_key",
+            "workspace_id": str(workspace_context["workspace_id"]),
+            "workspace_name": workspace_context["workspace_name"],
+            "user_id": str(workspace_context.get("user_id")) if workspace_context.get("user_id") else None,
+            "api_key_name": workspace_context["api_key_name"],
+            "permissions": workspace_context.get("permissions", {
+                "execute_sql": True,
+                "execute_python": True,
+                "generate_visualizations": True,
+            })
+        }
+
+    # Otherwise, try to decode as JWT (legacy method for platform communication)
     try:
-        # Decode JWT
-        # In production, use proper key management
         secret = config.platform.registration_token
         if secret:
             payload = jwt.decode(
-                token,
+                api_key,
                 secret.get_secret_value(),
                 algorithms=["HS256"],
                 audience="sandbox-executor",
             )
+            payload["auth_type"] = "jwt"
             return payload
         else:
             # Development mode - accept any token
-            return {"workspace_id": "dev", "permissions": {}}
+            logger.warning("Development mode: accepting token without verification")
+            return {
+                "auth_type": "dev",
+                "workspace_id": "dev",
+                "permissions": {}
+            }
 
     except jwt.ExpiredSignatureError:
         raise AuthenticationError("Token expired")
@@ -166,6 +217,20 @@ def create_rest_app() -> FastAPI:
         setup_logging()
         logger.info("rest_api_starting", port=config.server.rest_port)
 
+        # Initialize authenticator if API key auth is enabled
+        if config.authentication.enable_api_key_auth:
+            from sandbox.auth.sandbox_auth import initialize_authenticator
+            try:
+                initialize_authenticator(
+                    config.authentication.mvp_api_url,
+                    config.authentication.api_timeout
+                )
+                logger.info(f"Sandbox API key authentication initialized (MVP API: {config.authentication.mvp_api_url})")
+            except Exception as e:
+                logger.error(f"Failed to initialize authenticator: {e}")
+                if config.environment == "production":
+                    raise
+
         # Initialize executors
         app.state.sql_executor = SQLExecutor()
         app.state.python_executor = PythonExecutor()
@@ -177,6 +242,13 @@ def create_rest_app() -> FastAPI:
         # Shutdown
         logger.info("rest_api_stopping")
         await app.state.sql_executor.close()
+
+        # Close authenticator
+        if config.authentication.enable_api_key_auth:
+            from sandbox.auth.sandbox_auth import get_authenticator
+            authenticator = get_authenticator()
+            if authenticator:
+                await authenticator.close()
 
     app = FastAPI(
         title="Meridyen Sandbox API",
@@ -450,6 +522,25 @@ def register_routes(app: FastAPI) -> None:
             raise HTTPException(status_code=500, detail=str(e))
         finally:
             clear_context()
+
+    # ==========================================================================
+    # Handlers (Database Types)
+    # ==========================================================================
+
+    @app.get("/api/v1/handlers", tags=["Handlers"])
+    async def list_handlers() -> JSONResponse:
+        """
+        List all available database handlers.
+
+        Returns handler metadata including connection arguments for dynamic form generation.
+        """
+        from sandbox.services.db_handler_service import DBHandlerService
+
+        handlers = DBHandlerService.get_available_handlers()
+
+        return JSONResponse(content={
+            "handlers": [handler.to_dict() for handler in handlers]
+        })
 
     # ==========================================================================
     # Connection Management
