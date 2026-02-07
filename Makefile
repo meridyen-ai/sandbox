@@ -66,7 +66,7 @@ run:
 		echo "📝 Please edit config/sandbox.yaml with your settings"; \
 		exit 1; \
 	fi
-	docker-compose -f docker-compose.hybrid.yaml up -d
+	docker compose -f docker-compose.hybrid.yaml up -d
 	@echo "✅ Sandbox running in hybrid mode"
 	@echo "   REST API: http://localhost:8080"
 	@echo "   gRPC:     localhost:50051"
@@ -79,19 +79,19 @@ run-airgapped:
 		echo "📝 Please edit config/sandbox.yaml with your settings"; \
 		exit 1; \
 	fi
-	docker-compose -f docker-compose.airgapped.yaml up -d
+	docker compose -f docker-compose.airgapped.yaml up -d
 	@echo "✅ Sandbox running in air-gapped mode"
 
 stop:
-	docker-compose -f docker-compose.hybrid.yaml down 2>/dev/null || true
-	docker-compose -f docker-compose.airgapped.yaml down 2>/dev/null || true
+	docker compose -f docker-compose.hybrid.yaml down 2>/dev/null || true
+	docker compose -f docker-compose.airgapped.yaml down 2>/dev/null || true
 	@echo "✅ Sandbox stopped"
 
 restart: stop run
 
 logs:
-	docker-compose -f docker-compose.hybrid.yaml logs -f sandbox 2>/dev/null || \
-	docker-compose -f docker-compose.airgapped.yaml logs -f sandbox
+	docker compose -f docker-compose.hybrid.yaml logs -f sandbox 2>/dev/null || \
+	docker compose -f docker-compose.airgapped.yaml logs -f sandbox
 
 # =============================================================================
 # Development Commands
@@ -99,7 +99,7 @@ logs:
 
 dev:
 	@echo "Starting development environment..."
-	docker-compose -f docker-compose.hybrid.yaml -f docker-compose.dev.yaml up -d
+	docker compose -f docker-compose.hybrid.yaml -f docker-compose.dev.yaml up -d
 	@echo "✅ Development sandbox running"
 	@echo "   REST API: http://localhost:8080"
 	@echo "   Docs:     http://localhost:8080/docs"
@@ -136,8 +136,8 @@ proto:
 # =============================================================================
 
 clean:
-	docker-compose -f docker-compose.hybrid.yaml down -v 2>/dev/null || true
-	docker-compose -f docker-compose.airgapped.yaml down -v 2>/dev/null || true
+	docker compose -f docker-compose.hybrid.yaml down -v 2>/dev/null || true
+	docker compose -f docker-compose.airgapped.yaml down -v 2>/dev/null || true
 	rm -rf __pycache__ .pytest_cache .mypy_cache .ruff_cache
 	find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 	@echo "✅ Cleanup complete"
@@ -182,10 +182,17 @@ build-ui:
 
 dev-ui:
 	@echo "Starting UI development server..."
+	@echo "Make sure sandbox backend is running on http://localhost:8080"
 	cd frontend && npm run dev
+
+dev-backend:
+	@echo "Starting Python sandbox backend..."
+	@echo "Make sure you have Python dependencies installed (pip install -e .)"
+	cd src && python -m sandbox.main
 
 dev-full:
 	@echo "Starting sandbox backend and UI..."
+	@echo "NOTE: This requires docker compose. For Python dev backend, use 'make dev-backend' in one terminal and 'make dev-ui' in another."
 	@make -j2 dev dev-ui
 
 run-with-ui: build-ui
@@ -195,7 +202,7 @@ run-with-ui: build-ui
 		echo "📝 Please edit config/sandbox.yaml with your settings"; \
 		exit 1; \
 	fi
-	docker-compose -f docker-compose.hybrid.yaml up -d
+	docker compose -f docker-compose.hybrid.yaml up -d
 	@echo "✅ Sandbox running with UI"
 	@echo "   Web UI:   http://localhost:3000"
 	@echo "   REST API: http://localhost:8080"
