@@ -1,0 +1,253 @@
+# =============================================================================
+# Meridyen Sandbox Configuration
+# =============================================================================
+# Copy this file to sandbox.yaml and configure for your environment
+#
+# Environment variables can override any setting using the format:
+#   SANDBOX_SECTION__KEY=value
+# Example: SANDBOX_RESOURCE_LIMITS__MAX_MEMORY_MB=1024
+
+# -----------------------------------------------------------------------------
+# Basic Settings
+# -----------------------------------------------------------------------------
+environment: production  # development, staging, production
+execution_mode: hybrid   # cloud, hybrid, airgapped
+log_level: INFO          # DEBUG, INFO, WARNING, ERROR
+debug: false
+
+# -----------------------------------------------------------------------------
+# Server Configuration
+# -----------------------------------------------------------------------------
+server:
+  host: "0.0.0.0"
+  grpc_port: 50051
+  rest_port: 8080
+  metrics_port: 9090
+  workers: 4
+  max_concurrent_requests: 100
+
+# -----------------------------------------------------------------------------
+# Resource Limits
+# -----------------------------------------------------------------------------
+resource_limits:
+  # Memory limit for Python execution
+  max_memory_mb: 512
+
+  # Maximum CPU time for execution
+  max_cpu_seconds: 60
+
+  # Maximum output size
+  max_output_size_kb: 1024
+
+  # Maximum rows to return from SQL queries
+  max_rows: 100000
+
+  # Maximum concurrent queries per sandbox
+  max_concurrent_queries: 10
+
+  # Timeouts
+  query_timeout_seconds: 300
+  python_timeout_seconds: 60
+
+# -----------------------------------------------------------------------------
+# Security Configuration
+# -----------------------------------------------------------------------------
+security:
+  # Allowed Python imports (whitelist)
+  allowed_python_imports:
+    # Standard library
+    - json
+    - math
+    - datetime
+    - re
+    - collections
+    - itertools
+    - functools
+    - statistics
+    - decimal
+    - fractions
+    - random
+    - string
+    - textwrap
+
+    # Data processing
+    - pandas
+    - numpy
+    - scipy
+
+    # Machine learning
+    - sklearn
+
+    # Statistics
+    - statsmodels
+
+    # Visualization
+    - plotly
+
+  # Banned Python patterns (denylist)
+  banned_python_patterns:
+    - "exec("
+    - "eval("
+    - "compile("
+    - "__import__"
+    - "importlib"
+    - "open("
+    - "file("
+    - "os."
+    - "sys."
+    - "subprocess"
+    - "socket"
+    - "requests"
+    - "urllib"
+    - "httpx"
+    - "aiohttp"
+    - "pickle"
+    - "marshal"
+    - "shelve"
+    - "ctypes"
+    - "cffi"
+    - "multiprocessing"
+    - "threading"
+    - "globals("
+    - "locals("
+    - "vars("
+    - "__builtins__"
+    - "__class__"
+    - "__bases__"
+    - "__subclasses__"
+    - "__code__"
+    - "__globals__"
+
+  # Allowed SQL statements
+  allowed_sql_statements:
+    - SELECT
+    - WITH
+
+  # Banned SQL patterns
+  banned_sql_patterns:
+    - DROP
+    - DELETE
+    - TRUNCATE
+    - UPDATE
+    - INSERT
+    - ALTER
+    - CREATE
+    - GRANT
+    - REVOKE
+    - EXECUTE
+    - EXEC
+    - "xp_"
+    - "sp_"
+
+  # Sensitive column masking patterns
+  sensitive_column_patterns:
+    - "*password*"
+    - "*secret*"
+    - "*token*"
+    - "*key*"
+    - "*credential*"
+    - "*ssn*"
+    - "*social_security*"
+    - "*credit_card*"
+    - "*card_number*"
+    - "*cvv*"
+    - "*pin*"
+    - "*account_number*"
+
+  # Enable data masking
+  mask_sensitive_data: true
+
+  # Network isolation (block outbound)
+  enable_network_isolation: true
+
+# -----------------------------------------------------------------------------
+# Data Sharing Configuration
+# -----------------------------------------------------------------------------
+data_sharing:
+  # Maximum rows to send to Core Platform
+  max_rows_to_platform: 1000
+
+  # Force aggregation if more than N rows
+  force_aggregation_threshold: 100
+
+  # Allow raw data (vs only aggregated)
+  allow_raw_data: false
+
+  # Visualization mode: spec_only or with_data
+  visualization_mode: spec_only
+
+  # Maximum data points in visualization
+  max_visualization_data_points: 10000
+
+# -----------------------------------------------------------------------------
+# Platform Connection (Hybrid Mode)
+# -----------------------------------------------------------------------------
+platform:
+  # Core Platform API URL
+  platform_url: "https://api.meridyen.ai"
+
+  # Registration token (get from Meridyen dashboard)
+  # Use environment variable: SANDBOX_PLATFORM__REGISTRATION_TOKEN
+  registration_token: null
+
+  # Workspace ID
+  workspace_id: null
+
+  # Sandbox ID (auto-generated if not set)
+  sandbox_id: null
+
+  # Heartbeat interval
+  heartbeat_interval_seconds: 30
+
+  # Reconnection settings
+  reconnect_max_attempts: 5
+  reconnect_backoff_seconds: 5
+
+  # mTLS settings (for production)
+  mtls_enabled: false
+  client_cert_path: null
+  client_key_path: null
+  ca_cert_path: null
+
+# -----------------------------------------------------------------------------
+# Local LLM Configuration (Air-Gapped Mode)
+# -----------------------------------------------------------------------------
+local_llm:
+  # Enable local LLM
+  enabled: false
+
+  # Provider: ollama, vllm, transformers
+  provider: ollama
+
+  # Model name
+  model_name: "llama3:8b"
+
+  # Base URL for LLM API
+  base_url: "http://localhost:11434"
+
+  # API key (if required)
+  api_key: null
+
+  # Generation settings
+  max_tokens: 4096
+  temperature: 0.1
+
+# -----------------------------------------------------------------------------
+# Database Connections
+# -----------------------------------------------------------------------------
+# Configure your database connections here
+# Credentials should be provided via environment variables
+#
+# Example:
+# database_connections:
+#   - id: "prod_postgres"
+#     name: "Production PostgreSQL"
+#     db_type: postgresql
+#     host: "${DB_HOST}"
+#     port: 5432
+#     database: "${DB_NAME}"
+#     username: "${DB_USER}"
+#     password: "${DB_PASSWORD}"
+#     ssl_enabled: true
+
+database_connections: []

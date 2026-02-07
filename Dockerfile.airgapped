@@ -1,0 +1,102 @@
+# =============================================================================
+# Meridyen Sandbox - Air-Gapped Edition
+# =============================================================================
+# Includes local LLM support (Ollama) for fully on-premise deployment
+#
+# This image is larger due to LLM components but requires no external connectivity
+
+FROM python:3.12-slim AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    gcc \
+    g++ \
+    libpq-dev \
+    default-libmysqlclient-dev \
+    freetds-dev \
+    unixodbc-dev \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+COPY pyproject.toml ./
+COPY src/sandbox/__init__.py src/sandbox/
+
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Install with airgapped extras (includes transformers, torch)
+RUN pip install --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir ".[airgapped]"
+
+# -----------------------------------------------------------------------------
+# Production Runtime with Local LLM
+# -----------------------------------------------------------------------------
+FROM python:3.12-slim AS runtime
+
+LABEL org.opencontainers.image.title="Meridyen Sandbox (Air-Gapped)"
+LABEL org.opencontainers.image.description="Secure execution sandbox with local LLM support"
+LABEL org.opencontainers.image.vendor="Meridyen.ai"
+LABEL org.opencontainers.image.version="1.0.0"
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 \
+    default-mysql-client \
+    libct4 \
+    unixodbc \
+    procps \
+    curl \
+    ca-certificates \
+    # Additional for LLM
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Create non-root user
+ARG APP_UID=1000
+ARG APP_GID=1000
+
+RUN groupadd --gid ${APP_GID} sandbox && \
+    useradd --uid ${APP_UID} --gid sandbox --create-home --shell /bin/bash sandbox
+
+# Copy virtual environment
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+WORKDIR /app
+
+COPY --chown=sandbox:sandbox src/sandbox /app/sandbox
+COPY --chown=sandbox:sandbox config /app/config
+
+RUN mkdir -p /app/logs /app/data /app/models && \
+    chown -R sandbox:sandbox /app
+
+RUN chmod -R 555 /app/sandbox
+
+USER sandbox
+
+ENV PYTHONPATH=/app \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    # Sandbox config
+    SANDBOX_ENVIRONMENT=production \
+    SANDBOX_EXECUTION_MODE=airgapped \
+    SANDBOX_SERVER__HOST=0.0.0.0 \
+    SANDBOX_SERVER__REST_PORT=8080 \
+    SANDBOX_SERVER__GRPC_PORT=50051 \
+    # Local LLM config
+    SANDBOX_LOCAL_LLM__ENABLED=true \
+    SANDBOX_LOCAL_LLM__PROVIDER=ollama \
+    SANDBOX_LOCAL_LLM__BASE_URL=http://localhost:11434 \
+    # Transformers cache
+    TRANSFORMERS_CACHE=/app/models \
+    HF_HOME=/app/models
+
+EXPOSE 8080 50051 9090
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
+
+ENTRYPOINT ["python", "-m", "sandbox.main"]

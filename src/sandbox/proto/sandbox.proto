@@ -1,0 +1,435 @@
+// Sandbox Execution Service Protocol Buffer Definitions
+// Version: 1.0.0
+
+syntax = "proto3";
+
+package meridyen.sandbox.v1;
+
+option go_package = "github.com/meridyen/sandbox/proto/v1;sandboxv1";
+option java_package = "ai.meridyen.sandbox.v1";
+option java_multiple_files = true;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/duration.proto";
+
+// =============================================================================
+// Main Sandbox Execution Service
+// =============================================================================
+
+service SandboxExecutionService {
+  // Execute SQL query in sandbox
+  rpc ExecuteSQL(SQLExecutionRequest) returns (stream ExecutionResponse);
+
+  // Execute Python code in sandbox
+  rpc ExecutePython(PythonExecutionRequest) returns (stream ExecutionResponse);
+
+  // Create visualization from data
+  rpc CreateVisualization(VisualizationRequest) returns (VisualizationResponse);
+
+  // Health check
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+
+  // Get sandbox capabilities
+  rpc GetCapabilities(CapabilitiesRequest) returns (CapabilitiesResponse);
+}
+
+// =============================================================================
+// Sandbox Registration Service (Sandbox -> Core Platform)
+// =============================================================================
+
+service SandboxRegistrationService {
+  // Register sandbox with core platform
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+
+  // Send heartbeat to maintain registration
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  // Unregister sandbox
+  rpc Unregister(UnregisterRequest) returns (UnregisterResponse);
+}
+
+// =============================================================================
+// LLM Proxy Service (Sandbox -> Core Platform, for hybrid mode)
+// =============================================================================
+
+service LLMProxyService {
+  // Request LLM inference from core platform
+  rpc Inference(LLMInferenceRequest) returns (stream LLMInferenceResponse);
+
+  // Generate code (SQL or Python)
+  rpc GenerateCode(CodeGenerationRequest) returns (CodeGenerationResponse);
+}
+
+// =============================================================================
+// Common Types
+// =============================================================================
+
+message ExecutionContext {
+  string request_id = 1;
+  string workspace_id = 2;
+  string connection_id = 3;
+  string user_id = 4;
+  string trace_id = 5;
+  string span_id = 6;
+
+  // Resource limits (override defaults)
+  optional int32 max_rows = 10;
+  optional int32 timeout_seconds = 11;
+  optional int32 max_memory_mb = 12;
+  optional int32 max_output_size_kb = 13;
+}
+
+enum ExecutionStatus {
+  EXECUTION_STATUS_UNSPECIFIED = 0;
+  EXECUTION_STATUS_PENDING = 1;
+  EXECUTION_STATUS_RUNNING = 2;
+  EXECUTION_STATUS_SUCCESS = 3;
+  EXECUTION_STATUS_ERROR = 4;
+  EXECUTION_STATUS_TIMEOUT = 5;
+  EXECUTION_STATUS_CANCELLED = 6;
+  EXECUTION_STATUS_RESOURCE_LIMIT = 7;
+}
+
+message ExecutionMetrics {
+  double duration_ms = 1;
+  int64 rows_processed = 2;
+  int64 rows_returned = 3;
+  double memory_used_mb = 4;
+  double cpu_time_seconds = 5;
+}
+
+message ExecutionError {
+  string code = 1;
+  string message = 2;
+  map<string, string> details = 3;
+}
+
+// =============================================================================
+// SQL Execution
+// =============================================================================
+
+message SQLExecutionRequest {
+  ExecutionContext context = 1;
+  string query = 2;
+  map<string, google.protobuf.Value> parameters = 3;
+
+  // Options
+  ResultFormat result_format = 10;
+  bool include_column_metadata = 11;
+  bool stream_results = 12;
+}
+
+enum ResultFormat {
+  RESULT_FORMAT_UNSPECIFIED = 0;
+  RESULT_FORMAT_JSON = 1;
+  RESULT_FORMAT_ARROW = 2;
+  RESULT_FORMAT_CSV = 3;
+}
+
+message ColumnMetadata {
+  string name = 1;
+  string data_type = 2;
+  bool is_nullable = 3;
+  bool is_masked = 4;
+}
+
+message SQLResult {
+  repeated ColumnMetadata columns = 1;
+  repeated google.protobuf.Struct rows = 2;
+  int64 row_count = 3;
+  optional int64 total_rows_available = 4;
+}
+
+// =============================================================================
+// Python Execution
+// =============================================================================
+
+message PythonExecutionRequest {
+  ExecutionContext context = 1;
+  string code = 2;
+
+  // Input data (available as DATA_JSON and INPUT_DATA in code)
+  google.protobuf.Struct input_data = 3;
+
+  // Additional variables to inject
+  map<string, google.protobuf.Value> variables = 4;
+
+  // Allowed packages (override defaults)
+  repeated string allowed_packages = 10;
+}
+
+message PythonResult {
+  string stdout = 1;
+  string stderr = 2;
+  google.protobuf.Struct result_data = 3;
+  map<string, google.protobuf.Value> variables = 4;
+}
+
+// =============================================================================
+// Execution Response (Unified streaming response)
+// =============================================================================
+
+message ExecutionResponse {
+  string request_id = 1;
+  ExecutionStatus status = 2;
+
+  oneof result {
+    SQLResult sql_result = 10;
+    PythonResult python_result = 11;
+    StreamChunk stream_chunk = 12;
+    ExecutionError error = 13;
+  }
+
+  ExecutionMetrics metrics = 20;
+  google.protobuf.Timestamp timestamp = 21;
+}
+
+message StreamChunk {
+  int32 chunk_index = 1;
+  bytes data = 2;
+  bool is_final = 3;
+}
+
+// =============================================================================
+// Visualization
+// =============================================================================
+
+message VisualizationRequest {
+  ExecutionContext context = 1;
+  string instruction = 2;
+  google.protobuf.Struct data = 3;
+
+  // Optional: Result from previous SQL/Python execution
+  string data_reference = 4;
+
+  // Visualization options
+  VisualizationType chart_type = 10;
+  int32 max_data_points = 11;
+}
+
+enum VisualizationType {
+  VISUALIZATION_TYPE_UNSPECIFIED = 0;
+  VISUALIZATION_TYPE_AUTO = 1;
+  VISUALIZATION_TYPE_LINE = 2;
+  VISUALIZATION_TYPE_BAR = 3;
+  VISUALIZATION_TYPE_PIE = 4;
+  VISUALIZATION_TYPE_SCATTER = 5;
+  VISUALIZATION_TYPE_HEATMAP = 6;
+  VISUALIZATION_TYPE_TABLE = 7;
+}
+
+message VisualizationResponse {
+  string request_id = 1;
+  ExecutionStatus status = 2;
+
+  // Plotly-compatible JSON spec
+  google.protobuf.Struct plotly_spec = 3;
+
+  // Insights extracted from the visualization
+  string insight = 4;
+  string explanation = 5;
+
+  ExecutionError error = 10;
+  ExecutionMetrics metrics = 11;
+}
+
+// =============================================================================
+// Health Check
+// =============================================================================
+
+message HealthCheckRequest {
+  bool include_details = 1;
+}
+
+message HealthCheckResponse {
+  HealthStatus status = 1;
+  string version = 2;
+  google.protobuf.Timestamp uptime_since = 3;
+
+  // Detailed health info
+  map<string, ComponentHealth> components = 10;
+}
+
+enum HealthStatus {
+  HEALTH_STATUS_UNSPECIFIED = 0;
+  HEALTH_STATUS_HEALTHY = 1;
+  HEALTH_STATUS_DEGRADED = 2;
+  HEALTH_STATUS_UNHEALTHY = 3;
+}
+
+message ComponentHealth {
+  HealthStatus status = 1;
+  string message = 2;
+  google.protobuf.Timestamp last_check = 3;
+}
+
+// =============================================================================
+// Capabilities
+// =============================================================================
+
+message CapabilitiesRequest {}
+
+message CapabilitiesResponse {
+  string sandbox_id = 1;
+  string version = 2;
+
+  // Supported databases
+  repeated string supported_databases = 10;
+
+  // Supported Python packages
+  repeated string supported_packages = 11;
+
+  // Resource limits
+  ResourceLimits resource_limits = 12;
+
+  // Features
+  bool supports_streaming = 20;
+  bool supports_visualization = 21;
+  bool has_local_llm = 22;
+  string local_llm_model = 23;
+}
+
+message ResourceLimits {
+  int32 max_memory_mb = 1;
+  int32 max_cpu_seconds = 2;
+  int32 max_output_size_kb = 3;
+  int32 max_rows = 4;
+  int32 max_concurrent_queries = 5;
+  int32 query_timeout_seconds = 6;
+  int32 python_timeout_seconds = 7;
+}
+
+// =============================================================================
+// Registration
+// =============================================================================
+
+message RegisterRequest {
+  string workspace_id = 1;
+  string registration_token = 2;
+
+  // Sandbox info
+  string sandbox_id = 3;
+  string version = 4;
+  string callback_url = 5;
+
+  // Capabilities
+  repeated string supported_databases = 10;
+  repeated string supported_packages = 11;
+  ResourceLimits resource_limits = 12;
+  bool has_local_llm = 13;
+  string local_llm_model = 14;
+
+  // Security
+  string public_key = 20;
+}
+
+message RegisterResponse {
+  bool success = 1;
+  string sandbox_id = 2;  // Assigned sandbox ID
+  string message = 3;
+
+  // Configuration from platform
+  google.protobuf.Struct platform_config = 10;
+  google.protobuf.Duration heartbeat_interval = 11;
+}
+
+message HeartbeatRequest {
+  string sandbox_id = 1;
+  HealthStatus status = 2;
+
+  // Current load metrics
+  int32 active_queries = 10;
+  double cpu_usage_percent = 11;
+  double memory_usage_percent = 12;
+}
+
+message HeartbeatResponse {
+  bool acknowledged = 1;
+
+  // Commands from platform
+  repeated SandboxCommand commands = 10;
+}
+
+message SandboxCommand {
+  string command_id = 1;
+  SandboxCommandType type = 2;
+  google.protobuf.Struct payload = 3;
+}
+
+enum SandboxCommandType {
+  SANDBOX_COMMAND_TYPE_UNSPECIFIED = 0;
+  SANDBOX_COMMAND_TYPE_RELOAD_CONFIG = 1;
+  SANDBOX_COMMAND_TYPE_CLEAR_CACHE = 2;
+  SANDBOX_COMMAND_TYPE_SHUTDOWN = 3;
+}
+
+message UnregisterRequest {
+  string sandbox_id = 1;
+  string reason = 2;
+}
+
+message UnregisterResponse {
+  bool success = 1;
+}
+
+// =============================================================================
+// LLM Proxy (for hybrid mode)
+// =============================================================================
+
+message LLMInferenceRequest {
+  string request_id = 1;
+  string workspace_id = 2;
+
+  // Messages
+  repeated LLMMessage messages = 3;
+
+  // Model settings
+  string model = 10;
+  double temperature = 11;
+  int32 max_tokens = 12;
+}
+
+message LLMMessage {
+  string role = 1;  // system, user, assistant
+  string content = 2;
+}
+
+message LLMInferenceResponse {
+  string request_id = 1;
+
+  oneof response {
+    string content = 2;
+    StreamChunk chunk = 3;
+    ExecutionError error = 4;
+  }
+
+  bool is_complete = 10;
+
+  // Usage metrics
+  int32 prompt_tokens = 20;
+  int32 completion_tokens = 21;
+}
+
+message CodeGenerationRequest {
+  string request_id = 1;
+  string workspace_id = 2;
+
+  CodeGenerationType code_type = 3;
+  string user_query = 4;
+  string schema_context = 5;
+  repeated LLMMessage conversation_history = 6;
+}
+
+enum CodeGenerationType {
+  CODE_GENERATION_TYPE_UNSPECIFIED = 0;
+  CODE_GENERATION_TYPE_SQL = 1;
+  CODE_GENERATION_TYPE_PYTHON = 2;
+}
+
+message CodeGenerationResponse {
+  string request_id = 1;
+  string generated_code = 2;
+  string explanation = 3;
+  ExecutionError error = 4;
+}

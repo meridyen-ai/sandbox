@@ -1,0 +1,160 @@
+# =============================================================================
+# Docker Compose - Air-Gapped Mode
+# =============================================================================
+# Fully on-premise deployment with local LLM (Ollama)
+# No external network connectivity required
+#
+# Usage:
+#   1. Download Ollama models offline and place in ./models directory
+#   2. Configure sandbox.yaml
+#   3. docker-compose -f docker-compose.airgapped.yaml up -d
+
+name: meridyen-sandbox-airgapped
+
+services:
+  # ---------------------------------------------------------------------------
+  # Local LLM Service (Ollama)
+  # ---------------------------------------------------------------------------
+  ollama:
+    image: ollama/ollama:latest
+    container_name: meridyen-ollama
+    restart: unless-stopped
+
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+
+    volumes:
+      # Pre-downloaded models
+      - ./models:/root/.ollama
+      # GPU support (if available)
+      # - /dev/nvidia0:/dev/nvidia0
+
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+
+    networks:
+      - sandbox-internal
+
+    deploy:
+      resources:
+        limits:
+          cpus: "${OLLAMA_CPU_LIMIT:-4}"
+          memory: "${OLLAMA_MEMORY_LIMIT:-8G}"
+        reservations:
+          cpus: "1"
+          memory: "4G"
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # ---------------------------------------------------------------------------
+  # Sandbox Container
+  # ---------------------------------------------------------------------------
+  sandbox:
+    image: meridyen/sandbox-airgapped:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.airgapped
+    container_name: meridyen-sandbox
+    restart: unless-stopped
+    depends_on:
+      ollama:
+        condition: service_healthy
+
+    ports:
+      - "${SANDBOX_REST_PORT:-8080}:8080"
+      - "${SANDBOX_GRPC_PORT:-50051}:50051"
+      - "${SANDBOX_METRICS_PORT:-9090}:9090"
+
+    environment:
+      # Execution mode
+      - SANDBOX_EXECUTION_MODE=airgapped
+      - SANDBOX_ENVIRONMENT=${SANDBOX_ENVIRONMENT:-production}
+
+      # Local LLM configuration
+      - SANDBOX_LOCAL_LLM__ENABLED=true
+      - SANDBOX_LOCAL_LLM__PROVIDER=ollama
+      - SANDBOX_LOCAL_LLM__BASE_URL=http://ollama:11434
+      - SANDBOX_LOCAL_LLM__MODEL_NAME=${LLM_MODEL:-llama3:8b}
+
+      # Resource limits
+      - SANDBOX_RESOURCE_LIMITS__MAX_MEMORY_MB=${MAX_MEMORY_MB:-1024}
+      - SANDBOX_RESOURCE_LIMITS__MAX_CPU_SECONDS=${MAX_CPU_SECONDS:-120}
+      - SANDBOX_RESOURCE_LIMITS__MAX_ROWS=${MAX_ROWS:-100000}
+
+      # Security (no external network)
+      - SANDBOX_SECURITY__ENABLE_NETWORK_ISOLATION=true
+
+    volumes:
+      - ./config:/app/config:ro
+      - sandbox_logs:/app/logs
+      - ./certs:/app/certs:ro
+
+    networks:
+      - sandbox-internal
+      - client-database-network
+
+    # No internet access
+    dns: []
+
+    deploy:
+      resources:
+        limits:
+          cpus: "${SANDBOX_CPU_LIMIT:-2}"
+          memory: "${SANDBOX_MEMORY_LIMIT:-2G}"
+        reservations:
+          cpus: "0.5"
+          memory: "512M"
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ---------------------------------------------------------------------------
+  # Model Loader (One-time setup)
+  # ---------------------------------------------------------------------------
+  model-loader:
+    image: ollama/ollama:latest
+    container_name: meridyen-model-loader
+    depends_on:
+      ollama:
+        condition: service_healthy
+    volumes:
+      - ./models:/root/.ollama
+    environment:
+      - OLLAMA_HOST=ollama:11434
+    entrypoint: >
+      sh -c "
+        echo 'Checking if model is available...' &&
+        ollama pull ${LLM_MODEL:-llama3:8b} || echo 'Model already loaded or offline' &&
+        echo 'Model setup complete'
+      "
+    networks:
+      - sandbox-internal
+    profiles:
+      - setup
+
+volumes:
+  sandbox_logs:
+    driver: local
+
+networks:
+  sandbox-internal:
+    driver: bridge
+    internal: true  # No external access
+  client-database-network:
+    external: true
+    name: ${DATABASE_NETWORK:-client-databases}

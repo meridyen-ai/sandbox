@@ -1,0 +1,89 @@
+# =============================================================================
+# Docker Compose - Hybrid Mode
+# =============================================================================
+# Client-hosted sandbox that connects to Meridyen cloud for LLM services
+#
+# Usage:
+#   1. Copy config/sandbox.example.yaml to config/sandbox.yaml
+#   2. Edit sandbox.yaml with your settings
+#   3. docker-compose -f docker-compose.hybrid.yaml up -d
+
+name: meridyen-sandbox-hybrid
+
+services:
+  # ---------------------------------------------------------------------------
+  # Sandbox Container
+  # ---------------------------------------------------------------------------
+  sandbox:
+    image: meridyen/sandbox:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: meridyen-sandbox
+    restart: unless-stopped
+
+    ports:
+      - "${SANDBOX_REST_PORT:-8080}:8080"
+      - "${SANDBOX_GRPC_PORT:-50051}:50051"
+      - "${SANDBOX_METRICS_PORT:-9090}:9090"
+
+    environment:
+      # Execution mode
+      - SANDBOX_EXECUTION_MODE=hybrid
+      - SANDBOX_ENVIRONMENT=${SANDBOX_ENVIRONMENT:-production}
+
+      # Platform connection
+      - SANDBOX_PLATFORM__PLATFORM_URL=${PLATFORM_URL:-https://api.meridyen.ai}
+      - SANDBOX_PLATFORM__WORKSPACE_ID=${WORKSPACE_ID}
+      - SANDBOX_PLATFORM__REGISTRATION_TOKEN=${REGISTRATION_TOKEN}
+
+      # Resource limits
+      - SANDBOX_RESOURCE_LIMITS__MAX_MEMORY_MB=${MAX_MEMORY_MB:-512}
+      - SANDBOX_RESOURCE_LIMITS__MAX_CPU_SECONDS=${MAX_CPU_SECONDS:-60}
+      - SANDBOX_RESOURCE_LIMITS__MAX_ROWS=${MAX_ROWS:-100000}
+
+    volumes:
+      # Configuration
+      - ./config:/app/config:ro
+      # Logs (optional)
+      - sandbox_logs:/app/logs
+      # SSL certificates (if using mTLS)
+      - ./certs:/app/certs:ro
+
+    networks:
+      - sandbox-network
+      - client-database-network
+
+    deploy:
+      resources:
+        limits:
+          cpus: "${SANDBOX_CPU_LIMIT:-2}"
+          memory: "${SANDBOX_MEMORY_LIMIT:-2G}"
+        reservations:
+          cpus: "0.5"
+          memory: "512M"
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  sandbox_logs:
+    driver: local
+
+networks:
+  sandbox-network:
+    driver: bridge
+  # Connect to your existing database network
+  client-database-network:
+    external: true
+    name: ${DATABASE_NETWORK:-client-databases}
