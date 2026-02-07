@@ -49,3 +49,34 @@ Thumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Frontend / Node.js
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/build/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Frontend environment
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Frontend build/cache
+.vite/
+.turbo/
+.next/
+out/
+.nuxt/
+.cache/
+.parcel-cache/
+.vercel/
