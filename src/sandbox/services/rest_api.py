@@ -472,9 +472,108 @@ def register_routes(app: FastAPI) -> None:
                 "port": conn.port,
                 "database": conn.database,
                 "schema": conn.schema_name,
+                "is_default": getattr(conn, 'is_default', False),
+                "created_at": getattr(conn, 'created_at', None),
+                "updated_at": getattr(conn, 'updated_at', None),
             })
 
         return JSONResponse(content={"connections": connections})
+
+    @app.post("/api/v1/connections", tags=["Connections"])
+    async def create_connection(
+        connection: ConnectionConfig,
+        token_data: dict = Depends(verify_sandbox_token),
+    ) -> JSONResponse:
+        """Create a new database connection."""
+        from sandbox.core.config import DatabaseConnectionConfig, DatabaseType, get_config
+        from pydantic import SecretStr
+        import uuid
+        from datetime import datetime, timezone
+
+        config = get_config()
+
+        # Generate ID if not provided
+        conn_id = connection.id or str(uuid.uuid4())
+
+        # Create connection config
+        new_conn = DatabaseConnectionConfig(
+            id=conn_id,
+            name=connection.name,
+            db_type=DatabaseType(connection.db_type),
+            host=connection.host,
+            port=connection.port,
+            database=connection.database,
+            username=connection.username,
+            password=SecretStr(connection.password),
+            schema_name=connection.schema_name,
+            ssl_enabled=connection.ssl_enabled,
+        )
+
+        # Add to config (in-memory for now, should persist to file/db)
+        config.database_connections.append(new_conn)
+
+        return JSONResponse(
+            status_code=201,
+            content={
+                "id": conn_id,
+                "name": connection.name,
+                "message": "Connection created successfully"
+            }
+        )
+
+    @app.put("/api/v1/connections/{connection_id}", tags=["Connections"])
+    async def update_connection(
+        connection_id: str,
+        connection: ConnectionConfig,
+        token_data: dict = Depends(verify_sandbox_token),
+    ) -> JSONResponse:
+        """Update an existing database connection."""
+        from pydantic import SecretStr
+        config = get_config()
+
+        # Find and update connection
+        for idx, conn in enumerate(config.database_connections):
+            if conn.id == connection_id:
+                from sandbox.core.config import DatabaseConnectionConfig, DatabaseType
+
+                updated_conn = DatabaseConnectionConfig(
+                    id=connection_id,
+                    name=connection.name,
+                    db_type=DatabaseType(connection.db_type),
+                    host=connection.host,
+                    port=connection.port,
+                    database=connection.database,
+                    username=connection.username,
+                    password=SecretStr(connection.password),
+                    schema_name=connection.schema_name,
+                    ssl_enabled=connection.ssl_enabled,
+                )
+                config.database_connections[idx] = updated_conn
+
+                return JSONResponse(content={
+                    "id": connection_id,
+                    "message": "Connection updated successfully"
+                })
+
+        raise HTTPException(status_code=404, detail="Connection not found")
+
+    @app.delete("/api/v1/connections/{connection_id}", tags=["Connections"])
+    async def delete_connection(
+        connection_id: str,
+        token_data: dict = Depends(verify_sandbox_token),
+    ) -> JSONResponse:
+        """Delete a database connection."""
+        config = get_config()
+
+        # Find and remove connection
+        for idx, conn in enumerate(config.database_connections):
+            if conn.id == connection_id:
+                config.database_connections.pop(idx)
+                return JSONResponse(content={
+                    "message": "Connection deleted successfully"
+                })
+
+        raise HTTPException(status_code=404, detail="Connection not found")
 
     @app.post("/api/v1/connections/test", tags=["Connections"])
     async def test_connection(
@@ -521,6 +620,168 @@ def register_routes(app: FastAPI) -> None:
                     "message": str(e),
                 }
             )
+
+    # ==========================================================================
+    # Schema Sync (for AI Assistants MVP integration)
+    # ==========================================================================
+
+    @app.get("/api/v1/schema/sync", tags=["Schema"])
+    async def sync_schema(
+        connection_id: str,
+        include_samples: bool = True,
+        sample_limit: int = 10,
+        token_data: dict = Depends(verify_sandbox_token),
+    ) -> JSONResponse:
+        """
+        Sync schema from database connection.
+
+        Returns schema with tables, columns, data types, and optional sample data.
+        Compatible with AI Assistants MVP schema format.
+        """
+        from sandbox.connectors.factory import get_connector
+        from sandbox.core.config import get_config
+
+        config = get_config()
+
+        # Find connection config
+        conn_config = None
+        for conn in config.database_connections:
+            if conn.id == connection_id:
+                conn_config = conn
+                break
+
+        if not conn_config:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Connection '{connection_id}' not found"
+            )
+
+        try:
+            # Get connector
+            connector = get_connector(conn_config.db_type, conn_config)
+
+            async with connector.get_connection() as conn:
+                # Get all tables
+                tables = await connector.get_tables(conn, schema=conn_config.schema_name)
+
+                schema_data = {
+                    "connection_id": connection_id,
+                    "connection_name": conn_config.name,
+                    "database": conn_config.database,
+                    "db_type": conn_config.db_type.value,
+                    "schema": conn_config.schema_name,
+                    "tables": []
+                }
+
+                # For each table, get columns and optionally sample data
+                for table_name in tables:
+                    columns_info = await connector.get_columns(
+                        conn,
+                        table_name,
+                        schema=conn_config.schema_name
+                    )
+
+                    table_data = {
+                        "name": table_name,
+                        "columns": columns_info,
+                        "sample_data": None
+                    }
+
+                    # Get sample data if requested
+                    if include_samples:
+                        try:
+                            sample_query = f'SELECT * FROM "{table_name}" LIMIT {sample_limit}'
+                            if conn_config.schema_name:
+                                sample_query = f'SELECT * FROM "{conn_config.schema_name}"."{table_name}" LIMIT {sample_limit}'
+
+                            result = await connector.execute(conn, sample_query)
+
+                            table_data["sample_data"] = {
+                                "columns": result.columns,
+                                "rows": [
+                                    {col: val for col, val in zip(result.columns, row)}
+                                    for row in result.rows
+                                ],
+                                "total_rows": result.row_count
+                            }
+                        except Exception as e:
+                            logger.warning(
+                                "failed_to_get_samples",
+                                table=table_name,
+                                error=str(e)
+                            )
+                            table_data["sample_data"] = None
+
+                    schema_data["tables"].append(table_data)
+
+                return JSONResponse(content={
+                    "status": "success",
+                    "data": schema_data
+                })
+
+        except Exception as e:
+            logger.error("schema_sync_error", connection_id=connection_id, error=str(e))
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.get("/api/v1/schema/table/{table_name}/samples", tags=["Schema"])
+    async def get_table_samples(
+        connection_id: str,
+        table_name: str,
+        limit: int = 10,
+        token_data: dict = Depends(verify_sandbox_token),
+    ) -> JSONResponse:
+        """
+        Get sample data from a specific table.
+
+        Compatible with AI Assistants MVP getTableDataSamples() format.
+        """
+        from sandbox.connectors.factory import get_connector
+        from sandbox.core.config import get_config
+
+        config = get_config()
+
+        # Find connection config
+        conn_config = None
+        for conn in config.database_connections:
+            if conn.id == connection_id:
+                conn_config = conn
+                break
+
+        if not conn_config:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Connection '{connection_id}' not found"
+            )
+
+        try:
+            connector = get_connector(conn_config.db_type, conn_config)
+
+            async with connector.get_connection() as conn:
+                # Build query
+                if conn_config.schema_name:
+                    query = f'SELECT * FROM "{conn_config.schema_name}"."{table_name}" LIMIT {limit}'
+                else:
+                    query = f'SELECT * FROM "{table_name}" LIMIT {limit}'
+
+                result = await connector.execute(conn, query)
+
+                return JSONResponse(content={
+                    "columns": result.columns,
+                    "rows": [
+                        {col: val for col, val in zip(result.columns, row)}
+                        for row in result.rows
+                    ],
+                    "total_rows": result.row_count
+                })
+
+        except Exception as e:
+            logger.error(
+                "get_table_samples_error",
+                connection_id=connection_id,
+                table=table_name,
+                error=str(e)
+            )
+            raise HTTPException(status_code=500, detail=str(e))
 
     # ==========================================================================
     # Metrics

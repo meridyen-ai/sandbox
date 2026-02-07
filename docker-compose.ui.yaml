@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  # Nginx to serve UI and proxy API requests
+  ui:
+    image: nginx:alpine
+    container_name: meridyen-sandbox-ui
+    ports:
+      - "3000:80"
+    volumes:
+      - ./frontend/dist:/usr/share/nginx/html
+      - ./nginx-ui.conf:/etc/nginx/conf.d/default.conf
+    depends_on:
+      - sandbox
+    networks:
+      - sandbox-network
+
+networks:
+  sandbox-network:
+    external: true

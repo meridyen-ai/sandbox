@@ -12,16 +12,20 @@ help:
 	@echo "Build Commands:"
 	@echo "  make build           - Build standard sandbox image"
 	@echo "  make build-airgapped - Build air-gapped sandbox image (with local LLM)"
+	@echo "  make build-ui        - Build frontend UI"
 	@echo "  make push            - Push images to Docker Hub"
 	@echo ""
 	@echo "Run Commands:"
 	@echo "  make run             - Run sandbox in hybrid mode"
 	@echo "  make run-airgapped   - Run sandbox in air-gapped mode"
+	@echo "  make run-with-ui     - Run sandbox with web UI"
 	@echo "  make stop            - Stop all sandbox containers"
 	@echo "  make logs            - View sandbox logs"
 	@echo ""
 	@echo "Development Commands:"
 	@echo "  make dev             - Run sandbox in development mode"
+	@echo "  make dev-ui          - Run UI in development mode"
+	@echo "  make dev-full        - Run both sandbox and UI in development"
 	@echo "  make test            - Run tests"
 	@echo "  make lint            - Run linter"
 	@echo "  make format          - Format code"
@@ -163,3 +167,37 @@ download-models:
 	@mkdir -p models
 	docker run --rm -v $(PWD)/models:/root/.ollama ollama/ollama pull llama3:8b
 	@echo "✅ Models downloaded to ./models"
+
+# =============================================================================
+# UI Commands
+# =============================================================================
+
+install-ui:
+	cd frontend && npm install
+	@echo "✅ UI dependencies installed"
+
+build-ui:
+	cd frontend && npm run build
+	@echo "✅ UI build complete"
+
+dev-ui:
+	@echo "Starting UI development server..."
+	cd frontend && npm run dev
+
+dev-full:
+	@echo "Starting sandbox backend and UI..."
+	@make -j2 dev dev-ui
+
+run-with-ui: build-ui
+	@if [ ! -f config/sandbox.yaml ]; then \
+		echo "⚠️  config/sandbox.yaml not found. Copying example..."; \
+		cp config/sandbox.example.yaml config/sandbox.yaml; \
+		echo "📝 Please edit config/sandbox.yaml with your settings"; \
+		exit 1; \
+	fi
+	docker-compose -f docker-compose.hybrid.yaml up -d
+	@echo "✅ Sandbox running with UI"
+	@echo "   Web UI:   http://localhost:3000"
+	@echo "   REST API: http://localhost:8080"
+	@echo "   gRPC:     localhost:50051"
+	@echo "   Metrics:  http://localhost:9090/metrics"
