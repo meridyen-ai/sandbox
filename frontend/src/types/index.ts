@@ -51,3 +51,37 @@ export interface SchemaData {
   schema?: string
   tables: Table[]
 }
+
+// HandlerInfo and ConnectionArg for dynamic forms
+export interface ConnectionArgOption {
+  value: string
+  label: string
+}
+
+export interface ConnectionArgDependsOn {
+  field: string
+  values: string[]
+}
+
+export interface ConnectionArg {
+  name: string
+  type: string  // 'string', 'integer', 'boolean', 'password', 'text', 'select'
+  description: string
+  required: boolean
+  label: string
+  secret?: boolean
+  default?: unknown
+  options?: ConnectionArgOption[]
+  depends_on?: ConnectionArgDependsOn
+}
+
+export interface HandlerInfo {
+  name: string
+  type: string
+  title: string
+  description: string
+  icon?: string
+  available: boolean
+  error?: string
+  connection_args: ConnectionArg[]
+}
