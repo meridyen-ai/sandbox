@@ -25,7 +25,7 @@ services:
     ports:
       - "${SANDBOX_REST_PORT:-8081}:8080"
       - "${SANDBOX_GRPC_PORT:-50051}:50051"
-      - "${SANDBOX_METRICS_PORT:-9090}:9090"
+      - "${SANDBOX_METRICS_PORT:-9091}:9090"
 
     environment:
       # Execution mode
