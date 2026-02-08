@@ -299,7 +299,7 @@ export function ArchitecturePage() {
                   <td className="p-4 font-bold bg-slate-100 text-slate-900">LLM Service</td>
                   <td className="p-4 text-slate-700">Meridyen-hosted</td>
                   <td className="p-4 text-slate-700">Meridyen-hosted</td>
-                  <td className="p-4 text-slate-700">Local (Ollama)</td>
+                  <td className="p-4 text-slate-700">Local LLM</td>
                 </tr>
                 <tr>
                   <td className="p-4 font-bold bg-slate-100 text-slate-900">Database Access</td>
