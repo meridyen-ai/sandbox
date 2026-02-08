@@ -3,6 +3,7 @@ import { useMutation } from '@tanstack/react-query'
 import { X } from 'lucide-react'
 import { connectionsApi } from '../../utils/api'
 import type { Connection, ConnectionConfig } from '../../types'
+import { useTranslation } from '../../hooks/useTranslation'
 
 interface ConnectionFormModalProps {
   connection: Connection | null
@@ -11,6 +12,7 @@ interface ConnectionFormModalProps {
 }
 
 export function ConnectionFormModal({ connection, onClose, onSuccess }: ConnectionFormModalProps) {
+  const { t } = useTranslation()
   const [formData, setFormData] = useState<ConnectionConfig>({
     id: connection?.id,
     name: connection?.name || '',
@@ -49,7 +51,7 @@ export function ConnectionFormModal({ connection, onClose, onSuccess }: Connecti
     onError: (error: any) => {
       setTestResult({
         success: false,
-        message: error.response?.data?.message || 'Connection test failed',
+        message: error.response?.data?.message || t('connections.testFailed'),
       })
     },
   })
@@ -86,7 +88,7 @@ export function ConnectionFormModal({ connection, onClose, onSuccess }: Connecti
           <div className="px-6 py-4 border-b border-gray-200 dark:border-gray-700">
             <div className="flex items-center justify-between">
               <h3 className="text-lg font-medium text-gray-900 dark:text-white">
-                {connection ? 'Edit Connection' : 'New Connection'}
+                {connection ? t('connections.editConnection') : t('connections.newConnection')}
               </h3>
               <button
                 onClick={onClose}
@@ -100,7 +102,7 @@ export function ConnectionFormModal({ connection, onClose, onSuccess }: Connecti
           <form onSubmit={handleSubmit} className="px-6 py-4 space-y-4">
             <div>
               <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">
-                Connection Name
+                {t('connections.connectionName')}
               </label>
               <input
                 type="text"
@@ -114,7 +116,7 @@ export function ConnectionFormModal({ connection, onClose, onSuccess }: Connecti
 
             <div>
               <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">
-                Database Type
+                {t('connections.databaseType')}
               </label>
               <select
                 name="db_type"
@@ -122,17 +124,17 @@ export function ConnectionFormModal({ connection, onClose, onSuccess }: Connecti
                 onChange={handleChange}
                 className="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 shadow-sm focus:border-blue-500 focus:ring-blue-500 dark:bg-gray-700 dark:text-white sm:text-sm"
               >
-                <option value="postgresql">PostgreSQL</option>
-                <option value="mysql">MySQL</option>
-                <option value="snowflake">Snowflake</option>
-                <option value="bigquery">BigQuery</option>
+                <option value="postgresql">{t('connections.postgresql')}</option>
+                <option value="mysql">{t('connections.mysql')}</option>
+                <option value="snowflake">{t('connections.snowflake')}</option>
+                <option value="bigquery">{t('connections.bigquery')}</option>
               </select>
             </div>
 
             <div className="grid grid-cols-2 gap-4">
               <div>
                 <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">
-                  Host
+                  {t('connections.host')}
                 </label>
                 <input
                   type="text"
@@ -145,7 +147,7 @@ export function ConnectionFormModal({ connection, onClose, onSuccess }: Connecti
               </div>
               <div>
                 <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">
-                  Port
+                  {t('connections.port')}
                 </label>
                 <input
                   type="number"
@@ -160,7 +162,7 @@ export function ConnectionFormModal({ connection, onClose, onSuccess }: Connecti
 
             <div>
               <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">
-                Database
+                {t('connections.database')}
               </label>
               <input
                 type="text"
@@ -174,7 +176,7 @@ export function ConnectionFormModal({ connection, onClose, onSuccess }: Connecti
 
             <div>
               <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">
-                Schema (optional)
+                {t('connections.schemaOptional')}
               </label>
               <input
                 type="text"
@@ -187,7 +189,7 @@ export function ConnectionFormModal({ connection, onClose, onSuccess }: Connecti
 
             <div>
               <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">
-                Username
+                {t('connections.username')}
               </label>
               <input
                 type="text"
@@ -201,7 +203,7 @@ export function ConnectionFormModal({ connection, onClose, onSuccess }: Connecti
 
             <div>
               <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">
-                Password
+                {t('connections.password')}
               </label>
               <input
                 type="password"
@@ -233,7 +235,7 @@ export function ConnectionFormModal({ connection, onClose, onSuccess }: Connecti
                 disabled={testMutation.isPending}
                 className="inline-flex justify-center px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded-md hover:bg-gray-50 dark:hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
               >
-                {testMutation.isPending ? 'Testing...' : 'Test Connection'}
+                {testMutation.isPending ? t('connections.testing') : t('connections.testConnection')}
               </button>
               <div className="space-x-2">
                 <button
@@ -241,7 +243,7 @@ export function ConnectionFormModal({ connection, onClose, onSuccess }: Connecti
                   onClick={onClose}
                   className="inline-flex justify-center px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded-md hover:bg-gray-50 dark:hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
                 >
-                  Cancel
+                  {t('common.cancel')}
                 </button>
                 <button
                   type="submit"
@@ -249,10 +251,10 @@ export function ConnectionFormModal({ connection, onClose, onSuccess }: Connecti
                   className="inline-flex justify-center px-4 py-2 text-sm font-medium text-white bg-blue-600 border border-transparent rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
                 >
                   {createMutation.isPending || updateMutation.isPending
-                    ? 'Saving...'
+                    ? t('common.saving')
                     : connection
-                    ? 'Update'
-                    : 'Create'}
+                    ? t('common.update')
+                    : t('common.create')}
                 </button>
               </div>
             </div>

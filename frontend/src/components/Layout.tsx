@@ -1,8 +1,10 @@
 import { Outlet, Link, useLocation, useNavigate } from 'react-router-dom'
-import { Database, Settings, LogOut, Key } from 'lucide-react'
+import { Database, LogOut, Key } from 'lucide-react'
 import { useAuth } from '../contexts/AuthContext'
+import { useTranslation } from '../hooks/useTranslation'
 
 export function Layout() {
+  const { t } = useTranslation()
   const location = useLocation()
   const navigate = useNavigate()
   const { logout, apiKey } = useAuth()
@@ -20,7 +22,7 @@ export function Layout() {
           <div className="flex justify-between items-center h-16">
             <div className="flex items-center space-x-8">
               <h1 className="text-xl font-bold text-gray-900 dark:text-white">
-                Meridyen Sandbox
+                {t('layout.appTitle')}
               </h1>
               <nav className="flex space-x-4">
                 <Link
@@ -32,7 +34,7 @@ export function Layout() {
                   }`}
                 >
                   <Database className="inline-block w-4 h-4 mr-1" />
-                  Connections
+                  {t('layout.connections')}
                 </Link>
               </nav>
             </div>
@@ -48,10 +50,10 @@ export function Layout() {
               <button
                 onClick={handleLogout}
                 className="flex items-center space-x-2 px-3 py-2 rounded-md text-sm font-medium text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700"
-                title="Logout"
+                title={t('layout.logout')}
               >
                 <LogOut className="w-4 h-4" />
-                <span className="hidden sm:inline">Logout</span>
+                <span className="hidden sm:inline">{t('layout.logout')}</span>
               </button>
             </div>
           </div>

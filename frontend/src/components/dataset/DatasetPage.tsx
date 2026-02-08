@@ -4,8 +4,10 @@ import { useQuery } from '@tanstack/react-query'
 import { ArrowLeft, RefreshCw, Table as TableIcon } from 'lucide-react'
 import { schemaApi } from '../../utils/api'
 import { TableView } from './TableView'
+import { useTranslation } from '../../hooks/useTranslation'
 
 export function DatasetPage() {
+  const { t } = useTranslation()
   const { connectionId } = useParams<{ connectionId: string }>()
   const navigate = useNavigate()
   const [selectedTable, setSelectedTable] = useState<string | null>(null)
@@ -23,7 +25,7 @@ export function DatasetPage() {
   if (isLoading) {
     return (
       <div className="flex items-center justify-center h-64">
-        <div className="text-gray-500 dark:text-gray-400">Loading schema...</div>
+        <div className="text-gray-500 dark:text-gray-400">{t('dataset.loadingSchema')}</div>
       </div>
     )
   }
@@ -32,7 +34,7 @@ export function DatasetPage() {
     return (
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
         <div className="text-center">
-          <p className="text-gray-500 dark:text-gray-400">Failed to load schema</p>
+          <p className="text-gray-500 dark:text-gray-400">{t('dataset.failedToLoad')}</p>
         </div>
       </div>
     )
@@ -50,7 +52,7 @@ export function DatasetPage() {
             className="flex items-center text-sm text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white mb-4"
           >
             <ArrowLeft className="w-4 h-4 mr-1" />
-            Back to Connections
+            {t('dataset.backToConnections')}
           </button>
           <div className="flex items-center justify-between">
             <h2 className="text-lg font-semibold text-gray-900 dark:text-white">
@@ -59,7 +61,7 @@ export function DatasetPage() {
             <button
               onClick={() => refetch()}
               className="p-1 hover:bg-gray-100 dark:hover:bg-gray-700 rounded"
-              title="Refresh schema"
+              title={t('dataset.refreshSchema')}
             >
               <RefreshCw className="w-4 h-4 text-gray-600 dark:text-gray-400" />
             </button>
@@ -69,7 +71,7 @@ export function DatasetPage() {
             {schema.schema && ` / ${schema.schema}`}
           </p>
           <p className="text-xs text-gray-500 dark:text-gray-400">
-            {schema.tables.length} tables
+            {schema.tables.length} {t('common.tables')}
           </p>
         </div>
 
@@ -108,10 +110,10 @@ export function DatasetPage() {
             <div className="text-center">
               <TableIcon className="mx-auto h-12 w-12 text-gray-400" />
               <h3 className="mt-2 text-sm font-medium text-gray-900 dark:text-white">
-                No table selected
+                {t('dataset.noTableSelected')}
               </h3>
               <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">
-                Select a table from the left to view its data
+                {t('dataset.selectTableHint')}
               </p>
             </div>
           </div>

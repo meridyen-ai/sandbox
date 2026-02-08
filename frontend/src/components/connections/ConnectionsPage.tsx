@@ -5,11 +5,13 @@ import { Plus, Database, Trash2, Eye, ArrowLeft } from 'lucide-react'
 import { connectionsApi } from '../../utils/api'
 import { DataSourceSelector } from './DataSourceSelector'
 import { ConnectionForm } from './ConnectionForm'
-import type { Connection, HandlerInfo } from '../../types'
+import type { HandlerInfo } from '../../types'
+import { useTranslation } from '../../hooks/useTranslation'
 
 type ViewState = 'list' | 'select-type' | 'configure'
 
 export function ConnectionsPage() {
+  const { t } = useTranslation()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const [viewState, setViewState] = useState<ViewState>('list')
@@ -28,7 +30,7 @@ export function ConnectionsPage() {
   })
 
   const handleDelete = async (id: string) => {
-    if (confirm('Are you sure you want to delete this connection?')) {
+    if (confirm(t('connections.deleteConfirm'))) {
       await deleteMutation.mutateAsync(id)
     }
   }
@@ -77,7 +79,7 @@ export function ConnectionsPage() {
   if (isLoading) {
     return (
       <div className="flex items-center justify-center h-64">
-        <div className="text-gray-500 dark:text-gray-400">Loading connections...</div>
+        <div className="text-gray-500 dark:text-gray-400">{t('connections.loading')}</div>
       </div>
     )
   }
@@ -92,11 +94,11 @@ export function ConnectionsPage() {
             className="inline-flex items-center text-sm text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white mb-4"
           >
             <ArrowLeft className="w-4 h-4 mr-1" />
-            Back to connections
+            {t('connections.backToConnections')}
           </button>
-          <h2 className="text-2xl font-bold text-gray-900 dark:text-white">New Connection</h2>
+          <h2 className="text-2xl font-bold text-gray-900 dark:text-white">{t('connections.newConnection')}</h2>
           <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">
-            Select a database or data warehouse to connect
+            {t('connections.selectDatabaseToConnect')}
           </p>
         </div>
 
@@ -126,9 +128,9 @@ export function ConnectionsPage() {
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
       <div className="mb-6 flex justify-between items-center">
         <div>
-          <h2 className="text-2xl font-bold text-gray-900 dark:text-white">Database Connections</h2>
+          <h2 className="text-2xl font-bold text-gray-900 dark:text-white">{t('connections.title')}</h2>
           <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">
-            Manage your database connections and view datasets
+            {t('connections.subtitle')}
           </p>
         </div>
         <button
@@ -136,16 +138,16 @@ export function ConnectionsPage() {
           className="inline-flex items-center px-4 py-2 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
         >
           <Plus className="w-4 h-4 mr-2" />
-          New Connection
+          {t('connections.newConnection')}
         </button>
       </div>
 
       {!connections || connections.length === 0 ? (
         <div className="text-center py-12 bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700">
           <Database className="mx-auto h-12 w-12 text-gray-400" />
-          <h3 className="mt-2 text-sm font-medium text-gray-900 dark:text-white">No connections</h3>
+          <h3 className="mt-2 text-sm font-medium text-gray-900 dark:text-white">{t('connections.noConnections')}</h3>
           <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">
-            Get started by creating a new database connection.
+            {t('connections.getStarted')}
           </p>
           <div className="mt-6">
             <button
@@ -153,7 +155,7 @@ export function ConnectionsPage() {
               className="inline-flex items-center px-4 py-2 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-blue-600 hover:bg-blue-700"
             >
               <Plus className="w-4 h-4 mr-2" />
-              New Connection
+              {t('connections.newConnection')}
             </button>
           </div>
         </div>
@@ -163,19 +165,19 @@ export function ConnectionsPage() {
             <thead className="bg-gray-50 dark:bg-gray-900">
               <tr>
                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">
-                  Name
+                  {t('common.name')}
                 </th>
                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">
-                  Type
+                  {t('common.type')}
                 </th>
                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">
-                  Host
+                  {t('connections.host')}
                 </th>
                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">
-                  Database
+                  {t('connections.database')}
                 </th>
                 <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">
-                  Actions
+                  {t('common.actions')}
                 </th>
               </tr>
             </thead>
@@ -189,7 +191,7 @@ export function ConnectionsPage() {
                         {connection.name}
                         {connection.is_default && (
                           <span className="ml-2 inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200">
-                            Default
+                            {t('connections.default')}
                           </span>
                         )}
                       </div>
@@ -211,14 +213,14 @@ export function ConnectionsPage() {
                     <button
                       onClick={() => handleViewDataset(connection.id)}
                       className="text-blue-600 hover:text-blue-900 dark:text-blue-400 dark:hover:text-blue-300 mr-3"
-                      title="View Dataset"
+                      title={t('connections.viewDataset')}
                     >
                       <Eye className="w-4 h-4" />
                     </button>
                     <button
                       onClick={() => handleDelete(connection.id)}
                       className="text-red-600 hover:text-red-900 dark:text-red-400 dark:hover:text-red-300"
-                      title="Delete"
+                      title={t('common.delete')}
                     >
                       <Trash2 className="w-4 h-4" />
                     </button>

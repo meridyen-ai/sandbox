@@ -3,6 +3,7 @@ import { useQuery } from '@tanstack/react-query'
 import { Columns, Database } from 'lucide-react'
 import { schemaApi } from '../../utils/api'
 import type { Table } from '../../types'
+import { useTranslation } from '../../hooks/useTranslation'
 
 interface TableViewProps {
   connectionId: string
@@ -12,6 +13,7 @@ interface TableViewProps {
 type TabType = 'columns' | 'samples'
 
 export function TableView({ connectionId, table }: TableViewProps) {
+  const { t } = useTranslation()
   const [activeTab, setActiveTab] = useState<TabType>('columns')
 
   const { data: samples, isLoading: samplesLoading } = useQuery({
@@ -29,7 +31,7 @@ export function TableView({ connectionId, table }: TableViewProps) {
           {table.name}
         </h3>
         <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
-          {table.columns.length} columns
+          {table.columns.length} {t('common.columns')}
         </p>
       </div>
 
@@ -45,7 +47,7 @@ export function TableView({ connectionId, table }: TableViewProps) {
             }`}
           >
             <Columns className="w-4 h-4 inline-block mr-2" />
-            Columns
+            {t('dataset.columns')}
           </button>
           <button
             onClick={() => setActiveTab('samples')}
@@ -56,7 +58,7 @@ export function TableView({ connectionId, table }: TableViewProps) {
             }`}
           >
             <Database className="w-4 h-4 inline-block mr-2" />
-            Data Samples
+            {t('dataset.dataSamples')}
           </button>
         </nav>
       </div>
@@ -69,16 +71,16 @@ export function TableView({ connectionId, table }: TableViewProps) {
               <thead className="bg-gray-50 dark:bg-gray-900">
                 <tr>
                   <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">
-                    Column Name
+                    {t('dataset.columnName')}
                   </th>
                   <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">
-                    Data Type
+                    {t('dataset.dataType')}
                   </th>
                   <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">
-                    Nullable
+                    {t('dataset.nullable')}
                   </th>
                   <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">
-                    Key
+                    {t('dataset.key')}
                   </th>
                 </tr>
               </thead>
@@ -95,15 +97,15 @@ export function TableView({ connectionId, table }: TableViewProps) {
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
                       {column.is_nullable ? (
-                        <span className="text-green-600 dark:text-green-400">Yes</span>
+                        <span className="text-green-600 dark:text-green-400">{t('common.yes')}</span>
                       ) : (
-                        <span className="text-gray-400">No</span>
+                        <span className="text-gray-400">{t('common.no')}</span>
                       )}
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
                       {column.is_primary_key && (
                         <span className="px-2 py-1 text-xs font-medium bg-blue-100 dark:bg-blue-900 text-blue-800 dark:text-blue-200 rounded">
-                          PRIMARY
+                          {t('dataset.primary')}
                         </span>
                       )}
                     </td>
@@ -118,7 +120,7 @@ export function TableView({ connectionId, table }: TableViewProps) {
           <div className="bg-white dark:bg-gray-800 shadow-sm rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden">
             {samplesLoading ? (
               <div className="p-8 text-center text-gray-500 dark:text-gray-400">
-                Loading samples...
+                {t('dataset.loadingSamples')}
               </div>
             ) : samples && samples.rows.length > 0 ? (
               <>
@@ -159,12 +161,12 @@ export function TableView({ connectionId, table }: TableViewProps) {
                   </table>
                 </div>
                 <div className="px-6 py-3 bg-gray-50 dark:bg-gray-900 border-t border-gray-200 dark:border-gray-700 text-xs text-gray-500 dark:text-gray-400">
-                  Showing {samples.rows.length} of {samples.total_rows} rows
+                  {t('dataset.showingRows', { count: samples.rows.length, total: samples.total_rows })}
                 </div>
               </>
             ) : (
               <div className="p-8 text-center text-gray-500 dark:text-gray-400">
-                No sample data available
+                {t('dataset.noSampleData')}
               </div>
             )}
           </div>
