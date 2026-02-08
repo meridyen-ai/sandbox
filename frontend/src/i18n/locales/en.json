@@ -25,6 +25,7 @@
   "layout": {
     "appTitle": "Meridyen Sandbox",
     "connections": "Connections",
+    "architecture": "Architecture",
     "logout": "Logout"
   },
   "login": {

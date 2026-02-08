@@ -2,6 +2,7 @@ import { Routes, Route, Navigate } from 'react-router-dom'
 import { Layout } from './components/Layout'
 import { ConnectionsPage } from './components/connections/ConnectionsPage'
 import { DatasetPage } from './components/dataset/DatasetPage'
+import { ArchitecturePage } from './components/architecture/ArchitecturePage'
 import { LoginPage } from './components/auth/LoginPage'
 import { ProtectedRoute } from './components/auth/ProtectedRoute'
 
@@ -21,6 +22,7 @@ function App() {
           <Route index element={<Navigate to="/connections" replace />} />
           <Route path="connections" element={<ConnectionsPage />} />
           <Route path="dataset/:connectionId" element={<DatasetPage />} />
+          <Route path="architecture" element={<ArchitecturePage />} />
         </Route>
       </Routes>
     </div>
