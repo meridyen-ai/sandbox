@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect } from 'react'
+import React, { createContext, useContext, useState } from 'react'
 
 interface AuthContextType {
   apiKey: string | null
@@ -12,15 +12,10 @@ const AuthContext = createContext<AuthContextType | undefined>(undefined)
 const STORAGE_KEY = 'sandbox_api_key'
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
-  const [apiKey, setApiKey] = useState<string | null>(null)
-
-  // Load API key from localStorage on mount
-  useEffect(() => {
-    const stored = localStorage.getItem(STORAGE_KEY)
-    if (stored) {
-      setApiKey(stored)
-    }
-  }, [])
+  // Initialize directly from localStorage (synchronous) to avoid race condition
+  const [apiKey, setApiKey] = useState<string | null>(
+    () => localStorage.getItem(STORAGE_KEY)
+  )
 
   const login = (key: string) => {
     localStorage.setItem(STORAGE_KEY, key)

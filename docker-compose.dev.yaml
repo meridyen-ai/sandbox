@@ -40,9 +40,13 @@ services:
       # Disable TLS for development
       - SANDBOX_PLATFORM__MTLS_ENABLED=false
       # Authentication configuration
-      - SANDBOX_AUTHENTICATION__MVP_API_URL=http://host.docker.internal:18000
+      - SANDBOX_AUTHENTICATION__MVP_API_URL=${SANDBOX_MVP_API_URL:-http://host.docker.internal:18000}
       - SANDBOX_AUTHENTICATION__API_TIMEOUT=5.0
       - SANDBOX_AUTHENTICATION__ENABLE_API_KEY_AUTH=true
+
+    # Make host.docker.internal work on Linux
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
     # Mount source code for hot reload
     volumes:
@@ -75,6 +79,7 @@ services:
     environment:
       - NODE_ENV=development
       - VITE_API_URL=http://localhost:8081
+      - VITE_PROXY_TARGET=http://sandbox:8080
 
     volumes:
       - ./frontend:/app:rw
