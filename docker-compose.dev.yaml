@@ -19,17 +19,11 @@ services:
       context: .
     container_name: meridyen-sandbox-dev
 
+    # Clear inherited ENTRYPOINT so command runs directly
+    entrypoint: []
+
     # Override command to use uvicorn with --reload
-    command: >
-      sh -c "
-        cd /app/src &&
-        uvicorn sandbox.main:app
-          --host 0.0.0.0
-          --port 8080
-          --reload
-          --reload-dir /app/src/sandbox
-          --log-level debug
-      "
+    command: ["sh", "-c", "cd /app/src && uvicorn sandbox.main:app --host 0.0.0.0 --port 8080 --reload --reload-dir /app/src/sandbox --log-level debug"]
 
     environment:
       - SANDBOX_ENVIRONMENT=development
@@ -53,6 +47,8 @@ services:
       - ./src:/app/src:rw
       - ./config:/app/config:ro
       - ./tests:/app/tests:ro
+      # Persistent data (connections, etc.)
+      - sandbox_data:/app/data
       # Exclude Python cache directories
       - /app/src/sandbox/__pycache__
 
@@ -95,5 +91,8 @@ services:
     tty: true
 
 volumes:
+  # Persistent data for sandbox (connections, etc.)
+  sandbox_data:
+    driver: local
   # Named volume for node_modules to persist across rebuilds
   frontend_node_modules:

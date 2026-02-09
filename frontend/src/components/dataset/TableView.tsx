@@ -85,32 +85,54 @@ export function TableView({ connectionId, table }: TableViewProps) {
                 </tr>
               </thead>
               <tbody className="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
-                {table.columns.map((column) => (
-                  <tr key={column.name} className="hover:bg-gray-50 dark:hover:bg-gray-700">
-                    <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900 dark:text-white">
-                      {column.name}
-                    </td>
-                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
-                      <span className="px-2 py-1 text-xs font-mono bg-gray-100 dark:bg-gray-700 rounded">
-                        {column.data_type}
-                      </span>
-                    </td>
-                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
-                      {column.is_nullable ? (
-                        <span className="text-green-600 dark:text-green-400">{t('common.yes')}</span>
-                      ) : (
-                        <span className="text-gray-400">{t('common.no')}</span>
-                      )}
-                    </td>
-                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
-                      {column.is_primary_key && (
-                        <span className="px-2 py-1 text-xs font-medium bg-blue-100 dark:bg-blue-900 text-blue-800 dark:text-blue-200 rounded">
-                          {t('dataset.primary')}
+                {table.columns.map((column) => {
+                  let typeDisplay = column.type
+                  if (column.max_length) {
+                    typeDisplay = `${column.type}(${column.max_length})`
+                  } else if (column.precision != null && column.scale != null) {
+                    typeDisplay = `${column.type}(${column.precision},${column.scale})`
+                  } else if (column.precision != null) {
+                    typeDisplay = `${column.type}(${column.precision})`
+                  }
+                  return (
+                    <tr key={column.name} className="hover:bg-gray-50 dark:hover:bg-gray-700">
+                      <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900 dark:text-white">
+                        {column.name}
+                      </td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
+                        <span className="px-2 py-1 text-xs font-mono bg-gray-100 dark:bg-gray-700 rounded">
+                          {typeDisplay}
                         </span>
-                      )}
-                    </td>
-                  </tr>
-                ))}
+                      </td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
+                        {column.nullable ? (
+                          <span className="text-green-600 dark:text-green-400">{t('common.yes')}</span>
+                        ) : (
+                          <span className="text-gray-400">{t('common.no')}</span>
+                        )}
+                      </td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
+                        <div className="flex items-center gap-1">
+                          {column.is_primary_key && (
+                            <span className="px-2 py-1 text-xs font-medium bg-blue-100 dark:bg-blue-900 text-blue-800 dark:text-blue-200 rounded">
+                              PK
+                            </span>
+                          )}
+                          {column.is_foreign_key && (
+                            <span className="px-2 py-1 text-xs font-medium bg-purple-100 dark:bg-purple-900 text-purple-800 dark:text-purple-200 rounded" title={column.foreign_table || undefined}>
+                              FK
+                            </span>
+                          )}
+                          {column.is_unique && !column.is_primary_key && (
+                            <span className="px-2 py-1 text-xs font-medium bg-green-100 dark:bg-green-900 text-green-800 dark:text-green-200 rounded">
+                              UQ
+                            </span>
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                  )
+                })}
               </tbody>
             </table>
           </div>

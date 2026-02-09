@@ -45,6 +45,8 @@ services:
     volumes:
       # Configuration
       - ./config:/app/config:ro
+      # Persistent data (connections, etc.)
+      - sandbox_data:/app/data
       # Logs (optional)
       - sandbox_logs:/app/logs
       # SSL certificates (if using mTLS)
@@ -77,6 +79,8 @@ services:
         max-file: "3"
 
 volumes:
+  sandbox_data:
+    driver: local
   sandbox_logs:
     driver: local
 

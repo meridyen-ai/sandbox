@@ -5,7 +5,6 @@
 
 import React, { useState, useEffect } from "react";
 import {
-  ArrowLeft,
   CheckCircle,
   XCircle,
   Loader2,
@@ -27,7 +26,6 @@ interface ConnectionFormProps {
 
 export const ConnectionForm: React.FC<ConnectionFormProps> = ({
   handler,
-  workspaceId,
   onBack,
   onSuccess,
   existingConnectionName,

@@ -91,6 +91,7 @@ services:
 
     volumes:
       - ./config:/app/config:ro
+      - sandbox_data:/app/data
       - sandbox_logs:/app/logs
       - ./certs:/app/certs:ro
 
@@ -148,6 +149,8 @@ services:
       - setup
 
 volumes:
+  sandbox_data:
+    driver: local
   sandbox_logs:
     driver: local
 

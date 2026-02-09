@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, date, timezone
+from decimal import Decimal
 from typing import Any, AsyncIterator
 
 from fastapi import FastAPI, HTTPException, Depends, Header, status
@@ -32,6 +33,23 @@ from sandbox.execution.python_executor import PythonExecutor
 from sandbox.visualization.generator import VisualizationGenerator, ChartType
 
 logger = get_logger(__name__)
+
+
+def _make_json_safe(value: Any) -> Any:
+    """Convert non-JSON-serializable values to strings."""
+    if value is None:
+        return None
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    if isinstance(value, dict):
+        return {k: _make_json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_make_json_safe(v) for v in value]
+    return value
 
 
 # =============================================================================
@@ -77,7 +95,7 @@ class VisualizationRequest(BaseModel):
 
 class ConnectionConfig(BaseModel):
     """Database connection configuration."""
-    id: str
+    id: str | None = None
     name: str
     db_type: str
     host: str
@@ -87,6 +105,12 @@ class ConnectionConfig(BaseModel):
     password: str
     schema_name: str | None = None
     ssl_enabled: bool = True
+
+    @property
+    def normalized_db_type(self) -> str:
+        """Normalize common db_type aliases to canonical enum values."""
+        aliases = {"postgres": "postgresql", "pg": "postgresql", "mssql_server": "mssql"}
+        return aliases.get(self.db_type.lower(), self.db_type.lower())
 
 
 class HealthResponse(BaseModel):
@@ -564,8 +588,8 @@ def register_routes(app: FastAPI) -> None:
                 "database": conn.database,
                 "schema": conn.schema_name,
                 "is_default": getattr(conn, 'is_default', False),
-                "created_at": getattr(conn, 'created_at', None),
-                "updated_at": getattr(conn, 'updated_at', None),
+                "created_at": conn.created_at,
+                "updated_at": conn.updated_at,
             })
 
         return JSONResponse(content={"connections": connections})
@@ -587,10 +611,11 @@ def register_routes(app: FastAPI) -> None:
         conn_id = connection.id or str(uuid.uuid4())
 
         # Create connection config
+        now = datetime.now(timezone.utc).isoformat()
         new_conn = DatabaseConnectionConfig(
             id=conn_id,
             name=connection.name,
-            db_type=DatabaseType(connection.db_type),
+            db_type=DatabaseType(connection.normalized_db_type),
             host=connection.host,
             port=connection.port,
             database=connection.database,
@@ -598,10 +623,15 @@ def register_routes(app: FastAPI) -> None:
             password=SecretStr(connection.password),
             schema_name=connection.schema_name,
             ssl_enabled=connection.ssl_enabled,
+            created_at=now,
+            updated_at=now,
         )
 
-        # Add to config (in-memory for now, should persist to file/db)
+        # Add to config and persist to file
         config.database_connections.append(new_conn)
+
+        from sandbox.core.config import save_persisted_connections
+        save_persisted_connections(config)
 
         return JSONResponse(
             status_code=201,
@@ -620,6 +650,7 @@ def register_routes(app: FastAPI) -> None:
     ) -> JSONResponse:
         """Update an existing database connection."""
         from pydantic import SecretStr
+        from datetime import datetime, timezone
         config = get_config()
 
         # Find and update connection
@@ -630,7 +661,7 @@ def register_routes(app: FastAPI) -> None:
                 updated_conn = DatabaseConnectionConfig(
                     id=connection_id,
                     name=connection.name,
-                    db_type=DatabaseType(connection.db_type),
+                    db_type=DatabaseType(connection.normalized_db_type),
                     host=connection.host,
                     port=connection.port,
                     database=connection.database,
@@ -638,8 +669,13 @@ def register_routes(app: FastAPI) -> None:
                     password=SecretStr(connection.password),
                     schema_name=connection.schema_name,
                     ssl_enabled=connection.ssl_enabled,
+                    created_at=conn.created_at,
+                    updated_at=datetime.now(timezone.utc).isoformat(),
                 )
                 config.database_connections[idx] = updated_conn
+
+                from sandbox.core.config import save_persisted_connections
+                save_persisted_connections(config)
 
                 return JSONResponse(content={
                     "id": connection_id,
@@ -660,8 +696,54 @@ def register_routes(app: FastAPI) -> None:
         for idx, conn in enumerate(config.database_connections):
             if conn.id == connection_id:
                 config.database_connections.pop(idx)
+
+                from sandbox.core.config import save_persisted_connections
+                save_persisted_connections(config)
+
                 return JSONResponse(content={
                     "message": "Connection deleted successfully"
+                })
+
+        raise HTTPException(status_code=404, detail="Connection not found")
+
+    @app.get("/api/v1/connections/{connection_id}/selected-tables", tags=["Connections"])
+    async def get_selected_tables(
+        connection_id: str,
+        token_data: dict = Depends(verify_sandbox_token),
+    ) -> JSONResponse:
+        """Get selected tables/columns for a connection."""
+        config = get_config()
+
+        for conn in config.database_connections:
+            if conn.id == connection_id:
+                return JSONResponse(content={
+                    "connection_id": connection_id,
+                    "selected_tables": conn.selected_tables or {},
+                })
+
+        raise HTTPException(status_code=404, detail="Connection not found")
+
+    @app.put("/api/v1/connections/{connection_id}/selected-tables", tags=["Connections"])
+    async def save_selected_tables(
+        connection_id: str,
+        payload: dict,
+        token_data: dict = Depends(verify_sandbox_token),
+    ) -> JSONResponse:
+        """Save selected tables/columns for a connection."""
+        from sandbox.core.config import save_persisted_connections
+        from datetime import datetime, timezone
+
+        config = get_config()
+
+        for conn in config.database_connections:
+            if conn.id == connection_id:
+                conn.selected_tables = payload.get("selected_tables", {})
+                conn.updated_at = datetime.now(timezone.utc).isoformat()
+                save_persisted_connections(config)
+                return JSONResponse(content={
+                    "connection_id": connection_id,
+                    "message": "Selected tables saved successfully",
+                    "selected_tables": conn.selected_tables,
                 })
 
         raise HTTPException(status_code=404, detail="Connection not found")
@@ -681,7 +763,7 @@ def register_routes(app: FastAPI) -> None:
             conn_config = DatabaseConnectionConfig(
                 id=connection.id,
                 name=connection.name,
-                db_type=DatabaseType(connection.db_type),
+                db_type=DatabaseType(connection.normalized_db_type),
                 host=connection.host,
                 port=connection.port,
                 database=connection.database,
@@ -790,7 +872,7 @@ def register_routes(app: FastAPI) -> None:
                             table_data["sample_data"] = {
                                 "columns": result.columns,
                                 "rows": [
-                                    {col: val for col, val in zip(result.columns, row)}
+                                    {col: _make_json_safe(val) for col, val in zip(result.columns, row)}
                                     for row in result.rows
                                 ],
                                 "total_rows": result.row_count
@@ -813,6 +895,128 @@ def register_routes(app: FastAPI) -> None:
         except Exception as e:
             logger.error("schema_sync_error", connection_id=connection_id, error=str(e))
             raise HTTPException(status_code=500, detail=str(e))
+
+    @app.get("/api/v1/schema/full-sync", tags=["Schema"])
+    async def full_sync_schema(
+        include_samples: bool = True,
+        sample_limit: int = 10,
+        token_data: dict = Depends(verify_sandbox_token),
+    ) -> JSONResponse:
+        """
+        Bulk sync: returns all connections with schemas and sample data.
+
+        Used by AI Assistants MVP to pull all connection metadata in one call.
+        No credentials are included in the response.
+        """
+        from sandbox.connectors.factory import get_connector
+        from sandbox.core.config import get_config
+
+        config = get_config()
+        synced_connections = []
+
+        for conn_config in config.database_connections:
+            connection_data = {
+                "id": conn_config.id,
+                "name": conn_config.name,
+                "db_type": conn_config.db_type.value,
+                "host": conn_config.host,
+                "port": conn_config.port,
+                "database": conn_config.database,
+                "schema": conn_config.schema_name,
+                "is_default": getattr(conn_config, "is_default", False),
+                "tables": [],
+            }
+
+            # Get selected tables config (if any)
+            selected_tables_config = conn_config.selected_tables or {}
+
+            try:
+                connector = get_connector(conn_config.db_type, conn_config)
+
+                async with connector.get_connection() as conn:
+                    tables = await connector.get_tables(
+                        conn, schema=conn_config.schema_name
+                    )
+
+                    schema_prefix = conn_config.schema_name or "public"
+
+                    for table_name in tables:
+                        # If selected_tables is configured, only sync selected tables
+                        if selected_tables_config:
+                            full_name = f"{schema_prefix}.{table_name}"
+                            table_selection = selected_tables_config.get(full_name)
+                            if not table_selection or not table_selection.get("selected"):
+                                continue
+                            selected_columns = table_selection.get("columns", [])
+                        else:
+                            selected_columns = None  # Include all columns
+
+                        columns_info = await connector.get_columns(
+                            conn, table_name, schema=conn_config.schema_name
+                        )
+
+                        # Filter columns if selection exists
+                        if selected_columns is not None and selected_columns:
+                            columns_info = [
+                                col for col in columns_info
+                                if col.get("name") in selected_columns
+                            ]
+
+                        table_data = {
+                            "name": table_name,
+                            "columns": columns_info,
+                            "sample_data": None,
+                        }
+
+                        if include_samples:
+                            try:
+                                # Build column list for sample query
+                                if selected_columns:
+                                    col_list = ", ".join(f'"{c}"' for c in selected_columns)
+                                else:
+                                    col_list = "*"
+
+                                if conn_config.schema_name:
+                                    sample_query = f'SELECT {col_list} FROM "{conn_config.schema_name}"."{table_name}" LIMIT {sample_limit}'
+                                else:
+                                    sample_query = f'SELECT {col_list} FROM "{table_name}" LIMIT {sample_limit}'
+
+                                result = await connector.execute(conn, sample_query)
+                                table_data["sample_data"] = {
+                                    "columns": result.columns,
+                                    "rows": [
+                                        {col: _make_json_safe(val) for col, val in zip(result.columns, row)}
+                                        for row in result.rows
+                                    ],
+                                    "total_rows": result.row_count,
+                                }
+                            except Exception as e:
+                                logger.warning(
+                                    "full_sync_sample_error",
+                                    connection=conn_config.id,
+                                    table=table_name,
+                                    error=str(e),
+                                )
+
+                        connection_data["tables"].append(table_data)
+
+            except Exception as e:
+                logger.warning(
+                    "full_sync_connection_error",
+                    connection=conn_config.id,
+                    error=str(e),
+                )
+                connection_data["error"] = str(e)
+
+            synced_connections.append(connection_data)
+
+        from datetime import datetime, timezone
+
+        return JSONResponse(content={
+            "status": "success",
+            "synced_at": datetime.now(timezone.utc).isoformat(),
+            "connections": synced_connections,
+        })
 
     @app.get("/api/v1/schema/table/{table_name}/samples", tags=["Schema"])
     async def get_table_samples(
@@ -859,7 +1063,7 @@ def register_routes(app: FastAPI) -> None:
                 return JSONResponse(content={
                     "columns": result.columns,
                     "rows": [
-                        {col: val for col, val in zip(result.columns, row)}
+                        {col: _make_json_safe(val) for col, val in zip(result.columns, row)}
                         for row in result.rows
                     ],
                     "total_rows": result.row_count

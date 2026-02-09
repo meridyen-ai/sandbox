@@ -26,9 +26,16 @@ export interface ConnectionConfig {
 
 export interface TableColumn {
   name: string
-  data_type: string
-  is_nullable?: boolean
+  type: string
+  nullable: boolean
+  default?: string | null
+  max_length?: number | null
+  precision?: number | null
+  scale?: number | null
   is_primary_key?: boolean
+  is_unique?: boolean
+  is_foreign_key?: boolean
+  foreign_table?: string | null
 }
 
 export interface TableSampleData {
@@ -84,4 +91,28 @@ export interface HandlerInfo {
   available: boolean
   error?: string
   connection_args: ConnectionArg[]
+}
+
+// Types for table/column selection (mirrors MVP's dataConnectorsApi types)
+export interface ColumnInfo {
+  name: string
+  data_type: string
+  nullable: boolean
+  default_value?: string | null
+  sample_data?: string | null
+}
+
+export interface TableWithColumns {
+  schema_name: string
+  table_name: string
+  table_type: string
+  full_name: string
+  columns: ColumnInfo[]
+}
+
+export interface SelectedSchema {
+  [tableFullName: string]: {
+    selected: boolean
+    columns: string[]
+  }
 }

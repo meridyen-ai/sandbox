@@ -10,7 +10,10 @@ Centralized configuration using Pydantic Settings with support for:
 
 from __future__ import annotations
 
+import json
+import logging
 import os
+from datetime import datetime, timezone
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
@@ -19,6 +22,11 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logger = logging.getLogger(__name__)
+
+# Default path for persisted connections file
+CONNECTIONS_FILE_PATH = Path("/app/data/connections.json")
 
 
 class ExecutionMode(str, Enum):
@@ -68,6 +76,9 @@ class DatabaseConnectionConfig(BaseModel):
     query_timeout: int = Field(300, description="Query timeout in seconds")
     max_pool_size: int = Field(10, description="Maximum connection pool size")
     extra_params: dict[str, Any] = Field(default_factory=dict, description="Extra connection parameters")
+    created_at: str | None = Field(None, description="ISO timestamp when created")
+    updated_at: str | None = Field(None, description="ISO timestamp when last updated")
+    selected_tables: dict[str, Any] | None = Field(None, description="Selected tables/columns for sync: {full_name: {selected: bool, columns: [str]}}")
 
     @field_validator("port")
     @classmethod
@@ -309,22 +320,91 @@ def get_config() -> SandboxConfig:
     # Check for explicit config path
     config_path = os.environ.get("SANDBOX_CONFIG_PATH")
 
+    config: SandboxConfig
     if config_path and Path(config_path).exists():
-        return SandboxConfig.from_yaml(config_path)
+        config = SandboxConfig.from_yaml(config_path)
+    else:
+        # Check default locations
+        default_paths = [
+            Path("./config/sandbox.yaml"),
+            Path("./sandbox.yaml"),
+            Path("/etc/sandbox/config.yaml"),
+        ]
 
-    # Check default locations
-    default_paths = [
-        Path("./config/sandbox.yaml"),
-        Path("./sandbox.yaml"),
-        Path("/etc/sandbox/config.yaml"),
-    ]
+        config = SandboxConfig()
+        for path in default_paths:
+            if path.exists():
+                config = SandboxConfig.from_yaml(path)
+                break
 
-    for path in default_paths:
-        if path.exists():
-            return SandboxConfig.from_yaml(path)
+    # Load persisted connections (from /app/data/connections.json)
+    load_persisted_connections(config)
 
-    # Fall back to environment variables only
-    return SandboxConfig()
+    return config
+
+
+def load_persisted_connections(config: SandboxConfig) -> None:
+    """Load persisted connections from file into the config."""
+    connections_file = CONNECTIONS_FILE_PATH
+    if not connections_file.exists():
+        return
+
+    try:
+        with open(connections_file) as f:
+            data = json.load(f)
+
+        for conn_data in data.get("connections", []):
+            # Convert password string back to SecretStr
+            conn_data["password"] = SecretStr(conn_data.get("password", ""))
+            # Convert db_type string to enum
+            conn_data["db_type"] = DatabaseType(conn_data["db_type"])
+            conn = DatabaseConnectionConfig(**conn_data)
+            # Avoid duplicates (by id)
+            if not any(c.id == conn.id for c in config.database_connections):
+                config.database_connections.append(conn)
+
+        logger.info("Loaded %d persisted connections from %s", len(data.get("connections", [])), connections_file)
+    except Exception as e:
+        logger.error("Failed to load persisted connections: %s", e)
+
+
+def save_persisted_connections(config: SandboxConfig) -> None:
+    """Save current connections to file for persistence across restarts."""
+    connections_file = CONNECTIONS_FILE_PATH
+
+    try:
+        connections_file.parent.mkdir(parents=True, exist_ok=True)
+
+        connections = []
+        for conn in config.database_connections:
+            connections.append({
+                "id": conn.id,
+                "name": conn.name,
+                "db_type": conn.db_type.value,
+                "host": conn.host,
+                "port": conn.port,
+                "database": conn.database,
+                "username": conn.username,
+                "password": conn.password.get_secret_value(),
+                "schema_name": conn.schema_name,
+                "ssl_enabled": conn.ssl_enabled,
+                "ssl_ca_cert": conn.ssl_ca_cert,
+                "connection_timeout": conn.connection_timeout,
+                "query_timeout": conn.query_timeout,
+                "max_pool_size": conn.max_pool_size,
+                "extra_params": conn.extra_params,
+                "created_at": conn.created_at,
+                "updated_at": conn.updated_at,
+                "selected_tables": conn.selected_tables,
+            })
+
+        data = {"connections": connections}
+        with open(connections_file, "w") as f:
+            json.dump(data, f, indent=2)
+
+        logger.info("Saved %d connections to %s", len(connections), connections_file)
+    except Exception as e:
+        logger.error("Failed to save persisted connections: %s", e)
 
 
 def reset_config() -> None:

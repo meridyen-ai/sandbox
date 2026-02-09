@@ -1,5 +1,5 @@
 import axios from 'axios'
-import type { Connection, ConnectionConfig, SchemaData, TableSampleData, HandlerInfo } from '../types'
+import type { Connection, ConnectionConfig, SchemaData, TableSampleData, HandlerInfo, SelectedSchema } from '../types'
 
 const API_BASE_URL = '/api/v1'
 
@@ -67,6 +67,19 @@ export const connectionsApi = {
   test: async (connection: ConnectionConfig): Promise<{ success: boolean; message: string }> => {
     const response = await api.post('/connections/test', connection)
     return response.data
+  },
+
+  // Get selected tables for a connection
+  getSelectedTables: async (connectionId: string): Promise<SelectedSchema> => {
+    const response = await api.get(`/connections/${connectionId}/selected-tables`)
+    return response.data.selected_tables
+  },
+
+  // Save selected tables for a connection
+  saveSelectedTables: async (connectionId: string, selectedTables: SelectedSchema): Promise<void> => {
+    await api.put(`/connections/${connectionId}/selected-tables`, {
+      selected_tables: selectedTables,
+    })
   },
 }
 

@@ -1,14 +1,55 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
-import { Plus, Database, Trash2, Eye, ArrowLeft } from 'lucide-react'
+import {
+  Plus,
+  Database,
+  Trash2,
+  ArrowLeft,
+  Search,
+  Loader2,
+  CheckCircle,
+  XCircle,
+  RefreshCw,
+  Settings2,
+} from 'lucide-react'
 import { connectionsApi } from '../../utils/api'
 import { DataSourceSelector } from './DataSourceSelector'
 import { ConnectionForm } from './ConnectionForm'
-import type { HandlerInfo } from '../../types'
+import { TableColumnSelector } from './TableColumnSelector'
+import type { HandlerInfo, Connection, SelectedSchema } from '../../types'
 import { useTranslation } from '../../hooks/useTranslation'
 
-type ViewState = 'list' | 'select-type' | 'configure'
+type ViewState = 'list' | 'select-type' | 'configure' | 'select-tables'
+
+// Database type badge colors
+const DB_TYPE_COLORS: Record<string, string> = {
+  postgresql: 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400',
+  postgres: 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400',
+  mysql: 'bg-orange-100 text-orange-700 dark:bg-orange-900/30 dark:text-orange-400',
+  snowflake: 'bg-cyan-100 text-cyan-700 dark:bg-cyan-900/30 dark:text-cyan-400',
+  bigquery: 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400',
+  redshift: 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400',
+  databricks: 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400',
+  mssql: 'bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400',
+  oracle: 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400',
+  csv: 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400',
+}
+
+function formatRelativeDate(dateStr?: string) {
+  if (!dateStr) return '-'
+  const date = new Date(dateStr)
+  const now = new Date()
+  const diffMs = now.getTime() - date.getTime()
+  const diffMins = Math.floor(diffMs / (1000 * 60))
+  const diffHours = Math.floor(diffMs / (1000 * 60 * 60))
+  const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24))
+
+  if (diffMins < 60) return `${diffMins}m ago`
+  if (diffHours < 24) return `${diffHours}h ago`
+  if (diffDays < 7) return `${diffDays}d ago`
+  return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+}
 
 export function ConnectionsPage() {
   const { t } = useTranslation()
@@ -16,6 +57,17 @@ export function ConnectionsPage() {
   const queryClient = useQueryClient()
   const [viewState, setViewState] = useState<ViewState>('list')
   const [selectedHandler, setSelectedHandler] = useState<HandlerInfo | null>(null)
+  const [searchQuery, setSearchQuery] = useState('')
+  const [testingConnection, setTestingConnection] = useState<string | null>(null)
+  const [connectionStatuses, setConnectionStatuses] = useState<
+    Record<string, { connected: boolean; error?: string }>
+  >({})
+  const [deleteModalOpen, setDeleteModalOpen] = useState(false)
+  const [connectionToDelete, setConnectionToDelete] = useState<Connection | null>(null)
+  const [newConnectionId, setNewConnectionId] = useState<string | null>(null)
+  const [newConnectionName, setNewConnectionName] = useState<string>('')
+  const [savingSelection, setSavingSelection] = useState(false)
+  const [initialSelectedSchema, setInitialSelectedSchema] = useState<SelectedSchema | undefined>(undefined)
 
   const { data: connections, isLoading } = useQuery({
     queryKey: ['connections'],
@@ -26,16 +78,53 @@ export function ConnectionsPage() {
     mutationFn: connectionsApi.delete,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['connections'] })
+      setDeleteModalOpen(false)
+      setConnectionToDelete(null)
     },
   })
 
-  const handleDelete = async (id: string) => {
-    if (confirm(t('connections.deleteConfirm'))) {
-      await deleteMutation.mutateAsync(id)
+  const handleDelete = (connection: Connection) => {
+    setConnectionToDelete(connection)
+    setDeleteModalOpen(true)
+  }
+
+  const confirmDelete = async () => {
+    if (connectionToDelete) {
+      await deleteMutation.mutateAsync(connectionToDelete.id)
     }
   }
 
-  const handleViewDataset = (connectionId: string) => {
+  const handleTestConnection = async (connection: Connection) => {
+    setTestingConnection(connection.id)
+    try {
+      const result = await connectionsApi.test({
+        name: connection.name,
+        db_type: connection.db_type,
+        host: connection.host,
+        port: connection.port,
+        database: connection.database,
+        username: '',
+        password: '',
+        ssl_enabled: false,
+      })
+      setConnectionStatuses((prev) => ({
+        ...prev,
+        [connection.id]: { connected: result.success, error: result.message },
+      }))
+    } catch (err) {
+      setConnectionStatuses((prev) => ({
+        ...prev,
+        [connection.id]: {
+          connected: false,
+          error: err instanceof Error ? err.message : 'Test failed',
+        },
+      }))
+    } finally {
+      setTestingConnection(null)
+    }
+  }
+
+  const handleRowClick = (connectionId: string) => {
     navigate(`/dataset/${connectionId}`)
   }
 
@@ -59,27 +148,68 @@ export function ConnectionsPage() {
     setSelectedHandler(null)
   }
 
-  const handleConnectionSuccess = () => {
-    setViewState('list')
+  const handleConnectionSuccess = (connectionId: string, connectionName: string) => {
+    // Transition to table selection step after connection creation
+    setNewConnectionId(connectionId)
+    setNewConnectionName(connectionName)
+    setInitialSelectedSchema(undefined)
+    setViewState('select-tables')
     setSelectedHandler(null)
+  }
+
+  const handleTableSelectionConfirm = async (selectedSchema: SelectedSchema) => {
+    if (!newConnectionId) return
+
+    setSavingSelection(true)
+    try {
+      await connectionsApi.saveSelectedTables(newConnectionId, selectedSchema)
+      setViewState('list')
+      setNewConnectionId(null)
+      setNewConnectionName('')
+      queryClient.invalidateQueries({ queryKey: ['connections'] })
+    } catch (err) {
+      console.error('Failed to save table selection:', err)
+    } finally {
+      setSavingSelection(false)
+    }
+  }
+
+  const handleTableSelectionBack = () => {
+    // Skip table selection and go to list
+    setViewState('list')
+    setNewConnectionId(null)
+    setNewConnectionName('')
     queryClient.invalidateQueries({ queryKey: ['connections'] })
   }
 
-  const getDbTypeBadgeColor = (dbType: string) => {
-    const colors: Record<string, string> = {
-      postgresql: 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200',
-      postgres: 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200',
-      mysql: 'bg-orange-100 text-orange-800 dark:bg-orange-900 dark:text-orange-200',
-      snowflake: 'bg-cyan-100 text-cyan-800 dark:bg-cyan-900 dark:text-cyan-200',
-      bigquery: 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200',
+  const handleEditTables = async (connection: Connection) => {
+    setNewConnectionId(connection.id)
+    setNewConnectionName(connection.name)
+    try {
+      const existing = await connectionsApi.getSelectedTables(connection.id)
+      setInitialSelectedSchema(existing && Object.keys(existing).length > 0 ? existing : undefined)
+    } catch {
+      setInitialSelectedSchema(undefined)
     }
-    return colors[dbType.toLowerCase()] || 'bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-gray-200'
+    setViewState('select-tables')
   }
+
+  // Filter connections
+  const filteredConnections = (connections || []).filter((conn) => {
+    if (!searchQuery) return true
+    const query = searchQuery.toLowerCase()
+    return (
+      conn.name.toLowerCase().includes(query) ||
+      conn.db_type.toLowerCase().includes(query) ||
+      (conn.host && conn.host.toLowerCase().includes(query)) ||
+      (conn.database && conn.database.toLowerCase().includes(query))
+    )
+  })
 
   if (isLoading) {
     return (
-      <div className="flex items-center justify-center h-64">
-        <div className="text-gray-500 dark:text-gray-400">{t('connections.loading')}</div>
+      <div className="flex items-center justify-center py-12">
+        <Loader2 className="w-8 h-8 animate-spin text-blue-500" />
       </div>
     )
   }
@@ -123,112 +253,269 @@ export function ConnectionsPage() {
     )
   }
 
+  // View: Select tables after connection creation
+  if (viewState === 'select-tables' && newConnectionId) {
+    return (
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 h-[calc(100vh-4rem)]">
+        <TableColumnSelector
+          connectionId={newConnectionId}
+          connectionName={newConnectionName}
+          initialSelectedSchema={initialSelectedSchema}
+          onBack={handleTableSelectionBack}
+          onConfirm={handleTableSelectionConfirm}
+          loading={savingSelection}
+        />
+      </div>
+    )
+  }
+
   // View: List connections
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-      <div className="mb-6 flex justify-between items-center">
-        <div>
-          <h2 className="text-2xl font-bold text-gray-900 dark:text-white">{t('connections.title')}</h2>
-          <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">
-            {t('connections.subtitle')}
-          </p>
+      <div className="space-y-6">
+        {/* Header */}
+        <div className="flex items-center justify-between">
+          <div>
+            <h3 className="text-lg font-semibold text-gray-900 dark:text-white">
+              {t('connections.title')}
+            </h3>
+            <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
+              {t('connections.subtitle')}
+            </p>
+          </div>
+          <button
+            onClick={handleNewConnection}
+            className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-medium transition-colors"
+          >
+            <Plus className="w-4 h-4" />
+            {t('connections.newConnection')}
+          </button>
         </div>
-        <button
-          onClick={handleNewConnection}
-          className="inline-flex items-center px-4 py-2 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
-        >
-          <Plus className="w-4 h-4 mr-2" />
-          {t('connections.newConnection')}
-        </button>
-      </div>
 
-      {!connections || connections.length === 0 ? (
-        <div className="text-center py-12 bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700">
-          <Database className="mx-auto h-12 w-12 text-gray-400" />
-          <h3 className="mt-2 text-sm font-medium text-gray-900 dark:text-white">{t('connections.noConnections')}</h3>
-          <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">
-            {t('connections.getStarted')}
-          </p>
-          <div className="mt-6">
-            <button
-              onClick={handleNewConnection}
-              className="inline-flex items-center px-4 py-2 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-blue-600 hover:bg-blue-700"
-            >
-              <Plus className="w-4 h-4 mr-2" />
-              {t('connections.newConnection')}
-            </button>
+        {/* Search */}
+        <div className="flex items-center gap-4">
+          <div className="relative flex-1 max-w-md">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
+            <input
+              type="text"
+              placeholder={t('common.search') || 'Search'}
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              className="w-full pl-9 pr-4 py-2 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg text-sm text-gray-800 dark:text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
+            />
           </div>
         </div>
-      ) : (
-        <div className="bg-white dark:bg-gray-800 shadow-sm rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden">
-          <table className="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
-            <thead className="bg-gray-50 dark:bg-gray-900">
-              <tr>
-                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">
-                  {t('common.name')}
-                </th>
-                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">
-                  {t('common.type')}
-                </th>
-                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">
-                  {t('connections.host')}
-                </th>
-                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">
-                  {t('connections.database')}
-                </th>
-                <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">
-                  {t('common.actions')}
-                </th>
-              </tr>
-            </thead>
-            <tbody className="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
-              {connections.map((connection) => (
-                <tr key={connection.id} className="hover:bg-gray-50 dark:hover:bg-gray-700">
-                  <td className="px-6 py-4 whitespace-nowrap">
-                    <div className="flex items-center">
-                      <Database className="w-5 h-5 text-gray-400 mr-3" />
-                      <div className="text-sm font-medium text-gray-900 dark:text-white">
-                        {connection.name}
-                        {connection.is_default && (
-                          <span className="ml-2 inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200">
-                            {t('connections.default')}
-                          </span>
-                        )}
-                      </div>
+
+        {/* Empty state */}
+        {filteredConnections.length === 0 ? (
+          <div className="text-center py-12 bg-gray-50 dark:bg-gray-800/50 rounded-xl border-2 border-dashed border-gray-200 dark:border-gray-700">
+            <Database className="w-12 h-12 text-gray-300 dark:text-gray-600 mx-auto mb-4" />
+            <h4 className="text-lg font-medium text-gray-900 dark:text-white mb-2">
+              {searchQuery
+                ? 'No matching connections'
+                : t('connections.noConnections')}
+            </h4>
+            <p className="text-gray-500 dark:text-gray-400 mb-6 max-w-sm mx-auto">
+              {searchQuery
+                ? 'Try a different search term'
+                : t('connections.getStarted')}
+            </p>
+            {!searchQuery && (
+              <button
+                onClick={handleNewConnection}
+                className="inline-flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-medium transition-colors"
+              >
+                <Plus className="w-4 h-4" />
+                {t('connections.newConnection')}
+              </button>
+            )}
+          </div>
+        ) : (
+          /* Connections Table */
+          <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden">
+            {/* Table header */}
+            <div className="grid grid-cols-12 gap-4 px-4 py-3 bg-gray-50 dark:bg-gray-900 border-b border-gray-200 dark:border-gray-700 text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">
+              <div className="col-span-1"></div>
+              <div className="col-span-3">{t('common.name') || 'Connection name'}</div>
+              <div className="col-span-3">Source</div>
+              <div className="col-span-2">Status</div>
+              <div className="col-span-2">Modified</div>
+              <div className="col-span-1"></div>
+            </div>
+
+            {/* Table rows */}
+            {filteredConnections.map((connection) => {
+              const status = connectionStatuses[connection.id]
+              const isTesting = testingConnection === connection.id
+              const isDeleting = deleteMutation.isPending && connectionToDelete?.id === connection.id
+              const dbTypeColor =
+                DB_TYPE_COLORS[connection.db_type.toLowerCase()] ||
+                'bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300'
+
+              return (
+                <div
+                  key={connection.id}
+                  onClick={() => handleRowClick(connection.id)}
+                  className="group grid grid-cols-12 gap-4 px-4 py-3 border-b border-gray-100 dark:border-gray-700 last:border-b-0 hover:bg-gray-50 dark:hover:bg-gray-700 cursor-pointer transition-colors"
+                >
+                  {/* Icon */}
+                  <div className="col-span-1 flex items-center">
+                    <div className="w-8 h-8 rounded-lg bg-gray-100 dark:bg-gray-700 flex items-center justify-center">
+                      <Database className="w-4 h-4 text-gray-500 dark:text-gray-400" />
                     </div>
-                  </td>
-                  <td className="px-6 py-4 whitespace-nowrap">
-                    <span className={`px-2 py-1 inline-flex text-xs leading-5 font-semibold rounded-full ${getDbTypeBadgeColor(connection.db_type)}`}>
+                  </div>
+
+                  {/* Name */}
+                  <div className="col-span-3 flex items-center">
+                    <div>
+                      <span className="font-medium text-blue-600 dark:text-blue-400 hover:underline">
+                        {connection.name}
+                      </span>
+                      {connection.is_default && (
+                        <span className="ml-2 text-xs bg-blue-100 dark:bg-blue-900 text-blue-700 dark:text-blue-300 px-2 py-0.5 rounded">
+                          {t('connections.default')}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Source (db type + host) */}
+                  <div className="col-span-3 flex items-center gap-2">
+                    <span className={`text-xs font-medium px-2 py-0.5 rounded uppercase ${dbTypeColor}`}>
                       {connection.db_type}
                     </span>
-                  </td>
-                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
-                    {connection.host}:{connection.port}
-                  </td>
-                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
-                    {connection.database}
-                    {connection.schema && <span className="text-gray-400"> / {connection.schema}</span>}
-                  </td>
-                  <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+                    {connection.host && (
+                      <span className="text-sm text-gray-500 dark:text-gray-400 truncate">
+                        {connection.host}
+                        {connection.port && `:${connection.port}`}
+                      </span>
+                    )}
+                  </div>
+
+                  {/* Status */}
+                  <div className="col-span-2 flex items-center">
+                    {isTesting ? (
+                      <span className="inline-flex items-center gap-1 text-xs text-gray-500">
+                        <Loader2 className="w-3 h-3 animate-spin" />
+                        Testing...
+                      </span>
+                    ) : status ? (
+                      <span
+                        className={`inline-flex items-center gap-1 text-xs ${
+                          status.connected
+                            ? 'text-green-600 dark:text-green-400'
+                            : 'text-red-600 dark:text-red-400'
+                        }`}
+                      >
+                        {status.connected ? (
+                          <>
+                            <CheckCircle className="w-3 h-3" />
+                            Connected
+                          </>
+                        ) : (
+                          <>
+                            <XCircle className="w-3 h-3" />
+                            Disconnected
+                          </>
+                        )}
+                      </span>
+                    ) : (
+                      <span className="text-xs text-gray-400">-</span>
+                    )}
+                  </div>
+
+                  {/* Modified */}
+                  <div className="col-span-2 flex items-center">
+                    <span className="text-sm text-gray-500 dark:text-gray-400">
+                      {formatRelativeDate(connection.updated_at || connection.created_at)}
+                    </span>
+                  </div>
+
+                  {/* Actions */}
+                  <div className="col-span-1 flex items-center justify-end gap-1">
                     <button
-                      onClick={() => handleViewDataset(connection.id)}
-                      className="text-blue-600 hover:text-blue-900 dark:text-blue-400 dark:hover:text-blue-300 mr-3"
-                      title={t('connections.viewDataset')}
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        handleEditTables(connection)
+                      }}
+                      className="p-1.5 text-gray-400 hover:text-blue-600 rounded opacity-0 group-hover:opacity-100 hover:bg-gray-100 dark:hover:bg-gray-600 transition-all"
+                      title="Edit table selection"
                     >
-                      <Eye className="w-4 h-4" />
+                      <Settings2 className="w-4 h-4" />
                     </button>
                     <button
-                      onClick={() => handleDelete(connection.id)}
-                      className="text-red-600 hover:text-red-900 dark:text-red-400 dark:hover:text-red-300"
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        handleTestConnection(connection)
+                      }}
+                      disabled={isTesting || isDeleting}
+                      className="p-1.5 text-gray-400 hover:text-blue-600 rounded opacity-0 group-hover:opacity-100 hover:bg-gray-100 dark:hover:bg-gray-600 transition-all"
+                      title="Test connection"
+                    >
+                      <RefreshCw className={`w-4 h-4 ${isTesting ? 'animate-spin' : ''}`} />
+                    </button>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        handleDelete(connection)
+                      }}
+                      disabled={isTesting || isDeleting}
+                      className="p-1.5 text-gray-400 hover:text-red-500 rounded opacity-0 group-hover:opacity-100 hover:bg-gray-100 dark:hover:bg-gray-600 transition-all"
                       title={t('common.delete')}
                     >
-                      <Trash2 className="w-4 h-4" />
+                      {isDeleting ? (
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                      ) : (
+                        <Trash2 className="w-4 h-4" />
+                      )}
                     </button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        )}
+
+        {/* Stats footer */}
+        {filteredConnections.length > 0 && (
+          <div className="text-sm text-gray-500 dark:text-gray-400">
+            Showing {filteredConnections.length} of {connections?.length || 0} connections
+          </div>
+        )}
+      </div>
+
+      {/* Delete Confirmation Modal */}
+      {deleteModalOpen && connectionToDelete && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+          <div className="bg-white dark:bg-gray-800 rounded-lg shadow-xl max-w-md w-full mx-4 p-6">
+            <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-2">
+              Delete Connection
+            </h3>
+            <p className="text-sm text-gray-600 dark:text-gray-400 mb-4">
+              Are you sure you want to delete <strong>"{connectionToDelete.name}"</strong>? This action cannot be undone.
+            </p>
+            <div className="flex justify-end gap-3">
+              <button
+                onClick={() => {
+                  setDeleteModalOpen(false)
+                  setConnectionToDelete(null)
+                }}
+                className="px-4 py-2 text-sm text-gray-700 dark:text-gray-300 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={confirmDelete}
+                disabled={deleteMutation.isPending}
+                className="px-4 py-2 text-sm text-white bg-red-600 hover:bg-red-700 rounded-lg transition-colors disabled:opacity-50"
+              >
+                {deleteMutation.isPending ? (
+                  <Loader2 className="w-4 h-4 animate-spin inline mr-1" />
+                ) : null}
+                Delete
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>
