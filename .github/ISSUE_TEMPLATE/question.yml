@@ -1,0 +1,37 @@
+name: Question
+description: Ask a question about Meridyen Sandbox
+title: "[Question]: "
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Have a question? We're happy to help!
+        For general discussion, consider using [GitHub Discussions](https://github.com/meridyen-ai/sandbox/discussions) instead.
+
+  - type: textarea
+    id: question
+    attributes:
+      label: Your Question
+      description: What would you like to know?
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Any relevant context (what you've tried, what you're building, etc.)
+
+  - type: dropdown
+    id: topic
+    attributes:
+      label: Topic
+      options:
+        - Installation / Setup
+        - Configuration
+        - Database Connectors
+        - API Usage
+        - Deployment
+        - Contributing
+        - Other
