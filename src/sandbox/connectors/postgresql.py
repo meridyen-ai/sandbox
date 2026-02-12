@@ -122,7 +122,10 @@ class PostgreSQLConnector(BaseConnector[Connection]):
 
             # Extract column info
             columns = [attr.name for attr in stmt.get_attributes()]
-            column_types = [str(attr.type) for attr in stmt.get_attributes()]
+            column_types = [
+                getattr(attr.type, 'name', str(attr.type))
+                for attr in stmt.get_attributes()
+            ]
 
             # Convert records to tuples
             rows = [tuple(r) for r in records]

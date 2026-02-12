@@ -9,9 +9,13 @@ from __future__ import annotations
 
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, date, timezone
+from datetime import datetime, date, time, timedelta, timezone
 from decimal import Decimal
+from enum import Enum
+from ipaddress import IPv4Address, IPv6Address, IPv4Network, IPv6Network
+from pathlib import Path
 from typing import Any, AsyncIterator
+from uuid import UUID
 
 from fastapi import FastAPI, HTTPException, Depends, Header, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,20 +40,57 @@ logger = get_logger(__name__)
 
 
 def _make_json_safe(value: Any) -> Any:
-    """Convert non-JSON-serializable values to strings."""
+    """Convert any database value to a JSON-serializable type.
+
+    Handles types from all supported databases (PostgreSQL, MySQL, MSSQL,
+    Snowflake, BigQuery, etc.) so the API response is database-agnostic.
+    """
     if value is None:
         return None
-    if isinstance(value, (datetime, date)):
+    # Primitives — fast path
+    if isinstance(value, (bool, int, float, str)):
+        return value
+    # Date/time types (all databases)
+    if isinstance(value, datetime):
         return value.isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, time):
+        return value.isoformat()
+    if isinstance(value, timedelta):
+        return value.total_seconds()
+    # Numeric types
     if isinstance(value, Decimal):
         return float(value)
-    if isinstance(value, bytes):
+    # UUID (PostgreSQL, etc.)
+    if isinstance(value, UUID):
+        return str(value)
+    # Binary data
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        if isinstance(value, memoryview):
+            value = bytes(value)
         return value.decode("utf-8", errors="replace")
+    # Network types (PostgreSQL)
+    if isinstance(value, (IPv4Address, IPv6Address, IPv4Network, IPv6Network)):
+        return str(value)
+    # Enum types
+    if isinstance(value, Enum):
+        return value.value
+    # Path
+    if isinstance(value, Path):
+        return str(value)
+    # Collections
     if isinstance(value, dict):
-        return {k: _make_json_safe(v) for k, v in value.items()}
+        return {str(k): _make_json_safe(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [_make_json_safe(v) for v in value]
-    return value
+    if isinstance(value, (set, frozenset)):
+        return [_make_json_safe(v) for v in value]
+    # Fallback — convert anything else to string
+    try:
+        return str(value)
+    except Exception:
+        return repr(value)
 
 
 # =============================================================================
@@ -409,7 +450,7 @@ def register_routes(app: FastAPI) -> None:
                             {"name": c.name, "type": c.data_type, "masked": c.is_masked}
                             for c in result.columns
                         ],
-                        "rows": result.rows,
+                        "rows": [_make_json_safe(row) for row in result.rows],
                         "row_count": result.row_count,
                         "total_rows_available": result.total_rows_available,
                     },

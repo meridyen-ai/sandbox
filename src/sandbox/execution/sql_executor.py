@@ -237,7 +237,8 @@ class SQLExecutor(BaseExecutor[SQLExecutionResult]):
         super().__init__(config)
         self.validator = SQLValidator(security_config)
         self.masker = DataMasker(security_config)
-        self._connection_pool: dict[str, Any] = {}
+        # Stores (connector, raw_connection) tuples per connection_id
+        self._connection_pool: dict[str, tuple[Any, Any]] = {}
 
     async def validate(self, context: ExecutionContext, **kwargs: Any) -> list[str]:
         """Validate SQL execution request."""
@@ -284,8 +285,8 @@ class SQLExecutor(BaseExecutor[SQLExecutionResult]):
         self._log_start(context, "sql", query_preview=query[:100])
 
         try:
-            # Get connection
-            connection = await self._get_connection(context.connection_id)
+            # Get connector and connection (database-agnostic)
+            connector, connection = await self._get_connection(context.connection_id)
 
             # Execute with timeout
             timeout = context.get_timeout(self.config)
@@ -293,7 +294,7 @@ class SQLExecutor(BaseExecutor[SQLExecutionResult]):
 
             try:
                 rows, columns = await asyncio.wait_for(
-                    self._execute_query(connection, query, parameters, max_rows),
+                    self._execute_query(connector, connection, query, parameters, max_rows),
                     timeout=timeout,
                 )
             except asyncio.TimeoutError:
@@ -355,8 +356,13 @@ class SQLExecutor(BaseExecutor[SQLExecutionResult]):
                 cause=e,
             )
 
-    async def _get_connection(self, connection_id: str | None) -> Any:
-        """Get database connection from pool."""
+    async def _get_connection(self, connection_id: str | None) -> tuple[Any, Any]:
+        """Get connector and connection from pool.
+
+        Returns a (connector, raw_connection) tuple. The connector provides
+        a database-agnostic execute() interface so SQLExecutor never calls
+        driver-specific APIs directly.
+        """
         if not connection_id:
             raise ValidationError("Connection ID is required")
 
@@ -370,54 +376,56 @@ class SQLExecutor(BaseExecutor[SQLExecutionResult]):
         if not conn_config:
             raise ValidationError(f"Connection not found: {connection_id}")
 
-        # Create connection based on database type
-        connection = await self._create_connection(conn_config)
-        self._connection_pool[connection_id] = connection
-        return connection
-
-    async def _create_connection(self, conn_config: Any) -> Any:
-        """Create a new database connection."""
+        # Create connector + connection (database-agnostic)
         from sandbox.connectors import get_connector
 
-        connector = get_connector(conn_config.db_type)
-        return await connector.connect(conn_config)
+        connector = get_connector(conn_config.db_type, config=conn_config)
+        connection = await connector.connect()
+        self._connection_pool[connection_id] = (connector, connection)
+        return connector, connection
 
     async def _execute_query(
         self,
+        connector: Any,
         connection: Any,
         query: str,
         parameters: dict[str, Any] | None,
         max_rows: int,
     ) -> tuple[list[dict[str, Any]], list[ColumnInfo]]:
-        """Execute query and return results with column info."""
-        # This is a simplified implementation
-        # The actual implementation depends on the database driver
-        cursor = await connection.execute(query, parameters or {})
+        """Execute query via the connector's database-agnostic interface.
 
-        # Get column information
+        Uses connector.execute() which returns a unified QueryResult
+        regardless of database type (PostgreSQL, MySQL, MSSQL, etc.).
+        """
+        result = await connector.execute(connection, query, parameters)
+
+        if not result.rows:
+            columns = [
+                ColumnInfo(name=name, data_type=dtype)
+                for name, dtype in zip(result.columns, result.column_types)
+            ]
+            return [], columns
+
+        # Build column info from the connector's QueryResult
         columns = [
-            ColumnInfo(
-                name=desc[0],
-                data_type=str(desc[1]) if len(desc) > 1 else "unknown",
-            )
-            for desc in cursor.description or []
+            ColumnInfo(name=name, data_type=dtype)
+            for name, dtype in zip(result.columns, result.column_types)
         ]
 
-        # Fetch rows as dictionaries
-        rows = []
-        column_names = [c.name for c in columns]
-        async for row in cursor:
-            if len(rows) >= max_rows + 1:  # Fetch one extra to detect truncation
-                break
-            rows.append(dict(zip(column_names, row)))
+        # Convert tuples to dicts, limit to max_rows + 1 for truncation detection
+        limit = max_rows + 1
+        rows = [
+            dict(zip(result.columns, row))
+            for row in result.rows[:limit]
+        ]
 
         return rows, columns
 
     async def close(self) -> None:
         """Close all connections in the pool."""
-        for connection in self._connection_pool.values():
+        for connector, connection in self._connection_pool.values():
             try:
-                await connection.close()
+                await connector.close_connection(connection)
             except Exception as e:
                 logger.warning("connection_close_error", error=str(e))
         self._connection_pool.clear()
