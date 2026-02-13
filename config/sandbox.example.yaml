@@ -69,6 +69,7 @@ security:
     - random
     - string
     - textwrap
+    - warnings
 
     # Data processing
     - pandas

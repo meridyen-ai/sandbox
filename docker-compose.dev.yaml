@@ -29,6 +29,9 @@ services:
       - SANDBOX_ENVIRONMENT=development
       - SANDBOX_DEBUG=true
       - PYTHONUNBUFFERED=1
+      # Limit OpenBLAS/numpy threads to prevent memory allocation failures
+      - OPENBLAS_NUM_THREADS=1
+      - OMP_NUM_THREADS=1
       # Skip cloud registration in development (use airgapped mode)
       - SANDBOX_EXECUTION_MODE=airgapped
       # Disable TLS for development

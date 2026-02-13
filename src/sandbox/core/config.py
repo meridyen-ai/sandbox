@@ -108,6 +108,7 @@ class SecurityConfig(BaseModel):
         default_factory=lambda: [
             "json", "math", "datetime", "re", "collections", "itertools", "functools",
             "statistics", "decimal", "fractions", "random", "string", "textwrap",
+            "warnings",
             "pandas", "numpy", "scipy", "sklearn", "statsmodels", "plotly",
         ],
         description="Allowed Python imports"
