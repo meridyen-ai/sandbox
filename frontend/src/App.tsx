@@ -31,8 +31,8 @@ function App() {
         </Route>
 
         {/* ============================================= */}
-        {/* Embed mode (cloud - loaded in MVP iframe)     */}
-        {/* No header/nav/auth - MVP handles those        */}
+        {/* Embed mode (loaded in host app iframe)         */}
+        {/* No header/nav/auth - host app handles those   */}
         {/* ============================================= */}
         <Route path="/embed" element={<EmbedLayout />}>
           <Route index element={<Navigate to="/embed/connections" replace />} />

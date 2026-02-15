@@ -207,13 +207,32 @@ class PlatformConnectionConfig(BaseModel):
 class AuthenticationConfig(BaseModel):
     """Configuration for sandbox authentication."""
 
-    mvp_api_url: str = Field(
-        "http://localhost:8000",
-        description="AI_Assistants_MVP API URL for key validation"
+    # Provider selection
+    provider: str = Field(
+        "static",
+        description="Auth provider: 'static' (local keys), 'remote' (HTTP endpoint), 'noop' (dev only)",
     )
-    api_timeout: float = Field(5.0, description="API request timeout in seconds", ge=1.0, le=30.0)
     enable_api_key_auth: bool = Field(True, description="Enable API key authentication")
-    allow_jwt_auth: bool = Field(True, description="Allow JWT authentication (legacy)")
+    allow_jwt_auth: bool = Field(True, description="Allow JWT authentication (platform communication)")
+
+    # Static provider settings
+    static_keys: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="API keys for the 'static' provider",
+    )
+
+    # Remote provider settings
+    remote_url: str = Field(
+        "http://localhost:8000/api/v1/sandbox/validate-key",
+        description="URL of the remote key validation endpoint",
+    )
+    remote_timeout: float = Field(
+        5.0, description="Remote auth request timeout in seconds", ge=1.0, le=30.0
+    )
+    remote_headers: dict[str, str] = Field(
+        default_factory=dict,
+        description="Additional headers to send with remote auth requests",
+    )
 
 
 class LocalLLMConfig(BaseModel):

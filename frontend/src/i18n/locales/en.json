@@ -33,11 +33,11 @@
     "subtitle": "Secure execution environment for SQL and Python",
     "apiKeyLabel": "Sandbox API Key",
     "apiKeyPlaceholder": "sb_xxxxxxxxxxxxxxxx",
-    "apiKeyHelp": "Enter your sandbox API key from AI Assistants MVP",
+    "apiKeyHelp": "Enter your sandbox API key",
     "validating": "Validating...",
     "continue": "Continue",
     "noApiKey": "Don't have an API key?",
-    "createApiKey": "Create one in AI Assistants MVP",
+    "createApiKey": "Create one in your admin panel",
     "apiKeyPrefix": "Sandbox API keys start with",
     "errors": {
       "emptyKey": "Please enter your sandbox API key",

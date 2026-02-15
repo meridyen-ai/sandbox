@@ -1,0 +1,48 @@
+{
+  "name": "@meridyen/sandbox-client",
+  "version": "0.9.0",
+  "description": "TypeScript client for Meridyen Sandbox execution engine",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup src/index.ts --format cjs,esm --dts",
+    "dev": "tsup src/index.ts --format cjs,esm --dts --watch",
+    "test": "vitest",
+    "lint": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "devDependencies": {
+    "tsup": "^8.0.0",
+    "typescript": "^5.3.0",
+    "vitest": "^1.2.0"
+  },
+  "keywords": [
+    "sandbox",
+    "sql",
+    "python",
+    "code-execution",
+    "secure",
+    "meridyen"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/meridyen-ai/sandbox.git",
+    "directory": "sdks/typescript"
+  },
+  "homepage": "https://github.com/meridyen-ai/sandbox",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

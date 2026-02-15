@@ -26,7 +26,7 @@ If a user tries to access these routes without a valid API key, they are automat
 
 **How to Get a Sandbox API Key:**
 
-1. Go to AI_Assistants_MVP Frontend: http://localhost:13000
+1. Go to your platform admin panel
 2. Login with your account
 3. Navigate to **Settings → API Keys**
 4. Click **"Create Key"**

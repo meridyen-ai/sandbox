@@ -4,9 +4,9 @@ import { embedBridge } from '../../lib/embedBridge'
 
 /**
  * Layout for embed mode (no header, no sidebar, no auth wall).
- * Used when sandbox is loaded inside an iframe in the MVP UI.
+ * Used when sandbox is loaded inside an iframe in a host application.
  *
- * - No navigation chrome (MVP provides its own)
+ * - No navigation chrome (host app provides its own)
  * - Listens for navigation commands from parent
  * - Reports route changes to parent
  * - Auto-resizes to content height
@@ -15,10 +15,10 @@ export function EmbedLayout() {
   const location = useLocation()
   const navigate = useNavigate()
 
-  // Initialize embed bridge and listen for MVP messages
+  // Initialize embed bridge and listen for host app messages
   useEffect(() => {
-    // Handle init message from MVP (token, theme, locale)
-    const unsubInit = embedBridge.on('mvp:init', (data) => {
+    // Handle init message from host app (token, theme, locale)
+    const unsubInit = embedBridge.on('host:init', (data) => {
       const { token, theme } = data as { token?: string; theme?: string }
 
       // Store the auth token for API calls
@@ -34,16 +34,16 @@ export function EmbedLayout() {
       }
     })
 
-    // Handle navigation commands from MVP
-    const unsubNav = embedBridge.on('mvp:navigate', (data) => {
+    // Handle navigation commands from host app
+    const unsubNav = embedBridge.on('host:navigate', (data) => {
       const { path } = data as { path: string }
       if (path) {
         navigate(path)
       }
     })
 
-    // Handle theme changes from MVP
-    const unsubTheme = embedBridge.on('mvp:theme-changed', (data) => {
+    // Handle theme changes from host app
+    const unsubTheme = embedBridge.on('host:theme-changed', (data) => {
       const { theme } = data as { theme: string }
       if (theme === 'dark') {
         document.documentElement.classList.add('dark')

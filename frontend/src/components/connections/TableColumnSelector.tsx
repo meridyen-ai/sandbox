@@ -1,9 +1,8 @@
 /**
- * Table and Column Selector Component (Sandbox version)
+ * Table and Column Selector Component
  *
- * Adapted from the MVP's TableColumnSelector to work with the sandbox's
- * schema API. Provides a ThoughtSpot-style UI for selecting which tables
- * and columns should be synced to the MVP.
+ * Provides a UI for selecting which tables and columns should be
+ * synced to the host platform via the schema sync API.
  */
 
 import React, { useState, useEffect, useMemo } from 'react'
@@ -49,8 +48,7 @@ interface DatabaseGroup {
 type TabType = 'all' | 'selected'
 
 /**
- * Convert sandbox SchemaData (from schemaApi.sync) to TableWithColumns[]
- * that matches the MVP's format.
+ * Convert SchemaData (from schemaApi.sync) to TableWithColumns[].
  */
 function schemaDataToTableWithColumns(data: SchemaData): TableWithColumns[] {
   const schemaName = data.schema || 'public'
@@ -99,7 +97,7 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
     setLoading(true)
     setError(null)
     try {
-      // Use sandbox's schemaApi.sync instead of MVP's getConnectionSchema
+      // Fetch schema via schemaApi.sync
       const schemaData = await schemaApi.sync(connectionId, true, 10)
       const data = schemaDataToTableWithColumns(schemaData)
       setSchema(data)

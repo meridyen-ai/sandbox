@@ -189,7 +189,7 @@ async def verify_sandbox_token(
     Supports two authentication methods:
     1. Sandbox API Key (sb_*) - Preferred method for user authentication
        - Header: Authorization: Bearer sb_xxx OR X-API-Key: sb_xxx
-       - Validates against AI_Assistants_MVP database
+       - Validates against configured auth provider
 
     2. JWT Token (legacy) - For platform-to-sandbox communication
        - Header: Authorization: Bearer <jwt_token>
@@ -198,7 +198,7 @@ async def verify_sandbox_token(
     Returns:
         Dict with workspace_id, user_id, and other context
     """
-    from sandbox.auth.sandbox_auth import get_authenticator
+    from sandbox.auth.sandbox_auth import get_auth_provider
 
     config = get_config()
 
@@ -217,26 +217,26 @@ async def verify_sandbox_token(
 
     # Check if it's a sandbox API key (sb_* prefix)
     if api_key.startswith("sb_"):
-        authenticator = get_authenticator()
-        if not authenticator:
-            raise AuthenticationError("Sandbox authenticator not initialized")
+        provider = get_auth_provider()
+        if not provider:
+            raise AuthenticationError("Auth provider not initialized")
 
-        workspace_context = await authenticator.verify_sandbox_key(api_key)
-        if not workspace_context:
+        auth_result = await provider.verify(api_key)
+        if not auth_result:
             raise AuthenticationError("Invalid or inactive sandbox API key")
 
         # Return workspace context
         return {
             "auth_type": "sandbox_api_key",
-            "workspace_id": str(workspace_context["workspace_id"]),
-            "workspace_name": workspace_context["workspace_name"],
-            "user_id": str(workspace_context.get("user_id")) if workspace_context.get("user_id") else None,
-            "api_key_name": workspace_context["api_key_name"],
-            "permissions": workspace_context.get("permissions", {
+            "workspace_id": str(auth_result.workspace_id) if auth_result.workspace_id else None,
+            "workspace_name": auth_result.workspace_name,
+            "user_id": str(auth_result.user_id) if auth_result.user_id else None,
+            "api_key_name": auth_result.api_key_name,
+            "permissions": auth_result.permissions or {
                 "execute_sql": True,
                 "execute_python": True,
                 "generate_visualizations": True,
-            })
+            },
         }
 
     # Otherwise, try to decode as JWT (legacy method for platform communication)
@@ -282,17 +282,14 @@ def create_rest_app() -> FastAPI:
         setup_logging()
         logger.info("rest_api_starting", port=config.server.rest_port)
 
-        # Initialize authenticator if API key auth is enabled
+        # Initialize auth provider if API key auth is enabled
         if config.authentication.enable_api_key_auth:
-            from sandbox.auth.sandbox_auth import initialize_authenticator
+            from sandbox.auth.sandbox_auth import initialize_auth_provider
             try:
-                initialize_authenticator(
-                    config.authentication.mvp_api_url,
-                    config.authentication.api_timeout
-                )
-                logger.info(f"Sandbox API key authentication initialized (MVP API: {config.authentication.mvp_api_url})")
+                initialize_auth_provider(config)
+                logger.info(f"Auth provider initialized: {config.authentication.provider}")
             except Exception as e:
-                logger.error(f"Failed to initialize authenticator: {e}")
+                logger.error(f"Failed to initialize auth provider: {e}")
                 if config.environment == "production":
                     raise
 
@@ -308,12 +305,12 @@ def create_rest_app() -> FastAPI:
         logger.info("rest_api_stopping")
         await app.state.sql_executor.close()
 
-        # Close authenticator
+        # Close auth provider
         if config.authentication.enable_api_key_auth:
-            from sandbox.auth.sandbox_auth import get_authenticator
-            authenticator = get_authenticator()
-            if authenticator:
-                await authenticator.close()
+            from sandbox.auth.sandbox_auth import get_auth_provider
+            provider = get_auth_provider()
+            if provider:
+                await provider.close()
 
     app = FastAPI(
         title="Meridyen Sandbox API",
@@ -836,7 +833,7 @@ def register_routes(app: FastAPI) -> None:
             )
 
     # ==========================================================================
-    # Schema Sync (for AI Assistants MVP integration)
+    # Schema Sync
     # ==========================================================================
 
     @app.get("/api/v1/schema/sync", tags=["Schema"])
@@ -850,7 +847,7 @@ def register_routes(app: FastAPI) -> None:
         Sync schema from database connection.
 
         Returns schema with tables, columns, data types, and optional sample data.
-        Compatible with AI Assistants MVP schema format.
+        Returns database schema metadata with tables, columns, and optional sample data.
         """
         from sandbox.connectors.factory import get_connector
         from sandbox.core.config import get_config
@@ -946,7 +943,7 @@ def register_routes(app: FastAPI) -> None:
         """
         Bulk sync: returns all connections with schemas and sample data.
 
-        Used by AI Assistants MVP to pull all connection metadata in one call.
+        Pulls all connection metadata in one call.
         No credentials are included in the response.
         """
         from sandbox.connectors.factory import get_connector
@@ -1068,8 +1065,6 @@ def register_routes(app: FastAPI) -> None:
     ) -> JSONResponse:
         """
         Get sample data from a specific table.
-
-        Compatible with AI Assistants MVP getTableDataSamples() format.
         """
         from sandbox.connectors.factory import get_connector
         from sandbox.core.config import get_config

@@ -37,8 +37,9 @@ services:
       # Disable TLS for development
       - SANDBOX_PLATFORM__MTLS_ENABLED=false
       # Authentication configuration
-      - SANDBOX_AUTHENTICATION__MVP_API_URL=${SANDBOX_MVP_API_URL:-http://host.docker.internal:18000}
-      - SANDBOX_AUTHENTICATION__API_TIMEOUT=5.0
+      - SANDBOX_AUTHENTICATION__PROVIDER=${SANDBOX_AUTHENTICATION__PROVIDER:-remote}
+      - SANDBOX_AUTHENTICATION__REMOTE_URL=${SANDBOX_AUTHENTICATION__REMOTE_URL:-http://host.docker.internal:18000/api/v1/sandbox/validate-key}
+      - SANDBOX_AUTHENTICATION__REMOTE_TIMEOUT=5.0
       - SANDBOX_AUTHENTICATION__ENABLE_API_KEY_AUTH=true
 
     # Make host.docker.internal work on Linux

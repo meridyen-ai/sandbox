@@ -184,18 +184,33 @@ data_sharing:
 # Authentication Configuration
 # -----------------------------------------------------------------------------
 authentication:
-  # AI_Assistants_MVP database connection for API key validation
-  # This database contains the api_keys table for authentication
-  # Use environment variable: SANDBOX_AUTHENTICATION__MVP_DATABASE_URL
-  mvp_api_url: "http://localhost:8000"
-  api_timeout: 5.0
-
+  # Auth provider: 'static' (local keys), 'remote' (HTTP endpoint), 'noop' (dev only)
+  provider: static
 
   # Enable API key authentication (recommended for production)
   enable_api_key_auth: true
 
-  # Allow JWT authentication (legacy, for platform communication)
+  # Allow JWT authentication (for platform-to-sandbox communication)
   allow_jwt_auth: true
+
+  # --- Static provider settings ---
+  # Define API keys directly in config (for standalone deployments)
+  static_keys:
+    - key: "sb_change-me-in-production"
+      workspace_id: "default"
+      workspace_name: "Default Workspace"
+      name: "default-key"
+      permissions:
+        execute_sql: true
+        execute_python: true
+        generate_visualizations: true
+
+  # --- Remote provider settings ---
+  # Validate keys by calling an external HTTP endpoint
+  # remote_url: "https://your-auth-api.com/api/v1/validate-key"
+  # remote_timeout: 5.0
+  # remote_headers:
+  #   X-Service-Token: "your-internal-token"
 
 # -----------------------------------------------------------------------------
 # Platform Connection (Hybrid Mode)

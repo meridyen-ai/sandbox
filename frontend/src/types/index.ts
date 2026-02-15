@@ -93,7 +93,7 @@ export interface HandlerInfo {
   connection_args: ConnectionArg[]
 }
 
-// Types for table/column selection (mirrors MVP's dataConnectorsApi types)
+// Types for table/column selection
 export interface ColumnInfo {
   name: string
   data_type: string
