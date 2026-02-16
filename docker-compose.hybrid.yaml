@@ -12,6 +12,41 @@ name: meridyen-sandbox-hybrid
 
 services:
   # ---------------------------------------------------------------------------
+  # Sandbox PostgreSQL - Dedicated database for uploaded file data
+  # ---------------------------------------------------------------------------
+  sandbox-postgres:
+    image: postgres:16-alpine
+    container_name: meridyen-sandbox-postgres
+    restart: unless-stopped
+
+    ports:
+      - "${SANDBOX_PG_PORT:-5433}:5432"
+
+    environment:
+      - POSTGRES_DB=sandbox_uploads
+      - POSTGRES_USER=sandbox
+      - POSTGRES_PASSWORD=sandbox_password
+
+    volumes:
+      - sandbox_postgres_data:/var/lib/postgresql/data
+
+    networks:
+      - sandbox-network
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sandbox -d sandbox_uploads"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ---------------------------------------------------------------------------
   # Sandbox Container
   # ---------------------------------------------------------------------------
   sandbox:
@@ -21,6 +56,10 @@ services:
       dockerfile: Dockerfile
     container_name: meridyen-sandbox
     restart: unless-stopped
+
+    depends_on:
+      sandbox-postgres:
+        condition: service_healthy
 
     ports:
       - "${SANDBOX_REST_PORT:-8081}:8080"
@@ -41,6 +80,13 @@ services:
       - SANDBOX_RESOURCE_LIMITS__MAX_MEMORY_MB=${MAX_MEMORY_MB:-512}
       - SANDBOX_RESOURCE_LIMITS__MAX_CPU_SECONDS=${MAX_CPU_SECONDS:-60}
       - SANDBOX_RESOURCE_LIMITS__MAX_ROWS=${MAX_ROWS:-100000}
+
+      # Upload database (sandbox-postgres)
+      - SANDBOX_UPLOAD_DB_HOST=sandbox-postgres
+      - SANDBOX_UPLOAD_DB_PORT=5432
+      - SANDBOX_UPLOAD_DB_NAME=sandbox_uploads
+      - SANDBOX_UPLOAD_DB_USER=sandbox
+      - SANDBOX_UPLOAD_DB_PASSWORD=sandbox_password
 
     volumes:
       # Configuration
@@ -82,6 +128,8 @@ volumes:
   sandbox_data:
     driver: local
   sandbox_logs:
+    driver: local
+  sandbox_postgres_data:
     driver: local
 
 networks:

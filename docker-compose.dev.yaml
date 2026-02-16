@@ -19,6 +19,10 @@ services:
       context: .
     container_name: meridyen-sandbox-dev
 
+    depends_on:
+      sandbox-postgres:
+        condition: service_healthy
+
     # Clear inherited ENTRYPOINT so command runs directly
     entrypoint: []
 
@@ -41,6 +45,12 @@ services:
       - SANDBOX_AUTHENTICATION__REMOTE_URL=${SANDBOX_AUTHENTICATION__REMOTE_URL:-http://host.docker.internal:18000/api/v1/sandbox/validate-key}
       - SANDBOX_AUTHENTICATION__REMOTE_TIMEOUT=5.0
       - SANDBOX_AUTHENTICATION__ENABLE_API_KEY_AUTH=true
+      # Upload database
+      - SANDBOX_UPLOAD_DB_HOST=sandbox-postgres
+      - SANDBOX_UPLOAD_DB_PORT=5432
+      - SANDBOX_UPLOAD_DB_NAME=sandbox_uploads
+      - SANDBOX_UPLOAD_DB_USER=sandbox
+      - SANDBOX_UPLOAD_DB_PASSWORD=sandbox_password
 
     # Make host.docker.internal work on Linux
     extra_hosts:

@@ -65,7 +65,7 @@ class DatabaseConnectionConfig(BaseModel):
     name: str = Field(..., description="Human-readable connection name")
     db_type: DatabaseType = Field(..., description="Database type")
     host: str = Field(..., description="Database host")
-    port: int = Field(..., description="Database port")
+    port: int = Field(0, description="Database port (0 for file-based sources)")
     database: str = Field(..., description="Database name")
     username: str = Field(..., description="Database username")
     password: SecretStr = Field(..., description="Database password")
@@ -83,6 +83,8 @@ class DatabaseConnectionConfig(BaseModel):
     @field_validator("port")
     @classmethod
     def validate_port(cls, v: int) -> int:
+        if v == 0:
+            return v  # Allow 0 for file-based data sources
         if not 1 <= v <= 65535:
             raise ValueError("Port must be between 1 and 65535")
         return v

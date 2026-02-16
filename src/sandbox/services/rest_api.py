@@ -842,7 +842,7 @@ def register_routes(app: FastAPI) -> None:
     # File Upload (CSV, XLSX, XLS)
     # ==========================================================================
 
-    FILE_UPLOAD_DIR = Path("/tmp/sandbox_uploads")
+    FILE_UPLOAD_DIR = Path("/app/data/uploads")
     ALLOWED_FILE_EXTENSIONS = {".csv", ".xlsx", ".xls"}
 
     @app.post("/api/v1/upload-file", tags=["File Upload"])
@@ -855,13 +855,18 @@ def register_routes(app: FastAPI) -> None:
         token_data: dict = Depends(verify_sandbox_token),
     ) -> JSONResponse:
         """
-        Upload a CSV, XLSX, or XLS file and create connection(s).
-        For Excel files with multiple sheets, creates one connection per selected sheet.
+        Upload a CSV, XLSX, or XLS file and load it into the sandbox PostgreSQL.
+        Each CSV becomes a table; each Excel sheet becomes a separate table.
+        Data is queryable via standard SQL after upload.
         """
         import os
         import pandas as pd
         from sandbox.core.config import (
             DatabaseConnectionConfig, DatabaseType, get_config, save_persisted_connections,
+        )
+        from sandbox.services.file_loader import (
+            get_upload_engine, get_upload_db_config, sanitize_table_name,
+            load_csv_to_postgres, load_excel_sheet_to_postgres, UPLOADS_SCHEMA,
         )
         from pydantic import SecretStr
 
@@ -882,21 +887,25 @@ def register_routes(app: FastAPI) -> None:
         filename = f"{safe_name}_{unique_id}{file_ext}"
         file_path = str(FILE_UPLOAD_DIR / filename)
 
+        # Stream file to disk in chunks (handles large files without loading into memory)
         try:
-            content = await file.read()
             with open(file_path, "wb") as f:
-                f.write(content)
+                while chunk := await file.read(1024 * 1024):  # 1MB chunks
+                    f.write(chunk)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}")
 
         has_header_bool = has_header.lower() == "true"
         config = get_config()
         now = datetime.now(timezone.utc).isoformat()
+        db_config = get_upload_db_config()
 
         try:
+            sql_engine = get_upload_engine()
+
             if is_excel:
-                engine = "openpyxl" if file_ext == ".xlsx" else "xlrd"
-                excel_file = pd.ExcelFile(file_path, engine=engine)
+                excel_engine = "openpyxl" if file_ext == ".xlsx" else "xlrd"
+                excel_file = pd.ExcelFile(file_path, engine=excel_engine)
                 all_sheets = excel_file.sheet_names
 
                 if not all_sheets:
@@ -915,83 +924,103 @@ def register_routes(app: FastAPI) -> None:
                 else:
                     sheets_to_import = all_sheets
 
+                base_table = sanitize_table_name(name)
                 connections = []
                 total_rows = 0
+                sheet_stats = []
 
                 for sheet_name in sheets_to_import:
-                    df = pd.read_excel(
-                        file_path, sheet_name=sheet_name,
-                        header=0 if has_header_bool else None, engine=engine,
+                    # Table name: base_sheetname for multi-sheet, just base for single
+                    if len(sheets_to_import) > 1:
+                        table_name = f"{base_table}_{sanitize_table_name(sheet_name)}"
+                    else:
+                        table_name = base_table
+
+                    result = load_excel_sheet_to_postgres(
+                        file_path, sheet_name, table_name,
+                        has_header=has_header_bool, engine=sql_engine,
                     )
-                    row_count = len(df)
-                    if row_count == 0:
+
+                    if result["row_count"] == 0:
                         continue
 
-                    total_rows += row_count
-                    conn_name = f"{name} - {sheet_name}" if len(sheets_to_import) > 1 else name
-                    conn_id = str(uuid.uuid4())
-
-                    # Persist as a config entry with extra_config for file metadata
-                    new_conn = DatabaseConnectionConfig(
-                        id=conn_id,
-                        name=conn_name,
-                        db_type=DatabaseType.POSTGRESQL,  # placeholder type
-                        host="",
-                        port=0,
-                        database="",
-                        username="",
-                        password=SecretStr(""),
-                        created_at=now,
-                        updated_at=now,
-                    )
-                    # Store file metadata in extra fields
-                    if not hasattr(new_conn, "extra_config"):
-                        new_conn.__dict__["extra_config"] = {}
-                    new_conn.__dict__["extra_config"] = {
-                        "handler_type": "excel",
-                        "file_url": file_path,
-                        "file_type": file_ext.lstrip("."),
+                    total_rows += result["row_count"]
+                    sheet_stats.append({
                         "sheet_name": sheet_name,
-                        "all_sheets": all_sheets,
-                        "header_row": 0 if has_header_bool else None,
-                    }
-
-                    config.database_connections.append(new_conn)
-                    connections.append({
-                        "connection_id": conn_id,
-                        "name": conn_name,
-                        "sheet_name": sheet_name,
-                        "row_count": row_count,
+                        "table_name": result["table_name"],
+                        "row_count": result["row_count"],
+                        "column_count": result["column_count"],
                     })
 
-                if not connections:
+                if not sheet_stats:
                     os.remove(file_path)
                     raise HTTPException(status_code=400, detail="All sheets are empty")
 
+                # Create ONE connection for the upload database
+                conn_id = str(uuid.uuid4())
+                new_conn = DatabaseConnectionConfig(
+                    id=conn_id,
+                    name=name,
+                    db_type=DatabaseType.POSTGRESQL,
+                    host=db_config["host"],
+                    port=db_config["port"],
+                    database=db_config["database"],
+                    username=db_config["username"],
+                    password=SecretStr(db_config["password"]),
+                    schema_name=UPLOADS_SCHEMA,
+                    ssl_enabled=False,
+                    created_at=now,
+                    updated_at=now,
+                )
+                config.database_connections.append(new_conn)
                 save_persisted_connections(config)
+
+                # Build backward-compatible connections list
+                connections = [
+                    {
+                        "connection_id": conn_id,
+                        "name": f"{name} - {s['sheet_name']}" if len(sheet_stats) > 1 else name,
+                        "sheet_name": s["sheet_name"],
+                        "table_name": s["table_name"],
+                        "row_count": s["row_count"],
+                    }
+                    for s in sheet_stats
+                ]
+
+                # Clean up source file after successful load
+                if os.path.exists(file_path):
+                    os.remove(file_path)
 
                 return JSONResponse(
                     status_code=201,
                     content={
                         "success": True,
-                        "message": f"Excel file uploaded: {len(connections)} sheet(s), {total_rows} total rows",
-                        "connection_id": connections[0]["connection_id"],
+                        "message": f"Excel file loaded into PostgreSQL: {len(sheet_stats)} sheet(s), {total_rows} total rows",
+                        "connection_id": conn_id,
+                        "name": name,
+                        "db_type": "csv",
+                        "source_type": "excel",
+                        "host": db_config["host"],
+                        "port": db_config["port"],
+                        "database": db_config["database"],
+                        "schema_name": UPLOADS_SCHEMA,
+                        "upload_tables": [s["table_name"] for s in sheet_stats],
                         "connections": connections,
                         "row_count": total_rows,
-                        "file_path": file_path,
                         "sheets": all_sheets,
+                        "sheet_stats": sheet_stats,
                     },
                 )
             else:
-                # CSV
-                df = pd.read_csv(
-                    file_path, sep=delimiter,
-                    header=0 if has_header_bool else None,
+                # CSV — load into PostgreSQL
+                table_name = sanitize_table_name(name)
+                result = load_csv_to_postgres(
+                    file_path, table_name,
+                    delimiter=delimiter, has_header=has_header_bool,
+                    engine=sql_engine,
                 )
-                row_count = len(df)
-                column_count = len(df.columns)
 
-                if row_count == 0:
+                if result["row_count"] == 0:
                     os.remove(file_path)
                     raise HTTPException(status_code=400, detail="CSV file is empty")
 
@@ -999,36 +1028,41 @@ def register_routes(app: FastAPI) -> None:
                 new_conn = DatabaseConnectionConfig(
                     id=conn_id,
                     name=name,
-                    db_type=DatabaseType.POSTGRESQL,  # placeholder type
-                    host="",
-                    port=0,
-                    database="",
-                    username="",
-                    password=SecretStr(""),
+                    db_type=DatabaseType.POSTGRESQL,
+                    host=db_config["host"],
+                    port=db_config["port"],
+                    database=db_config["database"],
+                    username=db_config["username"],
+                    password=SecretStr(db_config["password"]),
+                    schema_name=UPLOADS_SCHEMA,
+                    ssl_enabled=False,
                     created_at=now,
                     updated_at=now,
                 )
-                new_conn.__dict__["extra_config"] = {
-                    "handler_type": "csv",
-                    "file_url": file_path,
-                    "file_type": "csv",
-                    "delimiter": delimiter,
-                    "encoding": "utf-8",
-                    "header_row": 0 if has_header_bool else None,
-                }
-
                 config.database_connections.append(new_conn)
                 save_persisted_connections(config)
+
+                # Clean up source file after successful load
+                if os.path.exists(file_path):
+                    os.remove(file_path)
 
                 return JSONResponse(
                     status_code=201,
                     content={
                         "success": True,
-                        "message": f"CSV uploaded: {row_count} rows, {column_count} columns",
+                        "message": f"CSV loaded into PostgreSQL: {result['row_count']} rows, {result['column_count']} columns",
                         "connection_id": conn_id,
-                        "row_count": row_count,
-                        "column_count": column_count,
-                        "file_path": file_path,
+                        "name": name,
+                        "db_type": "csv",
+                        "source_type": "csv",
+                        "host": db_config["host"],
+                        "port": db_config["port"],
+                        "database": db_config["database"],
+                        "schema_name": UPLOADS_SCHEMA,
+                        "upload_tables": [result["table_name"]],
+                        "table_name": result["table_name"],
+                        "row_count": result["row_count"],
+                        "column_count": result["column_count"],
                     },
                 )
 
@@ -1038,7 +1072,7 @@ def register_routes(app: FastAPI) -> None:
             import os as _os
             if _os.path.exists(file_path):
                 _os.remove(file_path)
-            raise HTTPException(status_code=400, detail=f"Failed to parse file: {str(e)}")
+            raise HTTPException(status_code=400, detail=f"Failed to load file into database: {str(e)}")
 
     @app.post("/api/v1/upload-file/sheets", tags=["File Upload"])
     async def get_file_sheets(
@@ -1200,15 +1234,21 @@ def register_routes(app: FastAPI) -> None:
         """
         from sandbox.connectors.factory import get_connector
         from sandbox.core.config import get_config
+        from sandbox.services.file_loader import UPLOADS_SCHEMA
 
         config = get_config()
         synced_connections = []
 
         for conn_config in config.database_connections:
+            # Connections using the uploads schema are CSV/Excel uploads — report as "csv"
+            display_db_type = (
+                "csv" if conn_config.schema_name == UPLOADS_SCHEMA
+                else conn_config.db_type.value
+            )
             connection_data = {
                 "id": conn_config.id,
                 "name": conn_config.name,
-                "db_type": conn_config.db_type.value,
+                "db_type": display_db_type,
                 "host": conn_config.host,
                 "port": conn_config.port,
                 "database": conn_config.database,
