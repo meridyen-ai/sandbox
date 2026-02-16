@@ -23,6 +23,45 @@ export interface SheetInfo {
   preview_rows: number
 }
 
+// Query Explorer types
+export interface QueryColumn {
+  name: string
+  type: string
+}
+
+export interface QueryResult {
+  columns: QueryColumn[]
+  rows: any[]
+  row_count: number
+  total_rows_available?: number
+}
+
+export interface QueryExecutionResponse {
+  status: 'success' | 'error'
+  data?: QueryResult
+  message?: string
+}
+
+export interface ConnectionWithSchema {
+  id: string
+  name: string
+  db_type: string
+  host: string
+  port: number
+  database: string
+  tables: Array<{
+    name: string
+    columns: Array<{ name: string; data_type: string }>
+  }>
+}
+
+export interface AIGenerateQueryResponse {
+  success: boolean
+  sql_query?: string
+  explanation?: string
+  error?: string
+}
+
 export interface SandboxUIApi {
   handlers: {
     list: () => Promise<HandlerInfo[]>
@@ -46,6 +85,13 @@ export interface SandboxUIApi {
       selectedSheets?: string[]
     }) => Promise<FileUploadResult>
     getSheets: (file: File) => Promise<{ sheets: SheetInfo[] }>
+  }
+  query?: {
+    fullSync: () => Promise<{ connections: ConnectionWithSchema[] }>
+    executeSql: (connectionId: string, sql: string) => Promise<QueryExecutionResponse>
+  }
+  ai?: {
+    generateQuery: (connectionId: string, userQuery: string) => Promise<AIGenerateQueryResponse>
   }
 }
 

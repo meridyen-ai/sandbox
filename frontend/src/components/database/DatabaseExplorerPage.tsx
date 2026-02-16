@@ -1,17 +1,22 @@
 /**
  * Database Explorer Page
  *
- * Full-page view for the database query explorer using SQL Pad.
+ * Full-page view wrapping the SDK's DatabaseExplorer component.
  */
 
-import { DatabaseExplorer } from './DatabaseExplorer';
+import { DatabaseExplorer, SandboxUIProvider } from '@meridyen/sandbox-ui';
+import { useSandboxApiAdapter } from '../../hooks/useSandboxApiAdapter';
 
 export function DatabaseExplorerPage() {
+  const api = useSandboxApiAdapter();
+
   return (
-    <div className="h-screen flex flex-col bg-gray-50">
-      <div className="flex-1 p-4">
-        <DatabaseExplorer fullscreen={false} />
+    <SandboxUIProvider api={api} iconBasePath="/icons/databases">
+      <div className="h-screen flex flex-col bg-gray-50">
+        <div className="flex-1 p-4">
+          <DatabaseExplorer fullscreen={false} />
+        </div>
       </div>
-    </div>
+    </SandboxUIProvider>
   );
 }

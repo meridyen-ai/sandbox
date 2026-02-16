@@ -1,45 +1,19 @@
 /**
- * Database Explorer Component
+ * Database Explorer Component (SDK)
  *
- * Built-in SQL query editor and result viewer.
- * Uses the sandbox /api/v1/execute/sql endpoint directly — no external dependencies.
+ * SQL query editor, result viewer, and AI query assistant.
+ * Uses SandboxUIApi from the provider for all API calls.
  */
 
-import { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Database, Play, X, Maximize2, Minimize2, ChevronRight, ChevronDown, Table, Columns, Wand2, Loader2, Copy, ArrowRight } from 'lucide-react';
-import { useApi } from '../../hooks/useApi';
+import { useSandboxApi } from '../context/SandboxUIContext';
+import type { ConnectionWithSchema, QueryResult } from '../context/types';
 
-interface DatabaseExplorerProps {
+export interface DatabaseExplorerProps {
   connectionId?: string;
   onClose?: () => void;
   fullscreen?: boolean;
-}
-
-interface Connection {
-  id: string;
-  name: string;
-  db_type: string;
-  host: string;
-  port: number;
-  database: string;
-  tables: TableInfo[];
-}
-
-interface TableInfo {
-  name: string;
-  columns: ColumnInfo[];
-}
-
-interface ColumnInfo {
-  name: string;
-  data_type: string;
-}
-
-interface QueryResult {
-  columns: { name: string; type: string }[];
-  rows: any[];
-  row_count: number;
-  total_rows_available?: number;
 }
 
 export function DatabaseExplorer({
@@ -47,9 +21,9 @@ export function DatabaseExplorer({
   onClose,
   fullscreen: initialFullscreen = false
 }: DatabaseExplorerProps) {
-  const { callApi } = useApi();
+  const api = useSandboxApi();
   const [isFullscreen, setIsFullscreen] = useState(initialFullscreen);
-  const [connections, setConnections] = useState<Connection[]>([]);
+  const [connections, setConnections] = useState<ConnectionWithSchema[]>([]);
   const [selectedConnection, setSelectedConnection] = useState<string | undefined>(connectionId);
   const [query, setQuery] = useState('');
   const [result, setResult] = useState<QueryResult | null>(null);
@@ -66,17 +40,25 @@ export function DatabaseExplorer({
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const aiInputRef = useRef<HTMLInputElement>(null);
 
+  const hasQueryApi = Boolean(api.query);
+  const hasAiApi = Boolean(api.ai);
+
   // Load schema on mount
   useEffect(() => {
     loadSchema();
   }, []);
 
   const loadSchema = async () => {
+    if (!api.query) {
+      setLoadError('Query API not configured.');
+      setIsLoadingSchema(false);
+      return;
+    }
     setIsLoadingSchema(true);
     setLoadError(null);
     try {
-      const response = await callApi('/api/v1/schema/full-sync', { method: 'GET' });
-      const conns = response?.connections ?? response?.data ?? [];
+      const response = await api.query.fullSync();
+      const conns = response?.connections ?? [];
       if (conns.length > 0) {
         setConnections(conns);
         if (!selectedConnection) {
@@ -93,7 +75,7 @@ export function DatabaseExplorer({
   };
 
   const executeQuery = useCallback(async () => {
-    if (!query.trim() || !selectedConnection || isExecuting) return;
+    if (!query.trim() || !selectedConnection || isExecuting || !api.query) return;
 
     setIsExecuting(true);
     setQueryError(null);
@@ -101,13 +83,7 @@ export function DatabaseExplorer({
     const startTime = performance.now();
 
     try {
-      const response = await callApi('/api/v1/execute/sql', {
-        method: 'POST',
-        data: {
-          context: { connection_id: selectedConnection },
-          query: query.trim(),
-        },
-      });
+      const response = await api.query.executeSql(selectedConnection, query.trim());
 
       setExecutionTime(Math.round(performance.now() - startTime));
 
@@ -119,7 +95,7 @@ export function DatabaseExplorer({
           total_rows_available: response.data.total_rows_available,
         });
       } else if (response?.status === 'error') {
-        setQueryError(response?.message || response?.detail || 'Query execution failed');
+        setQueryError(response?.message || 'Query execution failed');
       }
     } catch (err: any) {
       setExecutionTime(Math.round(performance.now() - startTime));
@@ -127,7 +103,7 @@ export function DatabaseExplorer({
     } finally {
       setIsExecuting(false);
     }
-  }, [query, selectedConnection, isExecuting, callApi]);
+  }, [query, selectedConnection, isExecuting, api.query]);
 
   // Ctrl+Enter to execute
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
@@ -155,20 +131,14 @@ export function DatabaseExplorer({
   };
 
   const generateSql = useCallback(async () => {
-    if (!aiQuery.trim() || !selectedConnection || aiLoading) return;
+    if (!aiQuery.trim() || !selectedConnection || aiLoading || !api.ai) return;
 
     setAiLoading(true);
     setAiError(null);
     setAiResult(null);
 
     try {
-      const response = await callApi('/api/v1/ai/generate-query', {
-        method: 'POST',
-        data: {
-          connection_id: selectedConnection,
-          user_query: aiQuery.trim(),
-        },
-      });
+      const response = await api.ai.generateQuery(selectedConnection, aiQuery.trim());
 
       if (response?.success && response?.sql_query) {
         setAiResult({
@@ -176,16 +146,16 @@ export function DatabaseExplorer({
           explanation: response.explanation || '',
         });
       } else {
-        const errMsg = response?.error || response?.message || response?.detail || 'Failed to generate SQL';
+        const errMsg = response?.error || 'Failed to generate SQL';
         setAiError(typeof errMsg === 'string' ? errMsg : JSON.stringify(errMsg));
       }
     } catch (err: any) {
-      const errMsg = err?.message || err?.detail || 'Failed to generate SQL';
+      const errMsg = err?.message || 'Failed to generate SQL';
       setAiError(typeof errMsg === 'string' ? errMsg : JSON.stringify(errMsg));
     } finally {
       setAiLoading(false);
     }
-  }, [aiQuery, selectedConnection, aiLoading, callApi]);
+  }, [aiQuery, selectedConnection, aiLoading, api.ai]);
 
   const useGeneratedQuery = () => {
     if (aiResult?.sql_query) {
@@ -272,85 +242,82 @@ export function DatabaseExplorer({
         </div>
       </div>
 
-      {/* AI Assistant Panel — always visible */}
-      <div className="shrink-0 border-b border-purple-200 bg-purple-50 px-4 py-3">
-        <div className="flex items-center gap-2 mb-2">
-          <Wand2 className="w-4 h-4 text-purple-600" />
-          <span className="text-sm font-medium text-purple-800">AI Query Assistant</span>
-          <span className="text-xs text-purple-500">Describe what you want to query in plain language</span>
-        </div>
-        <div className="flex gap-2">
-          <input
-            ref={aiInputRef}
-            type="text"
-            value={aiQuery}
-            onChange={(e) => setAiQuery(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault();
-                generateSql();
-              }
-            }}
-            placeholder="e.g. Show top 10 customers by total order amount..."
-            className="flex-1 px-3 py-2 text-sm text-gray-900 border border-purple-300 rounded-md focus:outline-none focus:ring-2 focus:ring-purple-500 bg-white cursor-text"
-            style={{ caretColor: '#7c3aed' }}
-            disabled={aiLoading}
-          />
-          <button
-            onClick={generateSql}
-            disabled={aiLoading || !aiQuery.trim() || !selectedConnection}
-            className="flex items-center gap-1.5 px-4 py-2 bg-purple-600 text-white text-sm rounded-md hover:bg-purple-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors whitespace-nowrap"
-          >
-            {aiLoading ? (
-              <>
-                <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                Generating...
-              </>
-            ) : (
-              <>
-                <Wand2 className="w-3.5 h-3.5" />
-                Generate
-              </>
-            )}
-          </button>
-        </div>
-
-        {aiError && (
-          <div className="mt-2 px-3 py-2 bg-red-50 border border-red-200 rounded-md">
-            <p className="text-sm text-red-700">{aiError}</p>
+      {/* AI Assistant Panel — shown only if ai API is available */}
+      {hasAiApi && (
+        <div className="shrink-0 border-b border-purple-200 bg-purple-50 px-4 py-3">
+          <div className="flex items-center gap-2 mb-2">
+            <Wand2 className="w-4 h-4 text-purple-600" />
+            <span className="text-sm font-medium text-purple-800">AI Query Assistant</span>
+            <span className="text-xs text-purple-500">Describe what you want to query in plain language</span>
           </div>
-        )}
+          <div className="flex gap-2">
+            <input
+              ref={aiInputRef}
+              type="text"
+              value={aiQuery}
+              onChange={(e) => setAiQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault();
+                  generateSql();
+                }
+              }}
+              placeholder="e.g. Show top 10 customers by total order amount..."
+              className="flex-1 px-3 py-2 text-sm text-gray-900 border border-purple-300 rounded-md focus:outline-none focus:ring-2 focus:ring-purple-500 bg-white cursor-text"
+              style={{ caretColor: '#7c3aed' }}
+              disabled={aiLoading}
+            />
+            <button
+              onClick={generateSql}
+              disabled={aiLoading || !aiQuery.trim() || !selectedConnection}
+              className="flex items-center gap-1.5 px-4 py-2 bg-purple-600 text-white text-sm rounded-md hover:bg-purple-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors whitespace-nowrap"
+            >
+              {aiLoading ? (
+                <>
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  Generating...
+                </>
+              ) : (
+                <>
+                  <Wand2 className="w-3.5 h-3.5" />
+                  Generate
+                </>
+              )}
+            </button>
+          </div>
 
-        {aiResult && (
-          <div className="mt-2 bg-white border border-purple-200 rounded-md overflow-hidden">
-            {aiResult.explanation && (
-              <div className="px-3 py-2 border-b border-purple-100">
-                <p className="text-xs text-purple-700">{aiResult.explanation}</p>
-              </div>
-            )}
-            <div className="relative">
-              <pre className="p-3 pr-32 text-sm font-mono text-gray-800 whitespace-pre-wrap bg-gray-50">{aiResult.sql_query}</pre>
-              <div className="absolute top-2 right-2 flex gap-1">
-                <button
-                  onClick={() => navigator.clipboard.writeText(aiResult.sql_query)}
-                  className="p-1.5 text-gray-400 hover:text-gray-600 hover:bg-gray-200 rounded transition-colors"
-                  title="Copy SQL"
-                >
-                  <Copy className="w-3.5 h-3.5" />
-                </button>
-                <button
-                  onClick={useGeneratedQuery}
-                  className="flex items-center gap-1 px-2 py-1 text-xs bg-purple-600 text-white rounded hover:bg-purple-700 transition-colors"
-                  title="Use this query in the editor"
-                >
-                  <ArrowRight className="w-3 h-3" />
-                  Use Query
-                </button>
+          {aiError && (
+            <div className="mt-2 px-3 py-2 bg-red-50 border border-red-200 rounded-md">
+              <p className="text-sm text-red-700">{aiError}</p>
+            </div>
+          )}
+
+          {aiResult && (
+            <div className="mt-2 bg-white border border-purple-200 rounded-md overflow-hidden">
+              <div className="relative">
+                <pre className="p-3 pr-32 text-sm font-mono text-gray-800 whitespace-pre-wrap bg-gray-50">{aiResult.sql_query}</pre>
+                <div className="absolute top-2 right-2 flex gap-1">
+                  <button
+                    onClick={() => navigator.clipboard.writeText(aiResult.sql_query)}
+                    className="p-1.5 text-gray-400 hover:text-gray-600 hover:bg-gray-200 rounded transition-colors"
+                    title="Copy SQL"
+                  >
+                    <Copy className="w-3.5 h-3.5" />
+                  </button>
+                  <button
+                    onClick={useGeneratedQuery}
+                    className="flex items-center gap-1 px-2 py-1 text-xs bg-purple-600 text-white rounded hover:bg-purple-700 transition-colors"
+                    title="Use this query in the editor"
+                  >
+                    <ArrowRight className="w-3 h-3" />
+                    Use Query
+                  </button>
+                </div>
               </div>
             </div>
-          </div>
-        )}
-      </div>
+          )}
+        </div>
+      )}
 
       {/* Main layout: sidebar + editor/results */}
       <div className="flex-1 flex overflow-hidden">
@@ -414,7 +381,7 @@ export function DatabaseExplorer({
               />
               <button
                 onClick={executeQuery}
-                disabled={isExecuting || !query.trim()}
+                disabled={isExecuting || !query.trim() || !hasQueryApi}
                 className="absolute top-2 right-2 flex items-center gap-1 px-3 py-1.5 bg-blue-600 text-white text-sm rounded-md hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
               >
                 <Play className="w-3.5 h-3.5" />

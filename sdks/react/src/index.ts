@@ -6,13 +6,25 @@ export {
   useSandboxApi,
   useSandboxTranslation,
 } from './context/SandboxUIContext'
-export type { SandboxUIApi, SandboxUIConfig, FileUploadResult, SheetInfo } from './context/types'
+export type {
+  SandboxUIApi,
+  SandboxUIConfig,
+  FileUploadResult,
+  SheetInfo,
+  QueryColumn,
+  QueryResult,
+  QueryExecutionResponse,
+  ConnectionWithSchema,
+  AIGenerateQueryResponse,
+} from './context/types'
 
 // Components
 export { DataSourceSelector } from './components/DataSourceSelector'
 export { ConnectionForm } from './components/ConnectionForm'
 export { TableColumnSelector } from './components/TableColumnSelector'
 export { ConnectionsPage } from './components/ConnectionsPage'
+export { DatabaseExplorer } from './components/DatabaseExplorer'
+export type { DatabaseExplorerProps } from './components/DatabaseExplorer'
 
 // Types
 export type {
