@@ -41,7 +41,7 @@ RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 RUN pip install --upgrade pip setuptools wheel && \
-    pip install --no-cache-dir .
+    pip install --no-cache-dir ".[all-databases]"
 
 # -----------------------------------------------------------------------------
 # Stage 2: Production Runtime

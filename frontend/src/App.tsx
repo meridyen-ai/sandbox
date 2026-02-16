@@ -1,15 +1,25 @@
-import { Routes, Route, Navigate } from 'react-router-dom'
+import { Routes, Route, Navigate, useNavigate } from 'react-router-dom'
+import { SandboxUIProvider, ConnectionsPage } from '@meridyen/sandbox-ui'
 import { Layout } from './components/Layout'
 import { EmbedLayout } from './components/embed/EmbedLayout'
-import { ConnectionsPage } from './components/connections/ConnectionsPage'
 import { DatasetPage } from './components/dataset/DatasetPage'
 import { ArchitecturePage } from './components/architecture/ArchitecturePage'
 import { LoginPage } from './components/auth/LoginPage'
 import { ProtectedRoute } from './components/auth/ProtectedRoute'
+import { sandboxApi } from './utils/sandboxApiAdapter'
+import { useTranslation } from './hooks/useTranslation'
 
-function App() {
+function AppRoutes() {
+  const navigate = useNavigate()
+  const { t } = useTranslation()
+
   return (
-    <div className="min-h-screen bg-gray-50 dark:bg-gray-900">
+    <SandboxUIProvider
+      api={sandboxApi}
+      iconBasePath="/icons/databases"
+      t={t}
+      onNavigate={(path) => navigate(path)}
+    >
       <Routes>
         {/* ============================================= */}
         {/* Standalone mode (hybrid/self-hosted users)    */}
@@ -41,6 +51,14 @@ function App() {
           <Route path="architecture" element={<ArchitecturePage />} />
         </Route>
       </Routes>
+    </SandboxUIProvider>
+  )
+}
+
+function App() {
+  return (
+    <div className="min-h-screen bg-gray-50 dark:bg-gray-900">
+      <AppRoutes />
     </div>
   )
 }
