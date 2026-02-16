@@ -1,5 +1,5 @@
 import { Outlet, Link, useLocation, useNavigate } from 'react-router-dom'
-import { Database, LogOut, Key, ShieldCheck } from 'lucide-react'
+import { Database, LogOut, Key, Search } from 'lucide-react'
 import { useAuth } from '../contexts/AuthContext'
 import { useTranslation } from '../hooks/useTranslation'
 
@@ -37,15 +37,15 @@ export function Layout() {
                   {t('layout.connections')}
                 </Link>
                 <Link
-                  to="/architecture"
+                  to="/explorer"
                   className={`px-3 py-2 rounded-md text-sm font-medium ${
-                    location.pathname === '/architecture'
+                    location.pathname === '/explorer'
                       ? 'bg-gray-100 dark:bg-gray-700 text-gray-900 dark:text-white'
                       : 'text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700'
                   }`}
                 >
-                  <ShieldCheck className="inline-block w-4 h-4 mr-1" />
-                  {t('layout.architecture')}
+                  <Search className="inline-block w-4 h-4 mr-1" />
+                  Query Explorer
                 </Link>
               </nav>
             </div>

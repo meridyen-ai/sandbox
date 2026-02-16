@@ -34,6 +34,7 @@ dependencies = [
     "fastapi>=0.109.0",
     "uvicorn[standard]>=0.27.0",
     "httpx>=0.26.0",
+    "python-multipart>=0.0.6",
 
     # Data processing
     "pandas>=2.1.0",
@@ -89,12 +90,13 @@ databricks = ["databricks-sql-connector>=3.0.0"]
 trino = ["trino>=0.330.0"]
 athena = ["pyhive[presto]>=0.7.0", "boto3>=1.34.0"]
 gsheets = ["gspread>=6.0.0", "google-auth>=2.0.0"]
+excel = ["openpyxl>=3.1.0", "xlrd>=2.0.0"]
 looker = ["looker-sdk>=24.0.0"]
 teradata = ["teradatasql>=20.0.0"]
 
 # Install all database connectors
 all-databases = [
-    "meridyen-sandbox[postgresql,mysql,mssql,oracle,saphana,clickhouse,odbc,snowflake,bigquery,databricks,trino,athena,gsheets,looker,teradata]",
+    "meridyen-sandbox[postgresql,mysql,mssql,oracle,saphana,clickhouse,odbc,snowflake,bigquery,databricks,trino,athena,gsheets,excel,looker,teradata]",
 ]
 
 # Development tools

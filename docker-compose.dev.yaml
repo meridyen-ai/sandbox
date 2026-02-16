@@ -83,6 +83,7 @@ services:
 
     volumes:
       - ./frontend:/app:rw
+      - ./sdks/react:/sdks/react:ro  # SDK package for @meridyen/sandbox-ui
       - /app/node_modules  # Named volume for node_modules
 
     networks:

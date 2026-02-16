@@ -6,6 +6,23 @@ import type {
   SchemaData,
 } from '../types'
 
+export interface FileUploadResult {
+  success: boolean
+  message: string
+  connection_id: string
+  connections?: Array<{ connection_id: string; name: string; sheet_name: string; row_count: number }>
+  row_count: number
+  column_count?: number
+  file_path: string
+  sheets?: string[]
+}
+
+export interface SheetInfo {
+  name: string
+  columns: string[]
+  preview_rows: number
+}
+
 export interface SandboxUIApi {
   handlers: {
     list: () => Promise<HandlerInfo[]>
@@ -21,6 +38,14 @@ export interface SandboxUIApi {
   }
   schema: {
     sync: (connectionId: string, includeSamples?: boolean, sampleLimit?: number) => Promise<SchemaData>
+  }
+  files?: {
+    upload: (file: File, name: string, options: {
+      delimiter?: string
+      hasHeader?: boolean
+      selectedSheets?: string[]
+    }) => Promise<FileUploadResult>
+    getSheets: (file: File) => Promise<{ sheets: SheetInfo[] }>
   }
 }
 

@@ -6,7 +6,7 @@ export {
   useSandboxApi,
   useSandboxTranslation,
 } from './context/SandboxUIContext'
-export type { SandboxUIApi, SandboxUIConfig } from './context/types'
+export type { SandboxUIApi, SandboxUIConfig, FileUploadResult, SheetInfo } from './context/types'
 
 // Components
 export { DataSourceSelector } from './components/DataSourceSelector'

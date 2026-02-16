@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 from uuid import UUID
 
-from fastapi import FastAPI, HTTPException, Depends, Header, status
+from fastapi import FastAPI, File, Form, HTTPException, Depends, Header, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -152,6 +152,12 @@ class ConnectionConfig(BaseModel):
         """Normalize common db_type aliases to canonical enum values."""
         aliases = {"postgres": "postgresql", "pg": "postgresql", "mssql_server": "mssql"}
         return aliases.get(self.db_type.lower(), self.db_type.lower())
+
+
+class AIGenerateQueryRequest(BaseModel):
+    """AI query generation request."""
+    connection_id: str
+    user_query: str
 
 
 class HealthResponse(BaseModel):
@@ -833,6 +839,252 @@ def register_routes(app: FastAPI) -> None:
             )
 
     # ==========================================================================
+    # File Upload (CSV, XLSX, XLS)
+    # ==========================================================================
+
+    FILE_UPLOAD_DIR = Path("/tmp/sandbox_uploads")
+    ALLOWED_FILE_EXTENSIONS = {".csv", ".xlsx", ".xls"}
+
+    @app.post("/api/v1/upload-file", tags=["File Upload"])
+    async def upload_file(
+        file: UploadFile = File(...),
+        name: str = Form(...),
+        delimiter: str = Form(","),
+        has_header: str = Form("true"),
+        selected_sheets: str = Form(""),
+        token_data: dict = Depends(verify_sandbox_token),
+    ) -> JSONResponse:
+        """
+        Upload a CSV, XLSX, or XLS file and create connection(s).
+        For Excel files with multiple sheets, creates one connection per selected sheet.
+        """
+        import os
+        import pandas as pd
+        from sandbox.core.config import (
+            DatabaseConnectionConfig, DatabaseType, get_config, save_persisted_connections,
+        )
+        from pydantic import SecretStr
+
+        if not file.filename:
+            raise HTTPException(status_code=400, detail="No file provided")
+        file_ext = os.path.splitext(file.filename)[1].lower()
+        if file_ext not in ALLOWED_FILE_EXTENSIONS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported file type '{file_ext}'. Allowed: CSV, XLSX, XLS",
+            )
+
+        is_excel = file_ext in (".xlsx", ".xls")
+
+        FILE_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        unique_id = str(uuid.uuid4())[:8]
+        safe_name = "".join(c for c in name if c.isalnum() or c in "._- ").strip() or "uploaded_data"
+        filename = f"{safe_name}_{unique_id}{file_ext}"
+        file_path = str(FILE_UPLOAD_DIR / filename)
+
+        try:
+            content = await file.read()
+            with open(file_path, "wb") as f:
+                f.write(content)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}")
+
+        has_header_bool = has_header.lower() == "true"
+        config = get_config()
+        now = datetime.now(timezone.utc).isoformat()
+
+        try:
+            if is_excel:
+                engine = "openpyxl" if file_ext == ".xlsx" else "xlrd"
+                excel_file = pd.ExcelFile(file_path, engine=engine)
+                all_sheets = excel_file.sheet_names
+
+                if not all_sheets:
+                    os.remove(file_path)
+                    raise HTTPException(status_code=400, detail="Excel file contains no sheets")
+
+                if selected_sheets.strip():
+                    sheets_to_import = [s.strip() for s in selected_sheets.split(",") if s.strip()]
+                    invalid = [s for s in sheets_to_import if s not in all_sheets]
+                    if invalid:
+                        os.remove(file_path)
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Sheet(s) not found: {', '.join(invalid)}. Available: {', '.join(all_sheets)}",
+                        )
+                else:
+                    sheets_to_import = all_sheets
+
+                connections = []
+                total_rows = 0
+
+                for sheet_name in sheets_to_import:
+                    df = pd.read_excel(
+                        file_path, sheet_name=sheet_name,
+                        header=0 if has_header_bool else None, engine=engine,
+                    )
+                    row_count = len(df)
+                    if row_count == 0:
+                        continue
+
+                    total_rows += row_count
+                    conn_name = f"{name} - {sheet_name}" if len(sheets_to_import) > 1 else name
+                    conn_id = str(uuid.uuid4())
+
+                    # Persist as a config entry with extra_config for file metadata
+                    new_conn = DatabaseConnectionConfig(
+                        id=conn_id,
+                        name=conn_name,
+                        db_type=DatabaseType.POSTGRESQL,  # placeholder type
+                        host="",
+                        port=0,
+                        database="",
+                        username="",
+                        password=SecretStr(""),
+                        created_at=now,
+                        updated_at=now,
+                    )
+                    # Store file metadata in extra fields
+                    if not hasattr(new_conn, "extra_config"):
+                        new_conn.__dict__["extra_config"] = {}
+                    new_conn.__dict__["extra_config"] = {
+                        "handler_type": "excel",
+                        "file_url": file_path,
+                        "file_type": file_ext.lstrip("."),
+                        "sheet_name": sheet_name,
+                        "all_sheets": all_sheets,
+                        "header_row": 0 if has_header_bool else None,
+                    }
+
+                    config.database_connections.append(new_conn)
+                    connections.append({
+                        "connection_id": conn_id,
+                        "name": conn_name,
+                        "sheet_name": sheet_name,
+                        "row_count": row_count,
+                    })
+
+                if not connections:
+                    os.remove(file_path)
+                    raise HTTPException(status_code=400, detail="All sheets are empty")
+
+                save_persisted_connections(config)
+
+                return JSONResponse(
+                    status_code=201,
+                    content={
+                        "success": True,
+                        "message": f"Excel file uploaded: {len(connections)} sheet(s), {total_rows} total rows",
+                        "connection_id": connections[0]["connection_id"],
+                        "connections": connections,
+                        "row_count": total_rows,
+                        "file_path": file_path,
+                        "sheets": all_sheets,
+                    },
+                )
+            else:
+                # CSV
+                df = pd.read_csv(
+                    file_path, sep=delimiter,
+                    header=0 if has_header_bool else None,
+                )
+                row_count = len(df)
+                column_count = len(df.columns)
+
+                if row_count == 0:
+                    os.remove(file_path)
+                    raise HTTPException(status_code=400, detail="CSV file is empty")
+
+                conn_id = str(uuid.uuid4())
+                new_conn = DatabaseConnectionConfig(
+                    id=conn_id,
+                    name=name,
+                    db_type=DatabaseType.POSTGRESQL,  # placeholder type
+                    host="",
+                    port=0,
+                    database="",
+                    username="",
+                    password=SecretStr(""),
+                    created_at=now,
+                    updated_at=now,
+                )
+                new_conn.__dict__["extra_config"] = {
+                    "handler_type": "csv",
+                    "file_url": file_path,
+                    "file_type": "csv",
+                    "delimiter": delimiter,
+                    "encoding": "utf-8",
+                    "header_row": 0 if has_header_bool else None,
+                }
+
+                config.database_connections.append(new_conn)
+                save_persisted_connections(config)
+
+                return JSONResponse(
+                    status_code=201,
+                    content={
+                        "success": True,
+                        "message": f"CSV uploaded: {row_count} rows, {column_count} columns",
+                        "connection_id": conn_id,
+                        "row_count": row_count,
+                        "column_count": column_count,
+                        "file_path": file_path,
+                    },
+                )
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            import os as _os
+            if _os.path.exists(file_path):
+                _os.remove(file_path)
+            raise HTTPException(status_code=400, detail=f"Failed to parse file: {str(e)}")
+
+    @app.post("/api/v1/upload-file/sheets", tags=["File Upload"])
+    async def get_file_sheets(
+        file: UploadFile = File(...),
+        token_data: dict = Depends(verify_sandbox_token),
+    ) -> JSONResponse:
+        """
+        Preview sheet names from an uploaded Excel file without creating a connection.
+        Used by the frontend to let users select which sheets to import.
+        """
+        import os
+        import pandas as pd
+
+        if not file.filename:
+            raise HTTPException(status_code=400, detail="No file provided")
+        file_ext = os.path.splitext(file.filename)[1].lower()
+        if file_ext not in (".xlsx", ".xls"):
+            raise HTTPException(status_code=400, detail="Sheet detection is only for Excel files")
+
+        FILE_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        temp_path = str(FILE_UPLOAD_DIR / f"_temp_{uuid.uuid4().hex[:8]}{file_ext}")
+
+        try:
+            content = await file.read()
+            with open(temp_path, "wb") as f:
+                f.write(content)
+
+            engine = "openpyxl" if file_ext == ".xlsx" else "xlrd"
+            excel_file = pd.ExcelFile(temp_path, engine=engine)
+            sheets = []
+            for sheet_name in excel_file.sheet_names:
+                df = pd.read_excel(temp_path, sheet_name=sheet_name, nrows=5, engine=engine)
+                sheets.append({
+                    "name": sheet_name,
+                    "columns": [str(c) for c in df.columns],
+                    "preview_rows": len(df),
+                })
+
+            return JSONResponse(content={"sheets": sheets})
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to read Excel file: {str(e)}")
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
+    # ==========================================================================
     # Schema Sync
     # ==========================================================================
 
@@ -1113,6 +1365,215 @@ def register_routes(app: FastAPI) -> None:
                 error=str(e)
             )
             raise HTTPException(status_code=500, detail=str(e))
+
+    # ==========================================================================
+    # SQL Pad Integration
+    # ==========================================================================
+
+    @app.post("/api/v1/sqlpad/connection", tags=["SQL Pad"])
+    async def create_sqlpad_connection(
+        connection_id: str,
+        token_data: dict = Depends(verify_sandbox_token),
+    ) -> JSONResponse:
+        """
+        Create or update SQL Pad connection for a database.
+
+        This syncs the sandbox database connection to SQL Pad so users can
+        explore and query their data using SQL Pad's UI.
+        """
+        from sandbox.services.sqlpad_service import get_sqlpad_service
+        from sandbox.core.config import get_config
+
+        config = get_config()
+
+        # Find connection in config
+        conn_config = next(
+            (c for c in config.database_connections if c.id == connection_id),
+            None
+        )
+
+        if not conn_config:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Connection {connection_id} not found"
+            )
+
+        try:
+            sqlpad = get_sqlpad_service()
+
+            result = await sqlpad.create_or_update_connection(
+                connection_id=conn_config.id,
+                name=conn_config.name,
+                db_type=conn_config.db_type.value,
+                host=conn_config.host,
+                port=conn_config.port,
+                database=conn_config.database,
+                username=conn_config.username,
+                password=conn_config.password.get_secret_value(),
+                schema=conn_config.schema_name,
+            )
+
+            return JSONResponse(content={
+                "status": "success",
+                "data": {
+                    "connection_id": result.get("id"),
+                    "name": result.get("name"),
+                    "driver": result.get("driver"),
+                }
+            })
+
+        except Exception as e:
+            logger.error("sqlpad_connection_error", error=str(e))
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.delete("/api/v1/sqlpad/connection/{connection_id}", tags=["SQL Pad"])
+    async def delete_sqlpad_connection(
+        connection_id: str,
+        token_data: dict = Depends(verify_sandbox_token),
+    ) -> JSONResponse:
+        """Delete a SQL Pad connection."""
+        from sandbox.services.sqlpad_service import get_sqlpad_service
+
+        try:
+            sqlpad = get_sqlpad_service()
+            await sqlpad.delete_connection(connection_id)
+
+            return JSONResponse(content={
+                "status": "success",
+                "message": "Connection deleted"
+            })
+
+        except Exception as e:
+            logger.error("sqlpad_delete_error", error=str(e))
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.get("/api/v1/sqlpad/connections", tags=["SQL Pad"])
+    async def list_sqlpad_connections(
+        token_data: dict = Depends(verify_sandbox_token),
+    ) -> JSONResponse:
+        """List all SQL Pad connections."""
+        from sandbox.services.sqlpad_service import get_sqlpad_service
+
+        try:
+            sqlpad = get_sqlpad_service()
+            connections = await sqlpad.list_connections()
+
+            return JSONResponse(content={
+                "status": "success",
+                "data": connections
+            })
+
+        except Exception as e:
+            logger.error("sqlpad_list_error", error=str(e))
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.get("/api/v1/sqlpad/embed-url", tags=["SQL Pad"])
+    async def get_sqlpad_embed_url(
+        connection_id: str | None = None,
+        token_data: dict = Depends(verify_sandbox_token),
+    ) -> JSONResponse:
+        """
+        Get SQL Pad embed URL with authentication token.
+
+        Use this URL in an iframe to embed SQL Pad in your UI.
+        """
+        from sandbox.services.sqlpad_service import get_sqlpad_service
+
+        try:
+            sqlpad = get_sqlpad_service()
+            embed_url = await sqlpad.get_embed_url(connection_id)
+
+            return JSONResponse(content={
+                "status": "success",
+                "data": {
+                    "embed_url": embed_url,
+                    "connection_id": connection_id,
+                }
+            })
+
+        except Exception as e:
+            logger.error("sqlpad_embed_url_error", error=str(e))
+            raise HTTPException(status_code=500, detail=str(e))
+
+    # ==========================================================================
+    # AI Query Generation (proxies to MVP backend)
+    # ==========================================================================
+
+    async def _extract_api_key(
+        x_api_key: str | None = Header(None, alias="X-API-Key"),
+        authorization: str | None = Header(None),
+    ) -> str | None:
+        """Extract the raw API key from request headers."""
+        if x_api_key:
+            return x_api_key
+        if authorization and authorization.startswith("Bearer "):
+            return authorization[7:]
+        return None
+
+    @app.post("/api/v1/ai/generate-query", tags=["AI"])
+    async def ai_generate_query(
+        request: AIGenerateQueryRequest,
+        token_data: dict = Depends(verify_sandbox_token),
+        api_key: str | None = Depends(_extract_api_key),
+    ) -> JSONResponse:
+        """
+        Generate SQL query from natural language using AI.
+
+        Proxies the request to the MVP backend which runs the LangGraph agent.
+        The sandbox just forwards connection_id + user_query.
+        """
+        import httpx
+
+        config = get_config()
+
+        # Derive MVP base URL from remote auth URL
+        # e.g. "http://host.docker.internal:18000/api/v1/sandbox/validate-key"
+        # -> "http://host.docker.internal:18000"
+        remote_url = getattr(config.authentication, "remote_url", "")
+        if "/api/" in remote_url:
+            mvp_base_url = remote_url.split("/api/")[0]
+        else:
+            mvp_base_url = remote_url.rstrip("/")
+
+        if not mvp_base_url:
+            raise HTTPException(
+                status_code=503,
+                detail="AI query generation not available (MVP URL not configured)",
+            )
+
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["X-API-Key"] = api_key
+
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                response = await client.post(
+                    f"{mvp_base_url}/api/v1/generate-sql",
+                    json={
+                        "connection_id": request.connection_id,
+                        "user_query": request.user_query,
+                    },
+                    headers=headers,
+                )
+
+            try:
+                content = response.json()
+            except Exception:
+                content = {"success": False, "error": f"MVP returned HTTP {response.status_code}: {response.text[:200]}"}
+
+            return JSONResponse(
+                status_code=response.status_code if response.status_code < 500 else 502,
+                content=content,
+            )
+
+        except httpx.TimeoutException:
+            raise HTTPException(
+                status_code=504,
+                detail="AI query generation timed out",
+            )
+        except Exception as e:
+            logger.error("ai_generate_query_error", error=str(e))
+            raise HTTPException(status_code=502, detail=str(e))
 
     # ==========================================================================
     # Metrics

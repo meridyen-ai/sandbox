@@ -3,7 +3,7 @@ import { SandboxUIProvider, ConnectionsPage } from '@meridyen/sandbox-ui'
 import { Layout } from './components/Layout'
 import { EmbedLayout } from './components/embed/EmbedLayout'
 import { DatasetPage } from './components/dataset/DatasetPage'
-import { ArchitecturePage } from './components/architecture/ArchitecturePage'
+import { DatabaseExplorerPage } from './components/database/DatabaseExplorerPage'
 import { LoginPage } from './components/auth/LoginPage'
 import { ProtectedRoute } from './components/auth/ProtectedRoute'
 import { sandboxApi } from './utils/sandboxApiAdapter'
@@ -36,8 +36,8 @@ function AppRoutes() {
         >
           <Route index element={<Navigate to="/connections" replace />} />
           <Route path="connections" element={<ConnectionsPage />} />
+          <Route path="explorer" element={<DatabaseExplorerPage />} />
           <Route path="dataset/:connectionId" element={<DatasetPage />} />
-          <Route path="architecture" element={<ArchitecturePage />} />
         </Route>
 
         {/* ============================================= */}
@@ -48,7 +48,6 @@ function AppRoutes() {
           <Route index element={<Navigate to="/embed/connections" replace />} />
           <Route path="connections" element={<ConnectionsPage />} />
           <Route path="dataset/:connectionId" element={<DatasetPage />} />
-          <Route path="architecture" element={<ArchitecturePage />} />
         </Route>
       </Routes>
     </SandboxUIProvider>

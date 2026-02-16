@@ -2112,6 +2112,110 @@ class CSVFileHandler(BaseDBHandler):
         return columns
 
 
+class ExcelFileHandler(BaseDBHandler):
+    """Excel file handler (XLSX/XLS) using pandas + openpyxl/xlrd."""
+
+    name = "excel"
+    type = "file"
+    title = "Excel File"
+    description = "Connect to Excel files (.xlsx, .xls) with multi-sheet support"
+    icon = "csv"
+    connection_args = [
+        ConnectionArg("file_url", "string", "File URL", "Path to the Excel file", required=True),
+        ConnectionArg("file_type", "string", "File Type", "xlsx or xls", required=False, default="xlsx"),
+        ConnectionArg("sheet_name", "string", "Sheet Name", "Name of the sheet to read (default: first sheet)", required=False),
+        ConnectionArg("encoding", "string", "Encoding", "File encoding (default: utf-8)", required=False, default="utf-8"),
+        ConnectionArg("header_row", "integer", "Header Row", "Row number containing headers (0-indexed, default: 0)", required=False, default=0),
+    ]
+
+    @classmethod
+    def is_available(cls) -> bool:
+        try:
+            import openpyxl
+            return True
+        except ImportError:
+            return False
+
+    @classmethod
+    def test_connection(cls, connection_data: Dict[str, Any]) -> ConnectionTestResult:
+        try:
+            import pandas as pd
+
+            file_url = connection_data.get("file_url", "")
+            file_type = connection_data.get("file_type", "xlsx")
+            sheet_name = connection_data.get("sheet_name")
+            header_row = connection_data.get("header_row", 0)
+            engine = "openpyxl" if file_type == "xlsx" else "xlrd"
+
+            df = pd.read_excel(
+                file_url,
+                sheet_name=sheet_name or 0,
+                header=header_row,
+                nrows=5,
+                engine=engine,
+            )
+
+            if df.empty:
+                return ConnectionTestResult(success=False, message="Excel sheet is empty", error="No data found")
+
+            return ConnectionTestResult(
+                success=True,
+                message=f"Connection successful. Found {len(df.columns)} columns."
+            )
+        except Exception as e:
+            return ConnectionTestResult(success=False, message=f"Failed to read Excel file: {str(e)}", error=str(e))
+
+    @classmethod
+    def get_tables(cls, connection_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        import pandas as pd
+
+        file_url = connection_data.get("file_url", "")
+        file_type = connection_data.get("file_type", "xlsx")
+        sheet_name = connection_data.get("sheet_name")
+        engine = "openpyxl" if file_type == "xlsx" else "xlrd"
+
+        if sheet_name:
+            return [{"schema": "file", "name": sheet_name, "type": "FILE"}]
+
+        try:
+            excel_file = pd.ExcelFile(file_url, engine=engine)
+            return [{"schema": "file", "name": s, "type": "FILE"} for s in excel_file.sheet_names]
+        except Exception:
+            file_name = file_url.split("/")[-1].split("?")[0]
+            for ext in (".xlsx", ".xls"):
+                if file_name.endswith(ext):
+                    file_name = file_name[: -len(ext)]
+            return [{"schema": "file", "name": file_name or "excel_data", "type": "FILE"}]
+
+    @classmethod
+    def get_columns(cls, connection_data: Dict[str, Any], table_name: str) -> List[Dict[str, Any]]:
+        import pandas as pd
+
+        file_url = connection_data.get("file_url", "")
+        file_type = connection_data.get("file_type", "xlsx")
+        header_row = connection_data.get("header_row", 0)
+        sheet_name = connection_data.get("sheet_name") or table_name
+        engine = "openpyxl" if file_type == "xlsx" else "xlrd"
+
+        df = pd.read_excel(
+            file_url,
+            sheet_name=sheet_name,
+            header=header_row,
+            nrows=100,
+            engine=engine,
+        )
+
+        columns = []
+        for col_name, dtype in df.dtypes.items():
+            columns.append({
+                "name": str(col_name),
+                "type": str(dtype),
+                "nullable": df[col_name].isnull().any(),
+                "default": None,
+            })
+        return columns
+
+
 class GoogleSheetsHandler(BaseDBHandler):
     """Google Sheets handler using gspread."""
 
@@ -2599,6 +2703,7 @@ HANDLERS: Dict[str, type[BaseDBHandler]] = {
     "starburst": StarburstHandler,
     # File-based Data Sources
     "csv": CSVFileHandler,
+    "excel": ExcelFileHandler,
     "google_sheets": GoogleSheetsHandler,
     # Other Data Sources
     "looker": LookerHandler,
