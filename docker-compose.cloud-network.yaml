@@ -1,0 +1,13 @@
+# Overlay: adds shared meridyen-cloud network to sandbox.
+# Used only by MVP's `make cloud` — allows MVP nginx to reach sandbox.
+
+services:
+  sandbox:
+    networks:
+      - sandbox-network
+      - meridyen-cloud
+
+networks:
+  meridyen-cloud:
+    external: true
+    name: meridyen-cloud
