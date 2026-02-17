@@ -136,6 +136,29 @@ export const ConnectionForm: React.FC<ConnectionFormProps> = ({
     try {
       const connArgs = buildConnectionArgs()
 
+      // Google Sheets: upload data into PostgreSQL (like CSV/Excel)
+      if (handler.name === 'google_sheets' && api.files?.uploadGoogleSheet) {
+        const result = await api.files.uploadGoogleSheet({
+          name: connectionName,
+          spreadsheet_id: connArgs.spreadsheet_id as string,
+          credentials_json: connArgs.credentials_json as string,
+          worksheet_name: (connArgs.worksheet_name as string) || undefined,
+        })
+
+        if (result.success) {
+          setTestResult({
+            success: true,
+            message:
+              t('dataSources.connectionSuccess') || 'Connection successful!',
+          })
+          const resultId = result.connection_id || ''
+          setTimeout(() => {
+            onSuccess?.(resultId, connectionName)
+          }, 1000)
+        }
+        return
+      }
+
       const connectionConfig = {
         name: connectionName,
         db_type: handler.name,

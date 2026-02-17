@@ -160,6 +160,14 @@ class AIGenerateQueryRequest(BaseModel):
     user_query: str
 
 
+class GoogleSheetUploadRequest(BaseModel):
+    """Request body for Google Sheets upload."""
+    name: str
+    spreadsheet_id: str
+    credentials_json: str
+    worksheet_name: str | None = None
+
+
 class HealthResponse(BaseModel):
     """Health check response."""
     status: str
@@ -865,8 +873,8 @@ def register_routes(app: FastAPI) -> None:
             DatabaseConnectionConfig, DatabaseType, get_config, save_persisted_connections,
         )
         from sandbox.services.file_loader import (
-            get_upload_engine, get_upload_db_config, sanitize_table_name,
-            load_csv_to_postgres, load_excel_sheet_to_postgres, UPLOADS_SCHEMA,
+            create_upload_database, sanitize_table_name,
+            load_csv_to_postgres, load_excel_sheet_to_postgres,
         )
         from pydantic import SecretStr
 
@@ -898,10 +906,11 @@ def register_routes(app: FastAPI) -> None:
         has_header_bool = has_header.lower() == "true"
         config = get_config()
         now = datetime.now(timezone.utc).isoformat()
-        db_config = get_upload_db_config()
+
+        # Create a dedicated database for this upload
+        sql_engine, db_config = create_upload_database(name)
 
         try:
-            sql_engine = get_upload_engine()
 
             if is_excel:
                 excel_engine = "openpyxl" if file_ext == ".xlsx" else "xlrd"
@@ -967,7 +976,6 @@ def register_routes(app: FastAPI) -> None:
                     database=db_config["database"],
                     username=db_config["username"],
                     password=SecretStr(db_config["password"]),
-                    schema_name=UPLOADS_SCHEMA,
                     ssl_enabled=False,
                     created_at=now,
                     updated_at=now,
@@ -1003,7 +1011,6 @@ def register_routes(app: FastAPI) -> None:
                         "host": db_config["host"],
                         "port": db_config["port"],
                         "database": db_config["database"],
-                        "schema_name": UPLOADS_SCHEMA,
                         "upload_tables": [s["table_name"] for s in sheet_stats],
                         "connections": connections,
                         "row_count": total_rows,
@@ -1034,7 +1041,6 @@ def register_routes(app: FastAPI) -> None:
                     database=db_config["database"],
                     username=db_config["username"],
                     password=SecretStr(db_config["password"]),
-                    schema_name=UPLOADS_SCHEMA,
                     ssl_enabled=False,
                     created_at=now,
                     updated_at=now,
@@ -1058,7 +1064,6 @@ def register_routes(app: FastAPI) -> None:
                         "host": db_config["host"],
                         "port": db_config["port"],
                         "database": db_config["database"],
-                        "schema_name": UPLOADS_SCHEMA,
                         "upload_tables": [result["table_name"]],
                         "table_name": result["table_name"],
                         "row_count": result["row_count"],
@@ -1119,6 +1124,276 @@ def register_routes(app: FastAPI) -> None:
                 os.remove(temp_path)
 
     # ==========================================================================
+    # Google Sheets Upload (loads sheet data into sandbox PostgreSQL)
+    # ==========================================================================
+
+    @app.post("/api/v1/upload-gsheet", tags=["File Upload"])
+    async def upload_google_sheet(
+        body: GoogleSheetUploadRequest,
+        token_data: dict = Depends(verify_sandbox_token),
+    ) -> JSONResponse:
+        """
+        Fetch data from a Google Sheet and load it into sandbox PostgreSQL.
+        Works like CSV upload — data becomes a table queryable via standard SQL.
+        """
+        import json as _json
+        import os
+        import pandas as pd
+        from sandbox.core.config import (
+            DatabaseConnectionConfig, DatabaseType, get_config, save_persisted_connections,
+        )
+        from sandbox.services.file_loader import (
+            create_upload_database, sanitize_table_name,
+            load_dataframe_to_postgres, load_csv_to_postgres,
+            load_excel_sheet_to_postgres,
+        )
+        from pydantic import SecretStr
+
+        # Parse credentials
+        try:
+            if isinstance(body.credentials_json, str):
+                credentials_info = _json.loads(body.credentials_json)
+            else:
+                credentials_info = body.credentials_json
+        except _json.JSONDecodeError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid credentials JSON: {e}")
+
+        # Connect to Google Sheets
+        try:
+            import gspread
+            from google.oauth2.service_account import Credentials
+        except ImportError:
+            raise HTTPException(
+                status_code=500,
+                detail="Google Sheets support not installed (gspread, google-auth)",
+            )
+
+        try:
+            scopes = [
+                "https://www.googleapis.com/auth/spreadsheets.readonly",
+                "https://www.googleapis.com/auth/drive.readonly",
+            ]
+            credentials = Credentials.from_service_account_info(credentials_info, scopes=scopes)
+            client = gspread.authorize(credentials)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to authenticate with Google: {e}")
+
+        # Try opening as native Google Sheet first; fall back to Drive download
+        # for uploaded files (Excel/CSV opened in Google Sheets)
+        is_native_sheet = True
+        try:
+            spreadsheet = client.open_by_key(body.spreadsheet_id)
+            # Probe: listing worksheets fails on non-native files
+            _ = spreadsheet.worksheets()
+        except Exception:
+            is_native_sheet = False
+
+        config = get_config()
+        now = datetime.now(timezone.utc).isoformat()
+
+        # Create a dedicated database for this upload
+        sql_engine, db_config = create_upload_database(body.name)
+
+        try:
+            base_table = sanitize_table_name(body.name)
+            sheet_stats = []
+            total_rows = 0
+
+            if not is_native_sheet:
+                # Non-native file in Drive (uploaded Excel/CSV) — download via
+                # gspread's authorized session and reuse existing file loaders.
+                import requests as _requests
+
+                session = client.http_client.session
+                download_url = f"https://www.googleapis.com/drive/v3/files/{body.spreadsheet_id}?alt=media"
+                resp = session.get(download_url)
+                if resp.status_code == 403:
+                    sa_email = credentials_info.get("client_email", "the service account")
+                    # Parse error details from Google API response
+                    try:
+                        error_info = resp.json()
+                        error_msg = error_info.get("error", {}).get("message", "")
+                    except Exception:
+                        error_msg = ""
+                    detail = f"Access denied. Share the file in Google Drive with: {sa_email}"
+                    if error_msg:
+                        detail += f" (Google: {error_msg})"
+                    raise HTTPException(status_code=400, detail=detail)
+                if resp.status_code != 200:
+                    # Include response body for debugging
+                    try:
+                        error_body = resp.text[:500]
+                    except Exception:
+                        error_body = ""
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Failed to download file from Google Drive (HTTP {resp.status_code}): {error_body}",
+                    )
+
+                # Get file name to determine format
+                meta_url = f"https://www.googleapis.com/drive/v3/files/{body.spreadsheet_id}?fields=name,mimeType"
+                meta_resp = session.get(meta_url)
+                file_name = "download"
+                mime = ""
+                if meta_resp.status_code == 200:
+                    meta = meta_resp.json()
+                    file_name = meta.get("name", "download")
+                    mime = meta.get("mimeType", "")
+
+                # Save to temp file and use existing file loaders
+                FILE_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+                # Determine extension
+                if file_name.endswith(".xlsx"):
+                    ext = ".xlsx"
+                elif file_name.endswith(".xls"):
+                    ext = ".xls"
+                else:
+                    ext = ".csv"
+
+                temp_path = str(FILE_UPLOAD_DIR / f"_gsheet_{uuid.uuid4().hex[:8]}{ext}")
+                try:
+                    with open(temp_path, "wb") as f:
+                        f.write(resp.content)
+
+                    if ext in (".xlsx", ".xls"):
+                        # Reuse existing Excel loader
+                        excel_engine_name = "openpyxl" if ext == ".xlsx" else "xlrd"
+                        excel_file = pd.ExcelFile(temp_path, engine=excel_engine_name)
+                        sheets_to_import = excel_file.sheet_names
+
+                        if body.worksheet_name:
+                            if body.worksheet_name in sheets_to_import:
+                                sheets_to_import = [body.worksheet_name]
+                            else:
+                                raise HTTPException(
+                                    status_code=400,
+                                    detail=f"Worksheet '{body.worksheet_name}' not found. Available: {', '.join(sheets_to_import)}",
+                                )
+
+                        for sheet_name in sheets_to_import:
+                            if len(sheets_to_import) > 1:
+                                tname = f"{base_table}_{sanitize_table_name(sheet_name)}"
+                            else:
+                                tname = base_table
+
+                            result = load_excel_sheet_to_postgres(
+                                temp_path, sheet_name, tname,
+                                has_header=True, engine=sql_engine,
+                            )
+                            if result["row_count"] == 0:
+                                continue
+                            total_rows += result["row_count"]
+                            sheet_stats.append({
+                                "sheet_name": sheet_name,
+                                "table_name": result["table_name"],
+                                "row_count": result["row_count"],
+                                "column_count": result["column_count"],
+                            })
+                    else:
+                        # Reuse existing CSV loader
+                        result = load_csv_to_postgres(
+                            temp_path, base_table,
+                            delimiter=",", has_header=True, engine=sql_engine,
+                        )
+                        if result["row_count"] > 0:
+                            total_rows = result["row_count"]
+                            sheet_stats.append({
+                                "sheet_name": file_name,
+                                "table_name": result["table_name"],
+                                "row_count": result["row_count"],
+                                "column_count": result["column_count"],
+                            })
+                finally:
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+
+            else:
+                # Native Google Sheet — use gspread
+                if body.worksheet_name:
+                    try:
+                        worksheets = [spreadsheet.worksheet(body.worksheet_name)]
+                    except Exception as e:
+                        raise HTTPException(status_code=400, detail=f"Worksheet '{body.worksheet_name}' not found: {e}")
+                else:
+                    worksheets = spreadsheet.worksheets()
+
+                if not worksheets:
+                    raise HTTPException(status_code=400, detail="Spreadsheet has no worksheets")
+
+                for ws in worksheets:
+                    all_values = ws.get_all_values()
+                    if not all_values or len(all_values) < 2:
+                        continue
+
+                    headers = all_values[0]
+                    data_rows = all_values[1:]
+                    df = pd.DataFrame(data_rows, columns=headers)
+
+                    if len(worksheets) > 1:
+                        table_name = f"{base_table}_{sanitize_table_name(ws.title)}"
+                    else:
+                        table_name = base_table
+
+                    result = load_dataframe_to_postgres(
+                        df, table_name, has_header=True, engine=sql_engine,
+                    )
+
+                    if result["row_count"] == 0:
+                        continue
+
+                    total_rows += result["row_count"]
+                    sheet_stats.append({
+                        "sheet_name": ws.title,
+                        "table_name": result["table_name"],
+                        "row_count": result["row_count"],
+                        "column_count": result["column_count"],
+                    })
+
+            if not sheet_stats:
+                raise HTTPException(status_code=400, detail="All worksheets are empty")
+
+            # Create ONE connection pointing to the upload database (same as CSV)
+            conn_id = str(uuid.uuid4())
+            new_conn = DatabaseConnectionConfig(
+                id=conn_id,
+                name=body.name,
+                db_type=DatabaseType.POSTGRESQL,
+                host=db_config["host"],
+                port=db_config["port"],
+                database=db_config["database"],
+                username=db_config["username"],
+                password=SecretStr(db_config["password"]),
+                ssl_enabled=False,
+                created_at=now,
+                updated_at=now,
+            )
+            config.database_connections.append(new_conn)
+            save_persisted_connections(config)
+
+            return JSONResponse(
+                status_code=201,
+                content={
+                    "success": True,
+                    "message": f"Google Sheet loaded into PostgreSQL: {len(sheet_stats)} sheet(s), {total_rows} total rows",
+                    "connection_id": conn_id,
+                    "name": body.name,
+                    "db_type": "google_sheets",
+                    "source_type": "google_sheets",
+                    "host": db_config["host"],
+                    "port": db_config["port"],
+                    "database": db_config["database"],
+                    "upload_tables": [s["table_name"] for s in sheet_stats],
+                    "row_count": total_rows,
+                    "sheet_stats": sheet_stats,
+                },
+            )
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to load Google Sheet into database: {str(e)}")
+
+    # ==========================================================================
     # Schema Sync
     # ==========================================================================
 
@@ -1157,6 +1432,10 @@ def register_routes(app: FastAPI) -> None:
             # Get connector
             connector = get_connector(conn_config.db_type, conn_config)
 
+            # Get selected tables config (if any) — uploaded connections restrict
+            # which tables from the shared schema belong to this connection
+            selected_tables_config = conn_config.selected_tables or {}
+
             async with connector.get_connection() as conn:
                 # Get all tables
                 tables = await connector.get_tables(conn, schema=conn_config.schema_name)
@@ -1170,13 +1449,32 @@ def register_routes(app: FastAPI) -> None:
                     "tables": []
                 }
 
+                schema_prefix = conn_config.schema_name or "public"
+
                 # For each table, get columns and optionally sample data
                 for table_name in tables:
+                    # If selected_tables is configured, only sync selected tables
+                    if selected_tables_config:
+                        full_name = f"{schema_prefix}.{table_name}"
+                        table_selection = selected_tables_config.get(full_name)
+                        if not table_selection or not table_selection.get("selected"):
+                            continue
+                        selected_columns = table_selection.get("columns", [])
+                    else:
+                        selected_columns = None  # Include all columns
+
                     columns_info = await connector.get_columns(
                         conn,
                         table_name,
                         schema=conn_config.schema_name
                     )
+
+                    # Filter columns if selection exists
+                    if selected_columns is not None and selected_columns:
+                        columns_info = [
+                            col for col in columns_info
+                            if col.get("name") in selected_columns
+                        ]
 
                     table_data = {
                         "name": table_name,
@@ -1187,9 +1485,14 @@ def register_routes(app: FastAPI) -> None:
                     # Get sample data if requested
                     if include_samples:
                         try:
-                            sample_query = f'SELECT * FROM "{table_name}" LIMIT {sample_limit}'
+                            if selected_columns:
+                                col_list = ", ".join(f'"{c}"' for c in selected_columns)
+                            else:
+                                col_list = "*"
+
+                            sample_query = f'SELECT {col_list} FROM "{table_name}" LIMIT {sample_limit}'
                             if conn_config.schema_name:
-                                sample_query = f'SELECT * FROM "{conn_config.schema_name}"."{table_name}" LIMIT {sample_limit}'
+                                sample_query = f'SELECT {col_list} FROM "{conn_config.schema_name}"."{table_name}" LIMIT {sample_limit}'
 
                             result = await connector.execute(conn, sample_query)
 
@@ -1234,17 +1537,18 @@ def register_routes(app: FastAPI) -> None:
         """
         from sandbox.connectors.factory import get_connector
         from sandbox.core.config import get_config
-        from sandbox.services.file_loader import UPLOADS_SCHEMA
 
         config = get_config()
         synced_connections = []
 
         for conn_config in config.database_connections:
-            # Connections using the uploads schema are CSV/Excel uploads — report as "csv"
-            display_db_type = (
-                "csv" if conn_config.schema_name == UPLOADS_SCHEMA
-                else conn_config.db_type.value
+            # Uploaded connections (CSV/Excel/Google Sheets) use per-upload databases
+            # named "upload_*" or legacy connections use the "uploads" schema
+            is_upload = (
+                conn_config.database.startswith("upload_")
+                or conn_config.schema_name == "uploads"
             )
+            display_db_type = "csv" if is_upload else conn_config.db_type.value
             connection_data = {
                 "id": conn_config.id,
                 "name": conn_config.name,

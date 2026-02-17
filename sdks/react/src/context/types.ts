@@ -85,6 +85,12 @@ export interface SandboxUIApi {
       selectedSheets?: string[]
     }) => Promise<FileUploadResult>
     getSheets: (file: File) => Promise<{ sheets: SheetInfo[] }>
+    uploadGoogleSheet?: (params: {
+      name: string
+      spreadsheet_id: string
+      credentials_json: string
+      worksheet_name?: string
+    }) => Promise<FileUploadResult>
   }
   query?: {
     fullSync: () => Promise<{ connections: ConnectionWithSchema[] }>
