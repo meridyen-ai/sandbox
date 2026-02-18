@@ -7,6 +7,7 @@ Alternative to gRPC for simpler integrations.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, date, time, timedelta, timezone
@@ -1539,11 +1540,59 @@ def register_routes(app: FastAPI) -> None:
         from sandbox.core.config import get_config
 
         config = get_config()
-        synced_connections = []
 
-        for conn_config in config.database_connections:
-            # Uploaded connections (CSV/Excel/Google Sheets) use per-upload databases
-            # named "upload_*" or legacy connections use the "uploads" schema
+        async def _sync_table(connector, conn_config, table_name, selected_columns, include_samples, sample_limit):
+            """Fetch columns and sample data for a single table."""
+            async with connector.get_connection() as conn:
+                columns_info = await connector.get_columns(
+                    conn, table_name, schema=conn_config.schema_name
+                )
+
+                if selected_columns is not None and selected_columns:
+                    columns_info = [
+                        col for col in columns_info
+                        if col.get("name") in selected_columns
+                    ]
+
+                table_data = {
+                    "name": table_name,
+                    "columns": columns_info,
+                    "sample_data": None,
+                }
+
+                if include_samples:
+                    try:
+                        if selected_columns:
+                            col_list = ", ".join(f'"{c}"' for c in selected_columns)
+                        else:
+                            col_list = "*"
+
+                        if conn_config.schema_name:
+                            sample_query = f'SELECT {col_list} FROM "{conn_config.schema_name}"."{table_name}" LIMIT {sample_limit}'
+                        else:
+                            sample_query = f'SELECT {col_list} FROM "{table_name}" LIMIT {sample_limit}'
+
+                        result = await connector.execute(conn, sample_query)
+                        table_data["sample_data"] = {
+                            "columns": result.columns,
+                            "rows": [
+                                {col: _make_json_safe(val) for col, val in zip(result.columns, row)}
+                                for row in result.rows
+                            ],
+                            "total_rows": result.row_count,
+                        }
+                    except Exception as e:
+                        logger.warning(
+                            "full_sync_sample_error",
+                            connection=conn_config.id,
+                            table=table_name,
+                            error=str(e),
+                        )
+
+                return table_data
+
+        async def _sync_connection(conn_config):
+            """Sync schema for a single database connection."""
             is_upload = (
                 conn_config.database.startswith("upload_")
                 or conn_config.schema_name == "uploads"
@@ -1561,7 +1610,6 @@ def register_routes(app: FastAPI) -> None:
                 "tables": [],
             }
 
-            # Get selected tables config (if any)
             selected_tables_config = conn_config.selected_tables or {}
 
             try:
@@ -1572,67 +1620,40 @@ def register_routes(app: FastAPI) -> None:
                         conn, schema=conn_config.schema_name
                     )
 
-                    schema_prefix = conn_config.schema_name or "public"
+                schema_prefix = conn_config.schema_name or "public"
 
-                    for table_name in tables:
-                        # If selected_tables is configured, only sync selected tables
-                        if selected_tables_config:
-                            full_name = f"{schema_prefix}.{table_name}"
-                            table_selection = selected_tables_config.get(full_name)
-                            if not table_selection or not table_selection.get("selected"):
-                                continue
-                            selected_columns = table_selection.get("columns", [])
+                # Build list of tables to sync with their column selections
+                tables_to_sync = []
+                for table_name in tables:
+                    if selected_tables_config:
+                        full_name = f"{schema_prefix}.{table_name}"
+                        table_selection = selected_tables_config.get(full_name)
+                        if not table_selection or not table_selection.get("selected"):
+                            continue
+                        selected_columns = table_selection.get("columns", [])
+                    else:
+                        selected_columns = None
+                    tables_to_sync.append((table_name, selected_columns))
+
+                # Fetch all tables in parallel (each task gets its own connection)
+                if tables_to_sync:
+                    table_results = await asyncio.gather(
+                        *[
+                            _sync_table(connector, conn_config, tname, sel_cols, include_samples, sample_limit)
+                            for tname, sel_cols in tables_to_sync
+                        ],
+                        return_exceptions=True,
+                    )
+                    for i, result in enumerate(table_results):
+                        if isinstance(result, Exception):
+                            logger.warning(
+                                "full_sync_table_error",
+                                connection=conn_config.id,
+                                table=tables_to_sync[i][0],
+                                error=str(result),
+                            )
                         else:
-                            selected_columns = None  # Include all columns
-
-                        columns_info = await connector.get_columns(
-                            conn, table_name, schema=conn_config.schema_name
-                        )
-
-                        # Filter columns if selection exists
-                        if selected_columns is not None and selected_columns:
-                            columns_info = [
-                                col for col in columns_info
-                                if col.get("name") in selected_columns
-                            ]
-
-                        table_data = {
-                            "name": table_name,
-                            "columns": columns_info,
-                            "sample_data": None,
-                        }
-
-                        if include_samples:
-                            try:
-                                # Build column list for sample query
-                                if selected_columns:
-                                    col_list = ", ".join(f'"{c}"' for c in selected_columns)
-                                else:
-                                    col_list = "*"
-
-                                if conn_config.schema_name:
-                                    sample_query = f'SELECT {col_list} FROM "{conn_config.schema_name}"."{table_name}" LIMIT {sample_limit}'
-                                else:
-                                    sample_query = f'SELECT {col_list} FROM "{table_name}" LIMIT {sample_limit}'
-
-                                result = await connector.execute(conn, sample_query)
-                                table_data["sample_data"] = {
-                                    "columns": result.columns,
-                                    "rows": [
-                                        {col: _make_json_safe(val) for col, val in zip(result.columns, row)}
-                                        for row in result.rows
-                                    ],
-                                    "total_rows": result.row_count,
-                                }
-                            except Exception as e:
-                                logger.warning(
-                                    "full_sync_sample_error",
-                                    connection=conn_config.id,
-                                    table=table_name,
-                                    error=str(e),
-                                )
-
-                        connection_data["tables"].append(table_data)
+                            connection_data["tables"].append(result)
 
             except Exception as e:
                 logger.warning(
@@ -1642,9 +1663,31 @@ def register_routes(app: FastAPI) -> None:
                 )
                 connection_data["error"] = str(e)
 
-            synced_connections.append(connection_data)
+            return connection_data
 
-        from datetime import datetime, timezone
+        # Sync all connections in parallel
+        results = await asyncio.gather(
+            *[_sync_connection(cc) for cc in config.database_connections],
+            return_exceptions=True,
+        )
+        synced_connections = []
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                cc = config.database_connections[i]
+                logger.warning(
+                    "full_sync_connection_error",
+                    connection=cc.id,
+                    error=str(result),
+                )
+                synced_connections.append({
+                    "id": cc.id,
+                    "name": cc.name,
+                    "db_type": cc.db_type.value,
+                    "tables": [],
+                    "error": str(result),
+                })
+            else:
+                synced_connections.append(result)
 
         return JSONResponse(content={
             "status": "success",

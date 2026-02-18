@@ -167,8 +167,8 @@ export function DatabaseExplorer({
   const currentConnection = connections.find(c => c.id === selectedConnection);
 
   const containerClass = isFullscreen
-    ? 'fixed inset-0 z-50 bg-white flex flex-col'
-    : 'relative h-full bg-white rounded-lg shadow-lg border border-gray-200 flex flex-col';
+    ? 'fixed inset-0 z-50 bg-white dark:bg-dashboard-surface flex flex-col'
+    : 'relative h-full bg-white dark:bg-dashboard-surface rounded-lg shadow-lg border border-gray-200 dark:border-dashboard-border flex flex-col';
 
   if (isLoadingSchema) {
     return (
@@ -176,7 +176,7 @@ export function DatabaseExplorer({
         <div className="flex-1 flex items-center justify-center">
           <div className="text-center">
             <Database className="w-8 h-8 text-blue-600 animate-pulse mx-auto mb-3" />
-            <p className="text-gray-600">Loading database schema...</p>
+            <p className="text-gray-600 dark:text-gray-400">Loading database schema...</p>
           </div>
         </div>
       </div>
@@ -188,11 +188,11 @@ export function DatabaseExplorer({
       <div className={containerClass}>
         <div className="flex-1 flex items-center justify-center">
           <div className="text-center max-w-md p-6">
-            <div className="w-16 h-16 bg-red-100 rounded-full flex items-center justify-center mx-auto mb-4">
-              <X className="w-8 h-8 text-red-600" />
+            <div className="w-16 h-16 bg-red-100 dark:bg-red-900/30 rounded-full flex items-center justify-center mx-auto mb-4">
+              <X className="w-8 h-8 text-red-600 dark:text-red-400" />
             </div>
-            <h3 className="text-lg font-semibold text-gray-900 mb-2">Connection Error</h3>
-            <p className="text-gray-600 mb-4">{loadError}</p>
+            <h3 className="text-lg font-semibold text-gray-900 dark:text-dashboard-text mb-2">Connection Error</h3>
+            <p className="text-gray-600 dark:text-gray-400 mb-4">{loadError}</p>
             <button
               onClick={loadSchema}
               className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 transition-colors"
@@ -208,15 +208,15 @@ export function DatabaseExplorer({
   return (
     <div className={containerClass}>
       {/* Header */}
-      <div className="flex items-center justify-between px-4 py-2 border-b border-gray-200 bg-gray-50 shrink-0">
+      <div className="flex items-center justify-between px-4 py-2 border-b border-gray-200 dark:border-dashboard-border bg-gray-50 dark:bg-dashboard-elevated shrink-0">
         <div className="flex items-center gap-3">
-          <Database className="w-5 h-5 text-blue-600" />
-          <h2 className="text-lg font-semibold text-gray-800">Query Explorer</h2>
+          <Database className="w-5 h-5 text-blue-600 dark:text-blue-400" />
+          <h2 className="text-lg font-semibold text-gray-800 dark:text-dashboard-text">Query Explorer</h2>
           {connections.length > 0 && (
             <select
               value={selectedConnection}
               onChange={(e) => setSelectedConnection(e.target.value)}
-              className="ml-2 px-3 py-1 text-sm border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+              className="ml-2 px-3 py-1 text-sm border border-gray-300 dark:border-dashboard-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 dark:bg-dashboard-elevated dark:text-dashboard-text"
             >
               {connections.map((conn) => (
                 <option key={conn.id} value={conn.id}>
@@ -229,13 +229,13 @@ export function DatabaseExplorer({
         <div className="flex items-center gap-2">
           <button
             onClick={() => setIsFullscreen(!isFullscreen)}
-            className="p-2 text-gray-600 hover:text-gray-800 hover:bg-gray-100 rounded-md transition-colors"
+            className="p-2 text-gray-600 dark:text-gray-400 hover:text-gray-800 dark:hover:text-dashboard-text hover:bg-gray-100 dark:hover:bg-dashboard-subtle rounded-md transition-colors"
             title={isFullscreen ? 'Exit Fullscreen' : 'Fullscreen'}
           >
             {isFullscreen ? <Minimize2 className="w-4 h-4" /> : <Maximize2 className="w-4 h-4" />}
           </button>
           {onClose && (
-            <button onClick={onClose} className="p-2 text-gray-600 hover:text-gray-800 hover:bg-gray-100 rounded-md transition-colors">
+            <button onClick={onClose} className="p-2 text-gray-600 dark:text-gray-400 hover:text-gray-800 dark:hover:text-dashboard-text hover:bg-gray-100 dark:hover:bg-dashboard-subtle rounded-md transition-colors">
               <X className="w-4 h-4" />
             </button>
           )}
@@ -244,11 +244,11 @@ export function DatabaseExplorer({
 
       {/* AI Assistant Panel — shown only if ai API is available */}
       {hasAiApi && (
-        <div className="shrink-0 border-b border-purple-200 bg-purple-50 px-4 py-3">
+        <div className="shrink-0 border-b border-purple-200 dark:border-purple-800/50 bg-purple-50 dark:bg-purple-900/20 px-4 py-3">
           <div className="flex items-center gap-2 mb-2">
-            <Wand2 className="w-4 h-4 text-purple-600" />
-            <span className="text-sm font-medium text-purple-800">AI Query Assistant</span>
-            <span className="text-xs text-purple-500">Describe what you want to query in plain language</span>
+            <Wand2 className="w-4 h-4 text-purple-600 dark:text-purple-400" />
+            <span className="text-sm font-medium text-purple-800 dark:text-purple-300">AI Query Assistant</span>
+            <span className="text-xs text-purple-500 dark:text-purple-400">Describe what you want to query in plain language</span>
           </div>
           <div className="flex gap-2">
             <input
@@ -263,7 +263,7 @@ export function DatabaseExplorer({
                 }
               }}
               placeholder="e.g. Show top 10 customers by total order amount..."
-              className="flex-1 px-3 py-2 text-sm text-gray-900 border border-purple-300 rounded-md focus:outline-none focus:ring-2 focus:ring-purple-500 bg-white cursor-text"
+              className="flex-1 px-3 py-2 text-sm text-gray-900 dark:text-dashboard-text border border-purple-300 dark:border-purple-700 rounded-md focus:outline-none focus:ring-2 focus:ring-purple-500 bg-white dark:bg-dashboard-elevated cursor-text dark:placeholder-gray-500"
               style={{ caretColor: '#7c3aed' }}
               disabled={aiLoading}
             />
@@ -287,19 +287,19 @@ export function DatabaseExplorer({
           </div>
 
           {aiError && (
-            <div className="mt-2 px-3 py-2 bg-red-50 border border-red-200 rounded-md">
-              <p className="text-sm text-red-700">{aiError}</p>
+            <div className="mt-2 px-3 py-2 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-md">
+              <p className="text-sm text-red-700 dark:text-red-400">{aiError}</p>
             </div>
           )}
 
           {aiResult && (
-            <div className="mt-2 bg-white border border-purple-200 rounded-md overflow-hidden">
+            <div className="mt-2 bg-white dark:bg-dashboard-elevated border border-purple-200 dark:border-purple-800/50 rounded-md overflow-hidden">
               <div className="relative">
-                <pre className="p-3 pr-32 text-sm font-mono text-gray-800 whitespace-pre-wrap bg-gray-50">{aiResult.sql_query}</pre>
+                <pre className="p-3 pr-32 text-sm font-mono text-gray-800 dark:text-gray-200 whitespace-pre-wrap bg-gray-50 dark:bg-dashboard-bg">{aiResult.sql_query}</pre>
                 <div className="absolute top-2 right-2 flex gap-1">
                   <button
                     onClick={() => navigator.clipboard.writeText(aiResult.sql_query)}
-                    className="p-1.5 text-gray-400 hover:text-gray-600 hover:bg-gray-200 rounded transition-colors"
+                    className="p-1.5 text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 hover:bg-gray-200 dark:hover:bg-dashboard-subtle rounded transition-colors"
                     title="Copy SQL"
                   >
                     <Copy className="w-3.5 h-3.5" />
@@ -322,37 +322,37 @@ export function DatabaseExplorer({
       {/* Main layout: sidebar + editor/results */}
       <div className="flex-1 flex overflow-hidden">
         {/* Schema Sidebar */}
-        <div className="w-56 border-r border-gray-200 bg-gray-50 overflow-y-auto shrink-0">
+        <div className="w-56 border-r border-gray-200 dark:border-dashboard-border bg-gray-50 dark:bg-dashboard-elevated overflow-y-auto shrink-0">
           <div className="p-2">
-            <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wider px-2 py-1">Tables</h3>
+            <h3 className="text-xs font-semibold text-gray-500 dark:text-dashboard-text-secondary uppercase tracking-wider px-2 py-1">Tables</h3>
             {currentConnection?.tables?.length ? (
               currentConnection.tables.map((table) => (
                 <div key={table.name}>
                   <button
                     onClick={() => toggleTable(table.name)}
                     onDoubleClick={() => insertTableQuery(table.name)}
-                    className="w-full flex items-center gap-1 px-2 py-1 text-sm text-gray-700 hover:bg-gray-100 rounded transition-colors"
+                    className="w-full flex items-center gap-1 px-2 py-1 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-dashboard-subtle rounded transition-colors"
                     title="Double-click to generate SELECT query"
                   >
                     {expandedTables.has(table.name) ? (
-                      <ChevronDown className="w-3 h-3 text-gray-400 shrink-0" />
+                      <ChevronDown className="w-3 h-3 text-gray-400 dark:text-gray-500 shrink-0" />
                     ) : (
-                      <ChevronRight className="w-3 h-3 text-gray-400 shrink-0" />
+                      <ChevronRight className="w-3 h-3 text-gray-400 dark:text-gray-500 shrink-0" />
                     )}
-                    <Table className="w-3.5 h-3.5 text-blue-500 shrink-0" />
+                    <Table className="w-3.5 h-3.5 text-blue-500 dark:text-blue-400 shrink-0" />
                     <span className="truncate">{table.name}</span>
                   </button>
                   {expandedTables.has(table.name) && table.columns && (
-                    <div className="ml-5 border-l border-gray-200">
+                    <div className="ml-5 border-l border-gray-200 dark:border-dashboard-border">
                       {table.columns.map((col) => (
                         <div
                           key={col.name}
-                          className="flex items-center gap-1 px-2 py-0.5 text-xs text-gray-600"
+                          className="flex items-center gap-1 px-2 py-0.5 text-xs text-gray-600 dark:text-gray-400"
                           title={col.data_type}
                         >
-                          <Columns className="w-3 h-3 text-gray-400 shrink-0" />
+                          <Columns className="w-3 h-3 text-gray-400 dark:text-gray-500 shrink-0" />
                           <span className="truncate">{col.name}</span>
-                          <span className="text-gray-400 ml-auto text-[10px] shrink-0">{col.data_type}</span>
+                          <span className="text-gray-400 dark:text-gray-500 ml-auto text-[10px] shrink-0">{col.data_type}</span>
                         </div>
                       ))}
                     </div>
@@ -360,7 +360,7 @@ export function DatabaseExplorer({
                 </div>
               ))
             ) : (
-              <p className="text-xs text-gray-400 px-2 py-2">No tables found</p>
+              <p className="text-xs text-gray-400 dark:text-gray-500 px-2 py-2">No tables found</p>
             )}
           </div>
         </div>
@@ -368,25 +368,27 @@ export function DatabaseExplorer({
         {/* Editor + Results */}
         <div className="flex-1 flex flex-col overflow-hidden">
           {/* SQL Editor */}
-          <div className="shrink-0 border-b border-gray-200">
-            <div className="relative">
+          <div className="shrink-0 border-b border-gray-200 dark:border-dashboard-border">
+            <div className="flex">
               <textarea
                 ref={textareaRef}
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 onKeyDown={handleKeyDown}
                 placeholder="Write your SQL query here... (Ctrl+Enter to execute)"
-                className="w-full h-32 p-3 pr-24 font-mono text-sm resize-none focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-inset border-0"
+                className="flex-1 min-w-0 h-32 p-3 font-mono text-sm resize-none focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-inset border-0 dark:bg-dashboard-surface dark:text-dashboard-text dark:placeholder-gray-500"
                 spellCheck={false}
               />
-              <button
-                onClick={executeQuery}
-                disabled={isExecuting || !query.trim() || !hasQueryApi}
-                className="absolute top-2 right-2 flex items-center gap-1 px-3 py-1.5 bg-blue-600 text-white text-sm rounded-md hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-              >
-                <Play className="w-3.5 h-3.5" />
-                {isExecuting ? 'Running...' : 'Run'}
-              </button>
+              <div className="shrink-0 p-2">
+                <button
+                  onClick={executeQuery}
+                  disabled={isExecuting || !query.trim() || !hasQueryApi}
+                  className="flex items-center gap-1 px-3 py-1.5 bg-blue-600 text-white text-sm rounded-md hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                >
+                  <Play className="w-3.5 h-3.5" />
+                  {isExecuting ? 'Running...' : 'Run'}
+                </button>
+              </div>
             </div>
           </div>
 
@@ -396,16 +398,16 @@ export function DatabaseExplorer({
               <div className="flex items-center justify-center h-full">
                 <div className="text-center">
                   <div className="w-6 h-6 border-2 border-blue-600 border-t-transparent rounded-full animate-spin mx-auto mb-2" />
-                  <p className="text-sm text-gray-500">Executing query...</p>
+                  <p className="text-sm text-gray-500 dark:text-gray-400">Executing query...</p>
                 </div>
               </div>
             )}
 
             {queryError && !isExecuting && (
               <div className="p-4">
-                <div className="bg-red-50 border border-red-200 rounded-lg p-4">
-                  <h4 className="text-sm font-semibold text-red-800 mb-1">Query Error</h4>
-                  <pre className="text-sm text-red-700 whitespace-pre-wrap font-mono">{queryError}</pre>
+                <div className="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg p-4">
+                  <h4 className="text-sm font-semibold text-red-800 dark:text-red-400 mb-1">Query Error</h4>
+                  <pre className="text-sm text-red-700 dark:text-red-300 whitespace-pre-wrap font-mono">{queryError}</pre>
                 </div>
               </div>
             )}
@@ -413,7 +415,7 @@ export function DatabaseExplorer({
             {result && !isExecuting && (
               <div className="flex flex-col h-full">
                 {/* Status bar */}
-                <div className="shrink-0 flex items-center justify-between px-4 py-1.5 bg-gray-50 border-b border-gray-200 text-xs text-gray-500">
+                <div className="shrink-0 flex items-center justify-between px-4 py-1.5 bg-gray-50 dark:bg-dashboard-elevated border-b border-gray-200 dark:border-dashboard-border text-xs text-gray-500 dark:text-dashboard-text-secondary">
                   <span>
                     {result.row_count} row{result.row_count !== 1 ? 's' : ''} returned
                     {result.total_rows_available && result.total_rows_available > result.row_count
@@ -427,38 +429,38 @@ export function DatabaseExplorer({
                 <div className="flex-1 overflow-auto">
                   {result.columns.length > 0 ? (
                     <table className="min-w-full text-sm">
-                      <thead className="bg-gray-50 sticky top-0">
+                      <thead className="bg-gray-50 dark:bg-dashboard-elevated sticky top-0">
                         <tr>
-                          <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 border-b border-r border-gray-200 bg-gray-100 w-10">#</th>
+                          <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-dashboard-text-secondary border-b border-r border-gray-200 dark:border-dashboard-border bg-gray-100 dark:bg-dashboard-elevated w-10">#</th>
                           {result.columns.map((col, i) => (
                             <th
                               key={i}
-                              className="px-3 py-2 text-left text-xs font-medium text-gray-700 border-b border-r border-gray-200 bg-gray-100 whitespace-nowrap"
+                              className="px-3 py-2 text-left text-xs font-medium text-gray-700 dark:text-gray-300 border-b border-r border-gray-200 dark:border-dashboard-border bg-gray-100 dark:bg-dashboard-elevated whitespace-nowrap"
                               title={col.type}
                             >
                               {col.name}
-                              <span className="ml-1 text-gray-400 font-normal">{col.type}</span>
+                              <span className="ml-1 text-gray-400 dark:text-gray-500 font-normal">{col.type}</span>
                             </th>
                           ))}
                         </tr>
                       </thead>
                       <tbody>
                         {result.rows.map((row, rowIdx) => (
-                          <tr key={rowIdx} className="hover:bg-blue-50 transition-colors">
-                            <td className="px-3 py-1.5 text-xs text-gray-400 border-b border-r border-gray-100 bg-gray-50">{rowIdx + 1}</td>
+                          <tr key={rowIdx} className="hover:bg-blue-50 dark:hover:bg-blue-900/20 transition-colors">
+                            <td className="px-3 py-1.5 text-xs text-gray-400 dark:text-gray-500 border-b border-r border-gray-100 dark:border-dashboard-border-subtle bg-gray-50 dark:bg-dashboard-elevated">{rowIdx + 1}</td>
                             {Array.isArray(row) ? (
                               row.map((cell: any, colIdx: number) => (
-                                <td key={colIdx} className="px-3 py-1.5 border-b border-r border-gray-100 font-mono text-xs text-gray-900 whitespace-nowrap max-w-xs truncate" title={cell != null ? String(cell) : 'NULL'}>
-                                  {cell === null || cell === undefined ? <span className="text-gray-400 italic">NULL</span> : String(cell)}
+                                <td key={colIdx} className="px-3 py-1.5 border-b border-r border-gray-100 dark:border-dashboard-border-subtle font-mono text-xs text-gray-900 dark:text-gray-200 whitespace-nowrap max-w-xs truncate" title={cell != null ? String(cell) : 'NULL'}>
+                                  {cell === null || cell === undefined ? <span className="text-gray-400 dark:text-gray-500 italic">NULL</span> : String(cell)}
                                 </td>
                               ))
                             ) : (
                               result.columns.map((col, colIdx) => {
                                 const val = row[col.name];
                                 return (
-                                  <td key={colIdx} className="px-3 py-1.5 border-b border-r border-gray-100 font-mono text-xs text-gray-900 whitespace-nowrap max-w-xs truncate" title={val != null ? String(val) : 'NULL'}>
+                                  <td key={colIdx} className="px-3 py-1.5 border-b border-r border-gray-100 dark:border-dashboard-border-subtle font-mono text-xs text-gray-900 dark:text-gray-200 whitespace-nowrap max-w-xs truncate" title={val != null ? String(val) : 'NULL'}>
                                     {val === null || val === undefined
-                                      ? <span className="text-gray-400 italic">NULL</span>
+                                      ? <span className="text-gray-400 dark:text-gray-500 italic">NULL</span>
                                       : String(val)}
                                   </td>
                                 );
@@ -469,7 +471,7 @@ export function DatabaseExplorer({
                       </tbody>
                     </table>
                   ) : (
-                    <div className="flex items-center justify-center h-full text-sm text-gray-500">
+                    <div className="flex items-center justify-center h-full text-sm text-gray-500 dark:text-gray-400">
                       Query executed successfully (no results to display)
                     </div>
                   )}
@@ -478,10 +480,10 @@ export function DatabaseExplorer({
             )}
 
             {!result && !queryError && !isExecuting && (
-              <div className="flex items-center justify-center h-full text-gray-400">
+              <div className="flex items-center justify-center h-full text-gray-400 dark:text-gray-500">
                 <div className="text-center">
                   <Database className="w-12 h-12 mx-auto mb-3 opacity-30" />
-                  <p className="text-sm">Write a query and press <kbd className="px-1.5 py-0.5 bg-gray-100 border border-gray-300 rounded text-xs">Ctrl+Enter</kbd> to execute</p>
+                  <p className="text-sm">Write a query and press <kbd className="px-1.5 py-0.5 bg-gray-100 dark:bg-dashboard-elevated border border-gray-300 dark:border-dashboard-border rounded text-xs">Ctrl+Enter</kbd> to execute</p>
                   <p className="text-xs mt-1">Double-click a table name in the sidebar to generate a SELECT query</p>
                 </div>
               </div>
