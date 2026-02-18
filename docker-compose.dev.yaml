@@ -32,6 +32,7 @@ services:
     environment:
       - SANDBOX_ENVIRONMENT=development
       - SANDBOX_DEBUG=true
+      - SANDBOX_CONFIG_PATH=/app/config/sandbox.yaml
       - PYTHONUNBUFFERED=1
       # Limit OpenBLAS/numpy threads to prevent memory allocation failures
       - OPENBLAS_NUM_THREADS=1
