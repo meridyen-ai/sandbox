@@ -208,15 +208,15 @@ export function DatabaseExplorer({
   return (
     <div className={containerClass}>
       {/* Header */}
-      <div className="flex items-center justify-between px-4 py-2 border-b border-gray-200 dark:border-dashboard-border bg-gray-50 dark:bg-dashboard-elevated shrink-0">
-        <div className="flex items-center gap-3">
-          <Database className="w-5 h-5 text-blue-600 dark:text-blue-400" />
-          <h2 className="text-lg font-semibold text-gray-800 dark:text-dashboard-text">Query Explorer</h2>
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 px-4 py-2 border-b border-gray-200 dark:border-dashboard-border bg-gray-50 dark:bg-dashboard-elevated shrink-0">
+        <div className="flex items-center gap-2 min-w-0">
+          <Database className="w-5 h-5 text-blue-600 dark:text-blue-400 shrink-0" />
+          <h2 className="text-base sm:text-lg font-semibold text-gray-800 dark:text-dashboard-text whitespace-nowrap">Query Explorer</h2>
           {connections.length > 0 && (
             <select
               value={selectedConnection}
               onChange={(e) => setSelectedConnection(e.target.value)}
-              className="ml-2 px-3 py-1 text-sm border border-gray-300 dark:border-dashboard-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 dark:bg-dashboard-elevated dark:text-dashboard-text"
+              className="px-2 py-1 text-sm border border-gray-300 dark:border-dashboard-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 dark:bg-dashboard-elevated dark:text-dashboard-text min-w-0 truncate"
             >
               {connections.map((conn) => (
                 <option key={conn.id} value={conn.id}>
@@ -226,7 +226,7 @@ export function DatabaseExplorer({
             </select>
           )}
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 shrink-0">
           <button
             onClick={() => setIsFullscreen(!isFullscreen)}
             className="p-2 text-gray-600 dark:text-gray-400 hover:text-gray-800 dark:hover:text-dashboard-text hover:bg-gray-100 dark:hover:bg-dashboard-subtle rounded-md transition-colors"
@@ -245,12 +245,12 @@ export function DatabaseExplorer({
       {/* AI Assistant Panel — shown only if ai API is available */}
       {hasAiApi && (
         <div className="shrink-0 border-b border-purple-200 dark:border-purple-800/50 bg-purple-50 dark:bg-purple-900/20 px-4 py-3">
-          <div className="flex items-center gap-2 mb-2">
-            <Wand2 className="w-4 h-4 text-purple-600 dark:text-purple-400" />
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1 mb-2">
+            <Wand2 className="w-4 h-4 text-purple-600 dark:text-purple-400 shrink-0" />
             <span className="text-sm font-medium text-purple-800 dark:text-purple-300">AI Query Assistant</span>
-            <span className="text-xs text-purple-500 dark:text-purple-400">Describe what you want to query in plain language</span>
+            <span className="hidden sm:inline text-xs text-purple-500 dark:text-purple-400">Describe what you want to query in plain language</span>
           </div>
-          <div className="flex gap-2">
+          <div className="flex flex-col sm:flex-row gap-2">
             <input
               ref={aiInputRef}
               type="text"
@@ -320,9 +320,9 @@ export function DatabaseExplorer({
       )}
 
       {/* Main layout: sidebar + editor/results */}
-      <div className="flex-1 flex overflow-hidden">
+      <div className="flex-1 flex flex-col md:flex-row overflow-hidden">
         {/* Schema Sidebar */}
-        <div className="w-56 border-r border-gray-200 dark:border-dashboard-border bg-gray-50 dark:bg-dashboard-elevated overflow-y-auto shrink-0">
+        <div className="w-full md:w-56 max-h-36 md:max-h-none border-b md:border-b-0 md:border-r border-gray-200 dark:border-dashboard-border bg-gray-50 dark:bg-dashboard-elevated overflow-y-auto shrink-0">
           <div className="p-2">
             <h3 className="text-xs font-semibold text-gray-500 dark:text-dashboard-text-secondary uppercase tracking-wider px-2 py-1">Tables</h3>
             {currentConnection?.tables?.length ? (
@@ -375,8 +375,8 @@ export function DatabaseExplorer({
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 onKeyDown={handleKeyDown}
-                placeholder="Write your SQL query here... (Ctrl+Enter to execute)"
-                className="flex-1 min-w-0 h-32 p-3 font-mono text-sm resize-none focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-inset border-0 dark:bg-dashboard-surface dark:text-dashboard-text dark:placeholder-gray-500"
+                placeholder="Write your SQL query here..."
+                className="flex-1 min-w-0 h-28 sm:h-32 p-3 font-mono text-sm resize-none focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-inset border-0 dark:bg-dashboard-surface dark:text-dashboard-text dark:placeholder-gray-500"
                 spellCheck={false}
               />
               <div className="shrink-0 p-2">
