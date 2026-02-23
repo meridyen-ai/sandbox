@@ -46,6 +46,10 @@ services:
       - SANDBOX_AUTHENTICATION__REMOTE_URL=${SANDBOX_AUTHENTICATION__REMOTE_URL:-http://host.docker.internal:18000/api/v1/sandbox/validate-key}
       - SANDBOX_AUTHENTICATION__REMOTE_TIMEOUT=5.0
       - SANDBOX_AUTHENTICATION__ENABLE_API_KEY_AUTH=true
+      # User authentication (web UI login)
+      - SANDBOX_AUTH_USERNAME=${SANDBOX_AUTH_USERNAME:-admin}
+      - SANDBOX_AUTH_PASSWORD=${SANDBOX_AUTH_PASSWORD:-admin123}
+      - SANDBOX_AUTH_JWT_SECRET=${SANDBOX_AUTH_JWT_SECRET:-sandbox-jwt-secret-change-me-to-something-secure}
       # Upload database
       - SANDBOX_UPLOAD_DB_HOST=sandbox-postgres
       - SANDBOX_UPLOAD_DB_PORT=5432

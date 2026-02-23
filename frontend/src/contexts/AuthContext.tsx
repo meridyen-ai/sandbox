@@ -1,35 +1,65 @@
-import React, { createContext, useContext, useState } from 'react'
+import React, { createContext, useContext, useState, useEffect, useCallback } from 'react'
+import axios from 'axios'
 
 interface AuthContextType {
-  apiKey: string | null
+  username: string | null
   isAuthenticated: boolean
-  login: (key: string) => void
-  logout: () => void
+  isLoading: boolean
+  login: (username: string, password: string) => Promise<void>
+  logout: () => Promise<void>
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined)
 
-const STORAGE_KEY = 'sandbox_api_key'
-
 export function AuthProvider({ children }: { children: React.ReactNode }) {
-  // Initialize directly from localStorage (synchronous) to avoid race condition
-  const [apiKey, setApiKey] = useState<string | null>(
-    () => localStorage.getItem(STORAGE_KEY)
-  )
+  const [username, setUsername] = useState<string | null>(null)
+  const [isLoading, setIsLoading] = useState(true)
 
-  const login = (key: string) => {
-    localStorage.setItem(STORAGE_KEY, key)
-    setApiKey(key)
-  }
+  // Check existing session on mount
+  useEffect(() => {
+    const checkSession = async () => {
+      try {
+        const response = await axios.get('/api/v1/auth/me', {
+          withCredentials: true,
+        })
+        if (response.data.authenticated) {
+          setUsername(response.data.username)
+        }
+      } catch {
+        // Not authenticated — that's fine
+      } finally {
+        setIsLoading(false)
+      }
+    }
+    checkSession()
+  }, [])
 
-  const logout = () => {
-    localStorage.removeItem(STORAGE_KEY)
-    setApiKey(null)
-  }
+  const login = useCallback(async (user: string, password: string) => {
+    const response = await axios.post(
+      '/api/v1/auth/login',
+      { username: user, password },
+      { withCredentials: true }
+    )
+    if (response.status === 200) {
+      setUsername(response.data.username)
+    } else {
+      throw new Error('Login failed')
+    }
+  }, [])
+
+  const logout = useCallback(async () => {
+    try {
+      await axios.post('/api/v1/auth/logout', {}, { withCredentials: true })
+    } catch {
+      // Ignore errors on logout
+    }
+    setUsername(null)
+  }, [])
 
   const value = {
-    apiKey,
-    isAuthenticated: !!apiKey,
+    username,
+    isAuthenticated: !!username,
+    isLoading,
     login,
     logout,
   }

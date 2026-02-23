@@ -31,19 +31,16 @@
   "login": {
     "title": "Meridyen Sandbox",
     "subtitle": "Secure execution environment for SQL and Python",
-    "apiKeyLabel": "Sandbox API Key",
-    "apiKeyPlaceholder": "sb_xxxxxxxxxxxxxxxx",
-    "apiKeyHelp": "Enter your sandbox API key",
-    "validating": "Validating...",
-    "continue": "Continue",
-    "noApiKey": "Don't have an API key?",
-    "createApiKey": "Create one in your admin panel",
-    "apiKeyPrefix": "Sandbox API keys start with",
+    "usernameLabel": "Username",
+    "usernamePlaceholder": "Enter your username",
+    "passwordLabel": "Password",
+    "passwordPlaceholder": "Enter your password",
+    "signIn": "Sign In",
+    "signingIn": "Signing in...",
     "errors": {
-      "emptyKey": "Please enter your sandbox API key",
-      "invalidFormat": "Invalid API key format. Sandbox API keys must start with \"sb_\"",
-      "validationFailed": "Unable to validate API key. Please check your key and try again.",
-      "connectionFailed": "Unable to connect to sandbox server. Please ensure the server is running."
+      "emptyFields": "Please enter both username and password",
+      "invalidCredentials": "Invalid username or password",
+      "connectionFailed": "Unable to connect to server. Please ensure the server is running."
     }
   },
   "dataSources": {

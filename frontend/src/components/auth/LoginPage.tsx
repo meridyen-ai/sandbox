@@ -1,51 +1,42 @@
 import { useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, Navigate } from 'react-router-dom'
 import { useAuth } from '../../contexts/AuthContext'
-import { Database, Key, AlertCircle } from 'lucide-react'
+import { Database, User, Lock, AlertCircle } from 'lucide-react'
 import { useTranslation } from '../../hooks/useTranslation'
 
 export function LoginPage() {
   const { t } = useTranslation()
-  const [apiKey, setApiKey] = useState('')
+  const [username, setUsername] = useState('')
+  const [password, setPassword] = useState('')
   const [error, setError] = useState('')
-  const [isValidating, setIsValidating] = useState(false)
-  const { login } = useAuth()
+  const [isLoading, setIsLoading] = useState(false)
+  const { login, isAuthenticated, isLoading: authLoading } = useAuth()
   const navigate = useNavigate()
+
+  // Redirect if already authenticated
+  if (!authLoading && isAuthenticated) {
+    return <Navigate to="/connections" replace />
+  }
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     setError('')
 
-    if (!apiKey.trim()) {
-      setError(t('login.errors.emptyKey'))
+    if (!username.trim() || !password.trim()) {
+      setError(t('login.errors.emptyFields'))
       return
     }
 
-    if (!apiKey.startsWith('sb_')) {
-      setError(t('login.errors.invalidFormat'))
-      return
-    }
-
-    setIsValidating(true)
+    setIsLoading(true)
 
     try {
-      // Validate the API key by making a test request to the sandbox health endpoint
-      const response = await fetch('http://localhost:8081/health', {
-        headers: {
-          'X-API-Key': apiKey,
-        },
-      })
-
-      if (response.ok) {
-        login(apiKey)
-        navigate('/connections')
-      } else {
-        setError(t('login.errors.validationFailed'))
-      }
-    } catch (err) {
-      setError(t('login.errors.connectionFailed'))
+      await login(username, password)
+      navigate('/connections')
+    } catch (err: any) {
+      const detail = err?.response?.data?.detail
+      setError(detail || t('login.errors.invalidCredentials'))
     } finally {
-      setIsValidating(false)
+      setIsLoading(false)
     }
   }
 
@@ -70,29 +61,50 @@ export function LoginPage() {
           <form onSubmit={handleSubmit} className="space-y-6">
             <div>
               <label
-                htmlFor="apiKey"
+                htmlFor="username"
                 className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2"
               >
-                {t('login.apiKeyLabel')}
+                {t('login.usernameLabel')}
               </label>
               <div className="relative">
                 <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
-                  <Key className="h-5 w-5 text-gray-400" />
+                  <User className="h-5 w-5 text-gray-400" />
                 </div>
                 <input
-                  id="apiKey"
-                  type="password"
-                  value={apiKey}
-                  onChange={(e) => setApiKey(e.target.value)}
+                  id="username"
+                  type="text"
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
                   className="block w-full pl-10 pr-3 py-3 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent dark:bg-gray-700 dark:text-white"
-                  placeholder={t('login.apiKeyPlaceholder')}
-                  autoComplete="off"
-                  disabled={isValidating}
+                  placeholder={t('login.usernamePlaceholder')}
+                  autoComplete="username"
+                  disabled={isLoading}
                 />
               </div>
-              <p className="mt-2 text-sm text-gray-500 dark:text-gray-400">
-                {t('login.apiKeyHelp')}
-              </p>
+            </div>
+
+            <div>
+              <label
+                htmlFor="password"
+                className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2"
+              >
+                {t('login.passwordLabel')}
+              </label>
+              <div className="relative">
+                <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+                  <Lock className="h-5 w-5 text-gray-400" />
+                </div>
+                <input
+                  id="password"
+                  type="password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  className="block w-full pl-10 pr-3 py-3 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent dark:bg-gray-700 dark:text-white"
+                  placeholder={t('login.passwordPlaceholder')}
+                  autoComplete="current-password"
+                  disabled={isLoading}
+                />
+              </div>
             </div>
 
             {error && (
@@ -104,34 +116,12 @@ export function LoginPage() {
 
             <button
               type="submit"
-              disabled={isValidating}
+              disabled={isLoading || !username || !password}
               className="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-blue-400 text-white font-medium py-3 px-4 rounded-lg transition-colors duration-200 disabled:cursor-not-allowed"
             >
-              {isValidating ? t('login.validating') : t('login.continue')}
+              {isLoading ? t('login.signingIn') : t('login.signIn')}
             </button>
           </form>
-
-          {/* Help Text */}
-          <div className="mt-6 pt-6 border-t border-gray-200 dark:border-gray-700">
-            <p className="text-sm text-gray-600 dark:text-gray-400 text-center">
-              {t('login.noApiKey')}{' '}
-              <a
-                href="http://localhost:13000"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="text-blue-600 dark:text-blue-400 hover:underline font-medium"
-              >
-                {t('login.createApiKey')}
-              </a>
-            </p>
-          </div>
-        </div>
-
-        {/* Additional Info */}
-        <div className="mt-6 text-center">
-          <p className="text-sm text-gray-500 dark:text-gray-400">
-            {t('login.apiKeyPrefix')} <code className="px-2 py-1 bg-gray-200 dark:bg-gray-700 rounded">sb_</code>
-          </p>
         </div>
       </div>
     </div>

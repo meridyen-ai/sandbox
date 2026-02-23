@@ -2,7 +2,7 @@
 # Meridyen Sandbox Makefile
 # =============================================================================
 
-.PHONY: help build build-airgapped run run-airgapped stop dev test lint format clean
+.PHONY: help build build-airgapped run run-airgapped stop dev test lint format clean sandbox sandbox-dev sandbox-stop
 
 # Default target
 help:
@@ -35,6 +35,11 @@ help:
 	@echo "  make test            - Run tests"
 	@echo "  make lint            - Run linter"
 	@echo "  make format          - Format code"
+	@echo ""
+	@echo "Sandbox Direct Run (sandbox.meridyen.ai):"
+	@echo "  make sandbox         - Build UI & run backend (production)"
+	@echo "  make sandbox-dev     - Run backend + UI with hot reload"
+	@echo "  make sandbox-stop    - Stop sandbox processes"
 	@echo ""
 	@echo "Cleanup Commands:"
 	@echo "  make clean           - Remove containers and volumes"
@@ -111,7 +116,7 @@ dev:
 	@echo "   Docs:     http://localhost:8080/docs"
 
 install:
-	pip install -e ".[dev]"
+	pip install --user --break-system-packages -e "." 2>/dev/null || pip install -e "."
 	@echo "✅ Development dependencies installed"
 
 test:
@@ -259,3 +264,29 @@ run-with-ui: build-ui
 	@echo "   REST API: http://localhost:8080"
 	@echo "   gRPC:     localhost:50051"
 	@echo "   Metrics:  http://localhost:9090/metrics"
+
+# =============================================================================
+# Sandbox Docker Run (for sandbox.meridyen.ai)
+# =============================================================================
+# Runs sandbox backend + frontend in Docker containers
+
+sandbox: build-ui
+	@echo "Starting Meridyen Sandbox (production mode in Docker)..."
+	docker compose -f docker-compose.sandbox.yaml up -d --build
+	@echo ""
+	@echo "Backend + Frontend on port $${SANDBOX_REST_PORT:-38082}"
+
+sandbox-dev:
+	@echo "Starting Meridyen Sandbox (development mode in Docker)..."
+	docker compose -f docker-compose.sandbox.yaml up --build
+	@echo ""
+	@echo "Frontend (Vite):    http://localhost:$${SANDBOX_FRONTEND_PORT:-5180}"
+	@echo "Backend (Uvicorn):  http://localhost:$${SANDBOX_REST_PORT:-38082}"
+
+sandbox-stop:
+	@echo "Stopping sandbox containers..."
+	docker compose -f docker-compose.sandbox.yaml down
+	@echo "Sandbox stopped"
+
+sandbox-logs:
+	docker compose -f docker-compose.sandbox.yaml logs -f

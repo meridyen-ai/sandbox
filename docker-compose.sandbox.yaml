@@ -1,14 +1,15 @@
 # =============================================================================
-# Docker Compose - Hybrid Mode
+# Docker Compose - Sandbox Standalone (sandbox.meridyen.ai)
 # =============================================================================
-# Client-hosted sandbox that connects to Meridyen cloud for LLM services
+# Runs sandbox backend + frontend in Docker containers with custom ports.
+# Uses unique container names to avoid conflicts with make cloud.
 #
 # Usage:
-#   1. Copy config/sandbox.example.yaml to config/sandbox.yaml
-#   2. Edit sandbox.yaml with your settings
-#   3. docker-compose -f docker-compose.hybrid.yaml up -d
+#   make sandbox-dev   (development with hot reload)
+#   make sandbox       (production with built frontend)
+#   make sandbox-stop  (stop all)
 
-name: meridyen-sandbox-hybrid
+name: sandbox-standalone
 
 services:
   # ---------------------------------------------------------------------------
@@ -16,11 +17,11 @@ services:
   # ---------------------------------------------------------------------------
   sandbox-postgres:
     image: postgres:16-alpine
-    container_name: meridyen-sandbox-postgres
+    container_name: sandbox-standalone-postgres
     restart: unless-stopped
 
     ports:
-      - "${SANDBOX_PG_PORT:-5433}:5432"
+      - "${SANDBOX_PG_PORT:-35433}:5432"
 
     environment:
       - POSTGRES_DB=sandbox_uploads
@@ -47,56 +48,60 @@ services:
         max-file: "3"
 
   # ---------------------------------------------------------------------------
-  # Sandbox Container
+  # Sandbox Backend (FastAPI + gRPC)
   # ---------------------------------------------------------------------------
   sandbox:
-    image: meridyen/sandbox:latest
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: meridyen-sandbox
+      target: development
+    container_name: sandbox-standalone-backend
     restart: unless-stopped
 
     depends_on:
       sandbox-postgres:
         condition: service_healthy
 
+    # Clear inherited ENTRYPOINT so command runs directly
+    entrypoint: []
+
+    # Development: uvicorn with hot reload
+    command: >
+      sh -c "cd /app/src && uvicorn sandbox.main:app
+      --host 0.0.0.0 --port 8080
+      --reload --reload-dir /app/src/sandbox
+      --log-level debug"
+
     ports:
-      - "${SANDBOX_REST_PORT:-8081}:8080"
-      - "${SANDBOX_GRPC_PORT:-50051}:50051"
-      - "${SANDBOX_METRICS_PORT:-9091}:9090"
+      - "${SANDBOX_REST_PORT:-38082}:8080"
+      - "${SANDBOX_GRPC_PORT:-50052}:50051"
+      - "${SANDBOX_METRICS_PORT:-39091}:9090"
 
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
     environment:
+      - SANDBOX_ENVIRONMENT=development
+      - SANDBOX_DEBUG=true
+      - SANDBOX_CONFIG_PATH=/app/config/sandbox.yaml
+      - PYTHONUNBUFFERED=1
+      # Limit threads to prevent memory issues
+      - OPENBLAS_NUM_THREADS=1
+      - OMP_NUM_THREADS=1
       # Execution mode
-      - SANDBOX_EXECUTION_MODE=${SANDBOX_EXECUTION_MODE:-hybrid}
-      - SANDBOX_ENVIRONMENT=${SANDBOX_ENVIRONMENT:-production}
-
-      # Authentication
+      - SANDBOX_EXECUTION_MODE=${SANDBOX_EXECUTION_MODE:-airgapped}
+      # Disable TLS
+      - SANDBOX_PLATFORM__MTLS_ENABLED=false
+      # Authentication (API key)
       - SANDBOX_AUTHENTICATION__PROVIDER=${SANDBOX_AUTHENTICATION__PROVIDER:-static}
       - SANDBOX_AUTHENTICATION__REMOTE_URL=${SANDBOX_AUTHENTICATION__REMOTE_URL:-}
-      - SANDBOX_AUTHENTICATION__REMOTE_TIMEOUT=${SANDBOX_AUTHENTICATION__REMOTE_TIMEOUT:-5.0}
-      - SANDBOX_AUTHENTICATION__ENABLE_API_KEY_AUTH=${SANDBOX_AUTHENTICATION__ENABLE_API_KEY_AUTH:-true}
-
+      - SANDBOX_AUTHENTICATION__REMOTE_TIMEOUT=5.0
+      - SANDBOX_AUTHENTICATION__ENABLE_API_KEY_AUTH=true
       # User authentication (web UI login)
       - SANDBOX_AUTH_USERNAME=${SANDBOX_AUTH_USERNAME:-admin}
       - SANDBOX_AUTH_PASSWORD=${SANDBOX_AUTH_PASSWORD:-admin123}
       - SANDBOX_AUTH_JWT_SECRET=${SANDBOX_AUTH_JWT_SECRET:-sandbox-jwt-secret-change-me-to-something-secure}
-
-      # Platform connection
-      - SANDBOX_PLATFORM__PLATFORM_URL=${PLATFORM_URL:-https://api.meridyen.ai}
-      - SANDBOX_PLATFORM__WORKSPACE_ID=${WORKSPACE_ID}
-      - SANDBOX_PLATFORM__REGISTRATION_TOKEN=${REGISTRATION_TOKEN}
-      - SANDBOX_PLATFORM__MTLS_ENABLED=${SANDBOX_PLATFORM__MTLS_ENABLED:-false}
-
-      # Resource limits
-      - SANDBOX_RESOURCE_LIMITS__MAX_MEMORY_MB=${MAX_MEMORY_MB:-512}
-      - SANDBOX_RESOURCE_LIMITS__MAX_CPU_SECONDS=${MAX_CPU_SECONDS:-60}
-      - SANDBOX_RESOURCE_LIMITS__MAX_ROWS=${MAX_ROWS:-100000}
-
-      # Upload database (sandbox-postgres)
+      # Upload database
       - SANDBOX_UPLOAD_DB_HOST=sandbox-postgres
       - SANDBOX_UPLOAD_DB_PORT=5432
       - SANDBOX_UPLOAD_DB_NAME=sandbox_uploads
@@ -104,34 +109,67 @@ services:
       - SANDBOX_UPLOAD_DB_PASSWORD=sandbox_password
 
     volumes:
-      # Configuration
+      # Mount source code for hot reload
+      - ./src:/app/src:rw
       - ./config:/app/config:ro
-      # Persistent data (connections, etc.)
+      # Persistent data
       - sandbox_data:/app/data
-      # Logs (optional)
       - sandbox_logs:/app/logs
-      # SSL certificates (if using mTLS)
-      - ./certs:/app/certs:ro
 
     networks:
       - sandbox-network
-      - client-database-network
 
     deploy:
       resources:
         limits:
-          cpus: "${SANDBOX_CPU_LIMIT:-2}"
-          memory: "${SANDBOX_MEMORY_LIMIT:-2G}"
-        reservations:
-          cpus: "0.5"
-          memory: "512M"
+          cpus: "4"
+          memory: "4G"
 
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 10s
+      start_period: 15s
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ---------------------------------------------------------------------------
+  # Frontend (Vite dev server with HMR)
+  # ---------------------------------------------------------------------------
+  frontend:
+    image: node:20-alpine
+    container_name: sandbox-standalone-frontend
+    restart: unless-stopped
+    working_dir: /app
+
+    depends_on:
+      sandbox:
+        condition: service_healthy
+
+    command: sh -c "npm install && npx vite --host 0.0.0.0 --port 5180"
+
+    ports:
+      - "${SANDBOX_FRONTEND_PORT:-5180}:5180"
+
+    environment:
+      - NODE_ENV=development
+      - VITE_PROXY_TARGET=http://sandbox:8080
+
+    volumes:
+      - ./frontend:/app:rw
+      - ./sdks/react:/sdks/react:ro
+      - sandbox_frontend_node_modules:/app/node_modules
+
+    networks:
+      - sandbox-network
+
+    stdin_open: true
+    tty: true
 
     logging:
       driver: "json-file"
@@ -146,13 +184,9 @@ volumes:
     driver: local
   sandbox_postgres_data:
     driver: local
+  sandbox_frontend_node_modules:
+    driver: local
 
 networks:
   sandbox-network:
-    driver: bridge
-  # Connect to your existing database network
-  # Set DATABASE_NETWORK_EXTERNAL=true if you want to use an existing external network
-  client-database-network:
-    external: ${DATABASE_NETWORK_EXTERNAL:-false}
-    name: ${DATABASE_NETWORK:-client-databases}
     driver: bridge

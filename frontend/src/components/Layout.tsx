@@ -1,5 +1,5 @@
 import { Outlet, Link, useLocation, useNavigate } from 'react-router-dom'
-import { Database, LogOut, Key, Search } from 'lucide-react'
+import { Database, LogOut, User, Search } from 'lucide-react'
 import { useAuth } from '../contexts/AuthContext'
 import { useTranslation } from '../hooks/useTranslation'
 
@@ -7,10 +7,10 @@ export function Layout() {
   const { t } = useTranslation()
   const location = useLocation()
   const navigate = useNavigate()
-  const { logout, apiKey } = useAuth()
+  const { logout, username } = useAuth()
 
-  const handleLogout = () => {
-    logout()
+  const handleLogout = async () => {
+    await logout()
     navigate('/login')
   }
 
@@ -50,13 +50,15 @@ export function Layout() {
               </nav>
             </div>
             <div className="flex items-center space-x-4">
-              {/* API Key Indicator */}
-              <div className="hidden md:flex items-center space-x-2 px-3 py-1 bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded-lg">
-                <Key className="w-4 h-4 text-green-600 dark:text-green-400" />
-                <span className="text-xs font-medium text-green-700 dark:text-green-300">
-                  {apiKey?.substring(0, 10)}...
-                </span>
-              </div>
+              {/* User Indicator */}
+              {username && (
+                <div className="hidden md:flex items-center space-x-2 px-3 py-1 bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded-lg">
+                  <User className="w-4 h-4 text-green-600 dark:text-green-400" />
+                  <span className="text-xs font-medium text-green-700 dark:text-green-300">
+                    {username}
+                  </span>
+                </div>
+              )}
 
               <button
                 onClick={handleLogout}

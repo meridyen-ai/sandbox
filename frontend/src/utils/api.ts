@@ -8,15 +8,7 @@ const api = axios.create({
   headers: {
     'Content-Type': 'application/json',
   },
-})
-
-// Add API key header to all requests
-api.interceptors.request.use((config) => {
-  const apiKey = localStorage.getItem('sandbox_api_key')
-  if (apiKey) {
-    config.headers['X-API-Key'] = apiKey
-  }
-  return config
+  withCredentials: true,
 })
 
 // Handle authentication errors
@@ -24,8 +16,6 @@ api.interceptors.response.use(
   (response) => response,
   (error) => {
     if (error.response?.status === 401) {
-      // Clear invalid API key and redirect to login
-      localStorage.removeItem('sandbox_api_key')
       window.location.href = '/login'
     }
     return Promise.reject(error)

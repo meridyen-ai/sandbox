@@ -8,6 +8,7 @@ Alternative to gRPC for simpler integrations.
 from __future__ import annotations
 
 import asyncio
+import os
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, date, time, timedelta, timezone
@@ -18,9 +19,10 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 from uuid import UUID
 
-from fastapi import FastAPI, File, Form, HTTPException, Depends, Header, UploadFile, status
+from fastapi import FastAPI, Cookie, File, Form, HTTPException, Depends, Header, Request, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 import jwt
 
@@ -169,6 +171,18 @@ class GoogleSheetUploadRequest(BaseModel):
     worksheet_name: str | None = None
 
 
+class LoginRequest(BaseModel):
+    """Login request with username and password."""
+    username: str
+    password: str
+
+
+class LoginResponse(BaseModel):
+    """Login response."""
+    username: str
+    message: str = "Login successful"
+
+
 class HealthResponse(BaseModel):
     """Health check response."""
     status: str
@@ -194,19 +208,49 @@ class CapabilitiesResponse(BaseModel):
 # =============================================================================
 
 
+def _get_user_jwt_secret() -> str:
+    """Get the JWT secret for user session tokens."""
+    return os.environ.get("SANDBOX_AUTH_JWT_SECRET", "sandbox-jwt-secret-change-me-to-something-secure")
+
+
+def _create_user_token(username: str) -> str:
+    """Create a JWT token for an authenticated user."""
+    secret = _get_user_jwt_secret()
+    payload = {
+        "sub": username,
+        "type": "user_session",
+        "iat": int(datetime.now(timezone.utc).timestamp()),
+    }
+    return jwt.encode(payload, secret, algorithm="HS256")
+
+
+def _verify_user_token(token: str) -> dict[str, Any] | None:
+    """Verify a user session JWT token. Returns claims or None."""
+    secret = _get_user_jwt_secret()
+    try:
+        return jwt.decode(token, secret, algorithms=["HS256"])
+    except jwt.InvalidTokenError:
+        return None
+
+
 async def verify_sandbox_token(
+    request: Request,
     authorization: str | None = Header(None, alias="Authorization"),
     x_api_key: str | None = Header(None, alias="X-API-Key"),
 ) -> dict[str, Any]:
     """
     Verify sandbox authentication token.
 
-    Supports two authentication methods:
-    1. Sandbox API Key (sb_*) - Preferred method for user authentication
+    Supports three authentication methods:
+    1. User session cookie (sandbox_token) - For browser-based users
+       - Cookie set by /api/v1/auth/login
+       - Contains JWT with user session info
+
+    2. Sandbox API Key (sb_*) - For programmatic access
        - Header: Authorization: Bearer sb_xxx OR X-API-Key: sb_xxx
        - Validates against configured auth provider
 
-    2. JWT Token (legacy) - For platform-to-sandbox communication
+    3. JWT Token (legacy) - For platform-to-sandbox communication
        - Header: Authorization: Bearer <jwt_token>
        - Used for internal platform communication
 
@@ -217,7 +261,24 @@ async def verify_sandbox_token(
 
     config = get_config()
 
-    # Try X-API-Key header first
+    # 1. Try cookie-based user session first
+    session_token = request.cookies.get("sandbox_token")
+    if session_token:
+        claims = _verify_user_token(session_token)
+        if claims and claims.get("type") == "user_session":
+            return {
+                "auth_type": "user_session",
+                "workspace_id": "default",
+                "workspace_name": "Default Workspace",
+                "user_id": claims.get("sub"),
+                "permissions": {
+                    "execute_sql": True,
+                    "execute_python": True,
+                    "generate_visualizations": True,
+                },
+            }
+
+    # 2. Try X-API-Key header
     api_key = x_api_key
 
     # Fall back to Authorization header
@@ -228,7 +289,7 @@ async def verify_sandbox_token(
             raise AuthenticationError("Invalid authorization format. Use 'Bearer <token>'")
 
     if not api_key:
-        raise AuthenticationError("Authentication required. Provide X-API-Key or Authorization header")
+        raise AuthenticationError("Authentication required. Provide credentials via login or X-API-Key header")
 
     # Check if it's a sandbox API key (sb_* prefix)
     if api_key.startswith("sb_"):
@@ -254,7 +315,7 @@ async def verify_sandbox_token(
             },
         }
 
-    # Otherwise, try to decode as JWT (legacy method for platform communication)
+    # 3. Otherwise, try to decode as JWT (legacy method for platform communication)
     try:
         secret = config.platform.registration_token
         if secret:
@@ -336,10 +397,10 @@ def create_rest_app() -> FastAPI:
         redoc_url="/redoc" if config.debug else None,
     )
 
-    # CORS middleware
+    # CORS middleware — allow all origins for sandbox (API key or cookie auth handles security)
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"] if config.debug else config.security.allowed_outbound_hosts,
+        allow_origins=["*"],
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -361,6 +422,29 @@ def create_rest_app() -> FastAPI:
 
     # Routes
     register_routes(app)
+
+    # Serve built frontend static files (production mode)
+    # The frontend build output goes to frontend/dist
+    frontend_dist = Path(__file__).resolve().parent.parent.parent.parent / "frontend" / "dist"
+    if frontend_dist.exists() and (frontend_dist / "index.html").exists():
+        # Mount static assets (js, css, images, etc.)
+        app.mount("/assets", StaticFiles(directory=str(frontend_dist / "assets")), name="static-assets")
+        # Mount icons if they exist
+        icons_dir = frontend_dist / "icons"
+        if icons_dir.exists():
+            app.mount("/icons", StaticFiles(directory=str(icons_dir)), name="static-icons")
+
+        # Catch-all: serve index.html for client-side routing
+        @app.get("/{path:path}", include_in_schema=False)
+        async def serve_spa(path: str) -> FileResponse:
+            # Resolve and verify the path stays within frontend_dist
+            file_path = (frontend_dist / path).resolve()
+            if file_path.is_file() and str(file_path).startswith(str(frontend_dist.resolve())):
+                return FileResponse(str(file_path))
+            # Otherwise serve index.html for client-side routing
+            return FileResponse(str(frontend_dist / "index.html"))
+
+        logger.info("serving_frontend", dist_path=str(frontend_dist))
 
     return app
 
@@ -416,6 +500,69 @@ def register_routes(app: FastAPI) -> None:
             supports_visualization=True,
             has_local_llm=config.local_llm.enabled,
         )
+
+    # ==========================================================================
+    # User Authentication (username/password from .env)
+    # ==========================================================================
+
+    @app.post("/api/v1/auth/login", tags=["Auth"])
+    async def auth_login(payload: LoginRequest, response: Response) -> JSONResponse:
+        """Authenticate with username and password defined in .env."""
+        expected_username = os.environ.get("SANDBOX_AUTH_USERNAME", "admin")
+        expected_password = os.environ.get("SANDBOX_AUTH_PASSWORD", "admin123")
+
+        if (
+            payload.username.lower() == expected_username.lower()
+            and payload.password == expected_password
+        ):
+            token = _create_user_token(payload.username)
+            response = JSONResponse(
+                content={
+                    "username": payload.username,
+                    "message": "Login successful",
+                }
+            )
+            response.set_cookie(
+                key="sandbox_token",
+                value=token,
+                httponly=True,
+                secure=os.environ.get("SANDBOX_ENVIRONMENT", "") in ("production", "preprod"),
+                samesite="lax",
+                max_age=86400 * 7,  # 7 days
+                path="/",
+            )
+            return response
+
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    @app.get("/api/v1/auth/me", tags=["Auth"])
+    async def auth_me(request: Request) -> JSONResponse:
+        """Check current user session from cookie."""
+        session_token = request.cookies.get("sandbox_token")
+        if not session_token:
+            raise HTTPException(status_code=401, detail="Not authenticated")
+
+        claims = _verify_user_token(session_token)
+        if not claims or claims.get("type") != "user_session":
+            raise HTTPException(status_code=401, detail="Invalid session")
+
+        return JSONResponse(content={
+            "username": claims.get("sub"),
+            "authenticated": True,
+        })
+
+    @app.post("/api/v1/auth/logout", tags=["Auth"])
+    async def auth_logout(response: Response) -> JSONResponse:
+        """Clear user session cookie."""
+        response = JSONResponse(content={"message": "Logged out"})
+        response.delete_cookie(
+            key="sandbox_token",
+            httponly=True,
+            secure=os.environ.get("SANDBOX_ENVIRONMENT", "") in ("production", "preprod"),
+            samesite="lax",
+            path="/",
+        )
+        return response
 
     # ==========================================================================
     # Execution Endpoints
