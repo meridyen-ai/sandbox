@@ -2,8 +2,7 @@
 # Meridyen Sandbox Makefile
 # =============================================================================
 
-.PHONY: help build build-airgapped run run-airgapped stop dev test lint format clean sandbox sandbox-dev sandbox-stop \
-       llm-up llm-stop llm-logs llm-status llm-bench llm-pull
+.PHONY: help build build-airgapped run run-airgapped stop dev test lint format clean sandbox sandbox-dev sandbox-stop
 
 # Default target
 help:
@@ -36,17 +35,6 @@ help:
 	@echo "  make test            - Run tests"
 	@echo "  make lint            - Run linter"
 	@echo "  make format          - Format code"
-	@echo ""
-	@echo "LLM Service (vLLM - OpenAI-Compatible API):"
-	@echo "  make llm-up                            - Start LLM with sandbox (all GPUs)"
-	@echo "  make llm-up GPUS=2                     - Start with specific GPU count"
-	@echo "  make llm-up MODEL=deepseek-ai/DeepSeek-V3 GPUS=4"
-	@echo "  make llm-up MODEL=meta-llama/Llama-3.3-70B-Instruct GPUS=2 CTX=16384"
-	@echo "  make llm-stop                          - Stop LLM service"
-	@echo "  make llm-logs                          - View LLM logs"
-	@echo "  make llm-status                        - Check model health & info"
-	@echo "  make llm-bench                         - Quick latency benchmark"
-	@echo "  make llm-pull MODEL=...                - Pre-download model weights"
 	@echo ""
 	@echo "Sandbox Direct Run (sandbox.meridyen.ai):"
 	@echo "  make sandbox         - Build UI & run backend (production)"
@@ -108,7 +96,6 @@ run-airgapped:
 stop:
 	docker compose -f docker-compose.hybrid.yaml down 2>/dev/null || true
 	docker compose -f docker-compose.airgapped.yaml down 2>/dev/null || true
-	docker compose -f docker-compose.sandbox.yaml -f docker-compose.llm.yaml down 2>/dev/null || true
 	@echo "✅ Sandbox stopped"
 
 restart: stop run
@@ -162,7 +149,6 @@ proto:
 clean:
 	docker compose -f docker-compose.hybrid.yaml down -v 2>/dev/null || true
 	docker compose -f docker-compose.airgapped.yaml down -v 2>/dev/null || true
-	docker compose -f docker-compose.sandbox.yaml -f docker-compose.llm.yaml down -v 2>/dev/null || true
 	rm -rf __pycache__ .pytest_cache .mypy_cache .ruff_cache
 	find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 	@echo "✅ Cleanup complete"
@@ -304,83 +290,3 @@ sandbox-stop:
 
 sandbox-logs:
 	docker compose -f docker-compose.sandbox.yaml logs -f
-
-# =============================================================================
-# LLM Service Commands (vLLM with OpenAI-Compatible API)
-# =============================================================================
-# Configurable via parameters:
-#   GPUS    - Number of GPUs (default: all). Sets both device count and tensor parallelism.
-#   MODEL   - HuggingFace model ID (default: meta-llama/Llama-3.3-70B-Instruct)
-#   CTX     - Max context/sequence length (default: 8192)
-#   HF_TOKEN - HuggingFace token for gated models
-
-# Defaults
-GPUS   ?= all
-MODEL  ?= meta-llama/Llama-3.3-70B-Instruct
-CTX    ?= 8192
-
-# Resolve tensor parallel size: "all" means use 1 (vLLM auto-detects), numeric = use that count
-ifeq ($(GPUS),all)
-  _TP_SIZE = 1
-else
-  _TP_SIZE = $(GPUS)
-endif
-
-# Common env exports for LLM compose
-define LLM_ENV
-	VLLM_GPU_COUNT=$(GPUS) \
-	VLLM_TENSOR_PARALLEL=$(_TP_SIZE) \
-	VLLM_MODEL=$(MODEL) \
-	VLLM_MAX_MODEL_LEN=$(CTX)
-endef
-
-llm-up:
-	@echo "Starting vLLM LLM service..."
-	@echo "  Model:          $(MODEL)"
-	@echo "  GPUs:           $(GPUS)"
-	@echo "  Tensor Parallel: $(_TP_SIZE)"
-	@echo "  Max Context:    $(CTX)"
-	@echo ""
-	$(LLM_ENV) docker compose -f docker-compose.sandbox.yaml -f docker-compose.llm.yaml up -d
-	@echo ""
-	@echo "vLLM starting up (model loading may take several minutes)..."
-	@echo "  OpenAI API:  http://localhost:$${VLLM_PORT:-8000}/v1"
-	@echo "  Models:      http://localhost:$${VLLM_PORT:-8000}/v1/models"
-	@echo "  Health:      http://localhost:$${VLLM_PORT:-8000}/health"
-	@echo "  Sandbox API: http://localhost:$${SANDBOX_REST_PORT:-38082}"
-	@echo ""
-	@echo "Monitor startup: make llm-logs"
-
-llm-stop:
-	docker compose -f docker-compose.sandbox.yaml -f docker-compose.llm.yaml down
-	@echo "LLM service stopped"
-
-llm-logs:
-	docker compose -f docker-compose.sandbox.yaml -f docker-compose.llm.yaml logs -f vllm
-
-llm-status:
-	@echo "=== vLLM Health ==="
-	@curl -sf http://localhost:$${VLLM_PORT:-8000}/health && echo " OK" || echo " UNAVAILABLE (still loading?)"
-	@echo ""
-	@echo "=== Loaded Models ==="
-	@curl -sf http://localhost:$${VLLM_PORT:-8000}/v1/models | python3 -m json.tool 2>/dev/null || echo "Not ready yet"
-
-llm-bench:
-	@echo "Running quick inference benchmark..."
-	@echo "--- First token latency (cold) ---"
-	@curl -sf -w "\nTotal: %{time_total}s | TTFB: %{time_starttransfer}s\n" \
-		-X POST http://localhost:$${VLLM_PORT:-8000}/v1/chat/completions \
-		-H "Content-Type: application/json" \
-		-d '{"model":"$(MODEL)","messages":[{"role":"user","content":"Say hello in one word."}],"max_tokens":16,"temperature":0}' \
-		| python3 -c "import sys,json; r=json.load(sys.stdin); u=r.get('usage',{}); print(f'Prompt tokens: {u.get(\"prompt_tokens\",\"?\")}  Completion tokens: {u.get(\"completion_tokens\",\"?\")}  Response: {r[\"choices\"][0][\"message\"][\"content\"]}')" 2>/dev/null \
-		|| echo "Service not ready"
-
-llm-pull:
-	@echo "Pre-downloading model: $(MODEL)..."
-	docker run --rm \
-		-e HF_TOKEN=$${HF_TOKEN:-} \
-		-e HUGGING_FACE_HUB_TOKEN=$${HF_TOKEN:-} \
-		-v meridyen-llm_vllm_models:/root/.cache/huggingface \
-		python:3.11-slim \
-		sh -c "pip install -q huggingface_hub && huggingface-cli download $(MODEL)"
-	@echo "Model downloaded to vllm_models volume"
