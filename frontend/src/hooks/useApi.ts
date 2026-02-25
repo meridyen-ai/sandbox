@@ -7,7 +7,7 @@
 import { useState, useCallback } from 'react';
 import axios, { AxiosRequestConfig } from 'axios';
 
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8081';
+const API_BASE_URL = import.meta.env.VITE_API_URL || '';
 
 interface ApiCallOptions {
   method?: 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH';
@@ -57,6 +57,7 @@ export function useApi() {
         },
         params,
         data,
+        withCredentials: true,
       };
 
       const response = await axios(config);

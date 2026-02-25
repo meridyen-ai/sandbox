@@ -9,7 +9,10 @@ Three providers cover common deployment scenarios:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import os
 from typing import Any
 
 import httpx
@@ -43,18 +46,60 @@ class StaticKeyAuthProvider(AuthProvider):
         logger.info(f"Static auth provider initialized with {len(keys)} key(s)")
 
     async def verify(self, api_key: str) -> AuthResult | None:
+        # 1. Check in-memory static keys (from YAML config)
         key_config = self._keys.get(api_key)
-        if not key_config:
-            return None
+        if key_config:
+            return AuthResult(
+                authenticated=True,
+                workspace_id=str(key_config.get("workspace_id", "default")),
+                workspace_name=key_config.get("workspace_name", "Default"),
+                user_id=key_config.get("user_id"),
+                api_key_name=key_config.get("name", "static-key"),
+                permissions=key_config.get("permissions", {}),
+            )
 
-        return AuthResult(
-            authenticated=True,
-            workspace_id=str(key_config.get("workspace_id", "default")),
-            workspace_name=key_config.get("workspace_name", "Default"),
-            user_id=key_config.get("user_id"),
-            api_key_name=key_config.get("name", "static-key"),
-            permissions=key_config.get("permissions", {}),
-        )
+        # 2. Check database-stored keys (created via UI)
+        return self._check_db_key(api_key)
+
+    def _check_db_key(self, api_key: str) -> AuthResult | None:
+        """Check if the API key exists in the PostgreSQL api_keys table."""
+        try:
+            from sqlalchemy import create_engine, text
+
+            host = os.environ.get("SANDBOX_UPLOAD_DB_HOST", "sandbox-postgres")
+            port = int(os.environ.get("SANDBOX_UPLOAD_DB_PORT", "5432"))
+            db = os.environ.get("SANDBOX_UPLOAD_DB_NAME", "sandbox_uploads")
+            user = os.environ.get("SANDBOX_UPLOAD_DB_USER", "sandbox")
+            password = os.environ.get("SANDBOX_UPLOAD_DB_PASSWORD", "sandbox_password")
+            url = f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{db}"
+
+            engine = create_engine(url, pool_pre_ping=True, pool_size=2)
+            key_hash = hashlib.sha256(api_key.encode()).hexdigest()
+
+            with engine.connect() as conn:
+                result = conn.execute(
+                    text("SELECT name, workspace_id, workspace_name, permissions FROM api_keys WHERE key_hash = :key_hash"),
+                    {"key_hash": key_hash},
+                )
+                row = result.fetchone()
+
+            if not row:
+                return None
+
+            permissions = row[3] if row[3] else {}
+            if isinstance(permissions, str):
+                permissions = json.loads(permissions)
+
+            return AuthResult(
+                authenticated=True,
+                workspace_id=str(row[1]),
+                workspace_name=row[2],
+                api_key_name=row[0],
+                permissions=permissions,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to check DB key: {e}")
+            return None
 
 
 class RemoteAuthProvider(AuthProvider):

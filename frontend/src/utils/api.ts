@@ -106,6 +106,28 @@ export const schemaApi = {
   },
 }
 
+export interface ApiKeyStatus {
+  configured: boolean
+  key_prefix?: string
+  created_at?: string
+}
+
+export const apiKeyApi = {
+  get: async (): Promise<ApiKeyStatus> => {
+    const response = await api.get('/api-key')
+    return response.data
+  },
+
+  save: async (apiKey: string): Promise<{ configured: boolean; key_prefix: string }> => {
+    const response = await api.put('/api-key', { api_key: apiKey })
+    return response.data
+  },
+
+  remove: async (): Promise<void> => {
+    await api.delete('/api-key')
+  },
+}
+
 export const executionApi = {
   // Execute SQL query
   executeSQL: async (

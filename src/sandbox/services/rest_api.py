@@ -8,7 +8,9 @@ Alternative to gRPC for simpler integrations.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
+import secrets
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, date, time, timedelta, timezone
@@ -183,6 +185,11 @@ class LoginResponse(BaseModel):
     message: str = "Login successful"
 
 
+class SaveApiKeyRequest(BaseModel):
+    """Request to save a Meridyen platform API key."""
+    api_key: str = Field(..., min_length=4, max_length=200)
+
+
 class HealthResponse(BaseModel):
     """Health check response."""
     status: str
@@ -231,6 +238,59 @@ def _verify_user_token(token: str) -> dict[str, Any] | None:
         return jwt.decode(token, secret, algorithms=["HS256"])
     except jwt.InvalidTokenError:
         return None
+
+
+# =============================================================================
+# API Key Database Helpers
+# =============================================================================
+
+_api_key_engine = None
+
+
+def _get_api_key_engine():
+    """Get or create SQLAlchemy engine for the API keys database."""
+    global _api_key_engine
+    if _api_key_engine is None:
+        from sqlalchemy import create_engine
+        host = os.environ.get("SANDBOX_UPLOAD_DB_HOST", "sandbox-postgres")
+        port = int(os.environ.get("SANDBOX_UPLOAD_DB_PORT", "5432"))
+        db = os.environ.get("SANDBOX_UPLOAD_DB_NAME", "sandbox_uploads")
+        user = os.environ.get("SANDBOX_UPLOAD_DB_USER", "sandbox")
+        password = os.environ.get("SANDBOX_UPLOAD_DB_PASSWORD", "sandbox_password")
+        url = f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{db}"
+        _api_key_engine = create_engine(url, pool_pre_ping=True, pool_size=3)
+    return _api_key_engine
+
+
+def _init_api_keys_table():
+    """Create the api_keys table if it doesn't exist."""
+    from sqlalchemy import text
+    engine = _get_api_key_engine()
+    with engine.connect() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS api_keys (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                key_prefix TEXT NOT NULL,
+                key_hash TEXT NOT NULL,
+                workspace_id TEXT NOT NULL DEFAULT 'default',
+                workspace_name TEXT NOT NULL DEFAULT 'Default Workspace',
+                permissions JSONB NOT NULL DEFAULT '{"execute_sql": true, "execute_python": true, "generate_visualizations": true}',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """))
+        conn.commit()
+    logger.info("api_keys_table_initialized")
+
+
+def _hash_api_key(raw_key: str) -> str:
+    """Hash an API key with SHA-256."""
+    return hashlib.sha256(raw_key.encode()).hexdigest()
+
+
+def _generate_api_key() -> str:
+    """Generate a new sb_ prefixed API key."""
+    return "sb_" + secrets.token_urlsafe(32)
 
 
 async def verify_sandbox_token(
@@ -368,6 +428,12 @@ def create_rest_app() -> FastAPI:
                 logger.error(f"Failed to initialize auth provider: {e}")
                 if config.environment == "production":
                     raise
+
+        # Initialize API keys table
+        try:
+            _init_api_keys_table()
+        except Exception as e:
+            logger.error(f"Failed to initialize api_keys table: {e}")
 
         # Initialize executors
         app.state.sql_executor = SQLExecutor()
@@ -563,6 +629,94 @@ def register_routes(app: FastAPI) -> None:
             path="/",
         )
         return response
+
+    # ==========================================================================
+    # API Key Management (single key per sandbox, provided by MVP platform)
+    # ==========================================================================
+
+    @app.get("/api/v1/api-key", tags=["API Keys"])
+    async def get_api_key(
+        token_data: dict = Depends(verify_sandbox_token),
+    ) -> JSONResponse:
+        """Get the current sandbox API key info (prefix only, never the full key)."""
+        from sqlalchemy import text
+
+        engine = _get_api_key_engine()
+        with engine.connect() as conn:
+            result = conn.execute(text(
+                "SELECT id, key_prefix, created_at FROM api_keys ORDER BY created_at DESC LIMIT 1"
+            ))
+            row = result.fetchone()
+
+        if not row:
+            return JSONResponse(content={"configured": False})
+
+        return JSONResponse(content={
+            "configured": True,
+            "key_prefix": row[1],
+            "created_at": row[2].isoformat() if row[2] else None,
+        })
+
+    @app.put("/api/v1/api-key", tags=["API Keys"])
+    async def save_api_key(
+        payload: SaveApiKeyRequest,
+        token_data: dict = Depends(verify_sandbox_token),
+    ) -> JSONResponse:
+        """Save the Meridyen platform API key. Replaces any existing key."""
+        from sqlalchemy import text
+        import json
+
+        api_key = payload.api_key.strip()
+        if not api_key.startswith("sb_"):
+            raise HTTPException(status_code=400, detail="API key must start with 'sb_'")
+
+        key_id = str(uuid.uuid4())
+        key_prefix = api_key[:13]  # "sb_" + first 10 chars
+        key_hash = _hash_api_key(api_key)
+        permissions = {"execute_sql": True, "execute_python": True, "generate_visualizations": True}
+
+        engine = _get_api_key_engine()
+        with engine.connect() as conn:
+            # Replace any existing key — sandbox has only one
+            conn.execute(text("DELETE FROM api_keys"))
+            conn.execute(
+                text("""
+                    INSERT INTO api_keys (id, name, key_prefix, key_hash, workspace_id, workspace_name, permissions)
+                    VALUES (:id, :name, :key_prefix, :key_hash, :workspace_id, :workspace_name, CAST(:permissions AS jsonb))
+                """),
+                {
+                    "id": key_id,
+                    "name": "meridyen-platform-key",
+                    "key_prefix": key_prefix,
+                    "key_hash": key_hash,
+                    "workspace_id": "default",
+                    "workspace_name": "Default Workspace",
+                    "permissions": json.dumps(permissions),
+                },
+            )
+            conn.commit()
+
+        logger.info("api_key_saved", key_prefix=key_prefix)
+
+        return JSONResponse(content={
+            "configured": True,
+            "key_prefix": key_prefix,
+        })
+
+    @app.delete("/api/v1/api-key", tags=["API Keys"])
+    async def remove_api_key(
+        token_data: dict = Depends(verify_sandbox_token),
+    ) -> JSONResponse:
+        """Remove the configured API key."""
+        from sqlalchemy import text
+
+        engine = _get_api_key_engine()
+        with engine.connect() as conn:
+            conn.execute(text("DELETE FROM api_keys"))
+            conn.commit()
+
+        logger.info("api_key_removed")
+        return JSONResponse(content={"message": "API key removed"})
 
     # ==========================================================================
     # Execution Endpoints

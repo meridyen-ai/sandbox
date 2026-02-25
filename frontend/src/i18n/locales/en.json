@@ -26,6 +26,7 @@
     "appTitle": "Meridyen Sandbox",
     "connections": "Connections",
     "architecture": "Architecture",
+    "apiKeys": "API Key",
     "logout": "Logout"
   },
   "login": {
@@ -106,6 +107,23 @@
     "mysql": "MySQL",
     "snowflake": "Snowflake",
     "bigquery": "BigQuery"
+  },
+  "apiKeys": {
+    "title": "API Key",
+    "subtitle": "Connect this sandbox with the Meridyen platform using your API key",
+    "configured": "API key configured",
+    "emptyTitle": "No API key configured",
+    "emptyDescription": "Paste your Meridyen platform API key to connect this sandbox.",
+    "inputLabel": "API Key",
+    "invalidPrefix": "API key must start with sb_",
+    "replaceHint": "Replace with a different key:",
+    "replace": "Replace",
+    "remove": "Remove",
+    "removeWarning": "This will disconnect the sandbox from the platform.",
+    "saveError": "Failed to save API key",
+    "whereToGet": "Where to get your API key",
+    "whereToGetDescription": "You can find your sandbox API key in the Meridyen platform at data.meridyen.ai under your workspace settings.",
+    "usageTitle": "Usage example"
   },
   "dataset": {
     "loadingSchema": "Loading schema...",
