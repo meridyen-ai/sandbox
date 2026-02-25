@@ -250,15 +250,21 @@ local_llm:
   enabled: false
 
   # Provider: ollama, vllm, transformers
+  # - ollama: Good for CPU / small models, runs GGUF quantized models
+  # - vllm:   Production GPU inference, OpenAI-compatible API, best throughput
   provider: ollama
 
   # Model name
+  # Ollama format:  llama3.3:70b, deepseek-r1:7b
+  # vLLM format:    meta-llama/Llama-3.3-70B-Instruct, deepseek-ai/DeepSeek-V3
   model_name: "llama3:8b"
 
   # Base URL for LLM API
+  # Ollama: http://ollama:11434       (native API)
+  # vLLM:   http://vllm:8000/v1      (OpenAI-compatible)
   base_url: "http://localhost:11434"
 
-  # API key (if required)
+  # API key (if required - used with vLLM when VLLM_API_KEY is set)
   api_key: null
 
   # Generation settings

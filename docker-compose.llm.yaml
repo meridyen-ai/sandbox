@@ -1,0 +1,168 @@
+# =============================================================================
+# Docker Compose - LLM Service (vLLM with OpenAI-Compatible API)
+# =============================================================================
+# Production-optimized vLLM inference server with OpenAI-compatible API.
+# Supports HuggingFace models (Llama 3.3 70B, DeepSeek, Mistral, etc.)
+#
+# Requirements:
+#   - NVIDIA GPU(s) with NVIDIA Container Toolkit installed
+#   - HuggingFace token for gated models (Llama)
+#
+# Usage:
+#   make llm-up GPUS=2 MODEL=meta-llama/Llama-3.3-70B-Instruct
+#   make llm-up GPUS=1 MODEL=Qwen/Qwen2.5-Coder-32B-Instruct CTX=32768
+#
+# Test:
+#   curl http://localhost:8000/v1/models
+#   curl http://localhost:8000/v1/chat/completions \
+#     -H "Content-Type: application/json" \
+#     -d '{"model": "meta-llama/Llama-3.3-70B-Instruct", "messages": [{"role": "user", "content": "Hello"}]}'
+#
+# =============================================================================
+# Recommended Coding Models for 2x RTX PRO 6000 (96GB each, 192GB total)
+# =============================================================================
+#
+# ┌─────────────────────────────────────────────────────────────────────────────┐
+# │ Model (HuggingFace ID)                   │ Params │ VRAM  │ GPUs │ CTX    │
+# ├─────────────────────────────────────────────────────────────────────────────┤
+# │ BEST FOR CODE:                                                            │
+# │ Qwen/Qwen2.5-Coder-32B-Instruct         │ 32B    │ ~68GB │ 1    │ 32768  │
+# │ deepseek-ai/DeepSeek-Coder-V2-Instruct  │ 236B*  │ ~160GB│ 2    │ 16384  │
+# │ meta-llama/CodeLlama-70b-Instruct-hf    │ 70B    │ ~140GB│ 2    │ 16384  │
+# │                                                                           │
+# │ BEST GENERAL + CODE:                                                      │
+# │ meta-llama/Llama-3.3-70B-Instruct       │ 70B    │ ~140GB│ 2    │ 16384  │
+# │ Qwen/Qwen2.5-72B-Instruct              │ 72B    │ ~145GB│ 2    │ 16384  │
+# │ deepseek-ai/DeepSeek-V3                 │ 671B*  │ ~160GB│ 2    │ 8192   │
+# │ mistralai/Mistral-Large-Instruct-2411   │ 123B   │ ~180GB│ 2    │ 16384  │
+# │                                                                           │
+# │ FAST SINGLE-GPU (fits on 1x 96GB):                                       │
+# │ Qwen/Qwen2.5-Coder-32B-Instruct        │ 32B    │ ~68GB │ 1    │ 65536  │
+# │ deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct │ 16B│ ~34GB │ 1    │ 65536  │
+# │ meta-llama/Llama-3.1-8B-Instruct        │ 8B     │ ~17GB │ 1    │ 32768  │
+# │ meta-llama/CodeLlama-34b-Instruct-hf    │ 34B    │ ~70GB │ 1    │ 32768  │
+# │                                                                           │
+# │ * MoE model — only active params loaded per token, fits in less VRAM      │
+# │                                                                           │
+# │ RECOMMENDED: Qwen2.5-Coder-32B on 1 GPU (fastest code, 65K ctx)          │
+# │              or Llama-3.3-70B on 2 GPUs (best all-round + code)           │
+# └─────────────────────────────────────────────────────────────────────────────┘
+#
+# Examples:
+#   make llm-up GPUS=1 MODEL=Qwen/Qwen2.5-Coder-32B-Instruct CTX=32768
+#   make llm-up GPUS=2 MODEL=meta-llama/Llama-3.3-70B-Instruct CTX=16384
+#   make llm-up GPUS=2 MODEL=deepseek-ai/DeepSeek-Coder-V2-Instruct CTX=16384
+#   make llm-up GPUS=2 MODEL=Qwen/Qwen2.5-72B-Instruct CTX=16384
+#   make llm-up GPUS=2 MODEL=mistralai/Mistral-Large-Instruct-2411 CTX=16384
+
+name: meridyen-llm
+
+services:
+  # ---------------------------------------------------------------------------
+  # vLLM Inference Server (OpenAI-Compatible API)
+  # ---------------------------------------------------------------------------
+  vllm:
+    image: vllm/vllm-openai:latest
+    container_name: meridyen-vllm
+    restart: unless-stopped
+
+    # Share host IPC namespace - required for NCCL multi-GPU communication
+    ipc: host
+
+    # Share host UTS for better NCCL perf (hostname resolution)
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+
+    ports:
+      - "${VLLM_PORT:-8000}:8000"
+
+    volumes:
+      # Persistent model cache - avoids re-downloading on restart
+      - vllm_models:/root/.cache/huggingface
+
+    environment:
+      # HuggingFace token (required for gated models like Llama)
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+      - HF_TOKEN=${HF_TOKEN:-}
+      # NCCL tuning for multi-GPU
+      - NCCL_P2P_DISABLE=0
+      - NCCL_IB_DISABLE=1
+      - NCCL_SOCKET_IFNAME=eth0
+      # CUDA optimizations
+      - CUDA_DEVICE_MAX_CONNECTIONS=1
+
+    # -------------------------------------------------------------------------
+    # vLLM server flags - optimized for throughput & latency
+    # -------------------------------------------------------------------------
+    command: >
+      --model ${VLLM_MODEL:-meta-llama/Llama-3.3-70B-Instruct}
+      --host 0.0.0.0
+      --port 8000
+      --api-key ${VLLM_API_KEY:-}
+      --served-model-name ${VLLM_SERVED_NAME:-${VLLM_MODEL:-meta-llama/Llama-3.3-70B-Instruct}}
+      --tensor-parallel-size ${VLLM_TENSOR_PARALLEL:-1}
+      --max-model-len ${VLLM_MAX_MODEL_LEN:-8192}
+      --dtype ${VLLM_DTYPE:-auto}
+      --trust-remote-code
+      --gpu-memory-utilization ${VLLM_GPU_MEMORY_UTIL:-0.95}
+      --max-num-seqs ${VLLM_MAX_NUM_SEQS:-128}
+      --max-num-batched-tokens ${VLLM_MAX_BATCHED_TOKENS:-8192}
+      --enable-prefix-caching
+      --disable-log-requests
+      --swap-space ${VLLM_SWAP_SPACE:-4}
+      --block-size 16
+      --num-scheduler-steps ${VLLM_SCHEDULER_STEPS:-1}
+      --uvicorn-log-level warning
+
+    networks:
+      - llm-network
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${VLLM_GPU_COUNT:-all}
+              capabilities: [gpu]
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 600s  # 70B models can take 5-10min to load
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  # ---------------------------------------------------------------------------
+  # Sandbox Backend - Override to connect to vLLM
+  # ---------------------------------------------------------------------------
+  sandbox:
+    environment:
+      - SANDBOX_LOCAL_LLM__ENABLED=true
+      - SANDBOX_LOCAL_LLM__PROVIDER=vllm
+      - SANDBOX_LOCAL_LLM__BASE_URL=http://vllm:8000/v1
+      - SANDBOX_LOCAL_LLM__MODEL_NAME=${VLLM_SERVED_NAME:-${VLLM_MODEL:-meta-llama/Llama-3.3-70B-Instruct}}
+      - SANDBOX_LOCAL_LLM__API_KEY=${VLLM_API_KEY:-}
+    depends_on:
+      vllm:
+        condition: service_healthy
+    networks:
+      - llm-network
+
+volumes:
+  vllm_models:
+    driver: local
+
+networks:
+  llm-network:
+    driver: bridge
