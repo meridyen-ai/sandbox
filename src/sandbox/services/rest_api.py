@@ -1713,7 +1713,7 @@ def register_routes(app: FastAPI) -> None:
         Returns database schema metadata with tables, columns, and optional sample data.
         """
         from sandbox.connectors.factory import get_connector
-        from sandbox.core.config import get_config
+        from sandbox.core.config import DatabaseType, get_config
 
         config = get_config()
 
@@ -1751,7 +1751,8 @@ def register_routes(app: FastAPI) -> None:
                     "tables": []
                 }
 
-                schema_prefix = conn_config.schema_name or "public"
+                default_schema = "dbo" if conn_config.db_type == DatabaseType.MSSQL else "public"
+                schema_prefix = conn_config.schema_name or default_schema
 
                 # For each table, get columns and optionally sample data
                 for table_name in tables:
@@ -1838,7 +1839,7 @@ def register_routes(app: FastAPI) -> None:
         No credentials are included in the response.
         """
         from sandbox.connectors.factory import get_connector
-        from sandbox.core.config import get_config
+        from sandbox.core.config import DatabaseType, get_config
 
         config = get_config()
 
@@ -1921,7 +1922,8 @@ def register_routes(app: FastAPI) -> None:
                         conn, schema=conn_config.schema_name
                     )
 
-                schema_prefix = conn_config.schema_name or "public"
+                default_schema = "dbo" if conn_config.db_type == DatabaseType.MSSQL else "public"
+                schema_prefix = conn_config.schema_name or default_schema
 
                 # Build list of tables to sync with their column selections
                 tables_to_sync = []
