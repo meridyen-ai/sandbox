@@ -1115,7 +1115,7 @@ def register_routes(app: FastAPI) -> None:
         try:
             # Build config
             conn_config = DatabaseConnectionConfig(
-                id=connection.id,
+                id=connection.id or str(uuid.uuid4()),
                 name=connection.name,
                 db_type=DatabaseType(connection.normalized_db_type),
                 host=connection.host,

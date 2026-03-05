@@ -36,11 +36,12 @@ class MSSQLConnector(BaseConnector[Any]):
             try:
                 return pymssql.connect(
                     server=cfg.host,
-                    port=cfg.port,
+                    port=str(cfg.port),
                     database=cfg.database,
                     user=cfg.username,
                     password=cfg.password.get_secret_value(),
                     login_timeout=int(cfg.connection_timeout),
+                    tds_version="7.0",
                     as_dict=False,
                 )
             except pymssql.OperationalError as e:
