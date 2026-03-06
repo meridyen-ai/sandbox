@@ -271,18 +271,13 @@ def _convert_parameters(
 def _pymssql_type_name(type_code: Any) -> str:
     """Map a pymssql DB-API type object or code to a human-readable name."""
     import pymssql
-    type_map = {
-        pymssql.STRING: "STRING",
-        pymssql.NUMBER: "NUMBER",
-        pymssql.DATETIME: "DATETIME",
-        pymssql.ROWID: "ROWID",
-        pymssql.BINARY: "BINARY",
-        pymssql.DECIMAL: "DECIMAL",
-    }
-    for db_api_type, name in type_map.items():
+    for attr in ("STRING", "NUMBER", "DATETIME", "ROWID", "BINARY", "DECIMAL"):
+        val = getattr(pymssql, attr, None)
+        if val is None:
+            continue
         try:
-            if type_code == db_api_type:
-                return name
+            if type_code == val:
+                return attr
         except Exception:
             pass
     return str(type_code)

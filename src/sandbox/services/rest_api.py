@@ -1793,9 +1793,18 @@ def register_routes(app: FastAPI) -> None:
                             else:
                                 col_list = "*"
 
-                            sample_query = f'SELECT {col_list} FROM "{table_name}" LIMIT {sample_limit}'
+                            is_mssql = conn_config.db_type == DatabaseType.MSSQL
+                            if is_mssql:
+                                top_clause = f"TOP {sample_limit} "
+                                limit_clause = ""
+                            else:
+                                top_clause = ""
+                                limit_clause = f" LIMIT {sample_limit}"
+
                             if conn_config.schema_name:
-                                sample_query = f'SELECT {col_list} FROM "{conn_config.schema_name}"."{table_name}" LIMIT {sample_limit}'
+                                sample_query = f'SELECT {top_clause}{col_list} FROM "{conn_config.schema_name}"."{table_name}"{limit_clause}'
+                            else:
+                                sample_query = f'SELECT {top_clause}{col_list} FROM "{table_name}"{limit_clause}'
 
                             result = await connector.execute(conn, sample_query)
 
@@ -1869,10 +1878,19 @@ def register_routes(app: FastAPI) -> None:
                         else:
                             col_list = "*"
 
-                        if conn_config.schema_name:
-                            sample_query = f'SELECT {col_list} FROM "{conn_config.schema_name}"."{table_name}" LIMIT {sample_limit}'
+                        is_mssql = conn_config.db_type == DatabaseType.MSSQL
+
+                        if is_mssql:
+                            top_clause = f"TOP {sample_limit} "
+                            limit_clause = ""
                         else:
-                            sample_query = f'SELECT {col_list} FROM "{table_name}" LIMIT {sample_limit}'
+                            top_clause = ""
+                            limit_clause = f" LIMIT {sample_limit}"
+
+                        if conn_config.schema_name:
+                            sample_query = f'SELECT {top_clause}{col_list} FROM "{conn_config.schema_name}"."{table_name}"{limit_clause}'
+                        else:
+                            sample_query = f'SELECT {top_clause}{col_list} FROM "{table_name}"{limit_clause}'
 
                         result = await connector.execute(conn, sample_query)
                         table_data["sample_data"] = {
