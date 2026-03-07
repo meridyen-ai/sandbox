@@ -16,13 +16,6 @@ interface ApiCallOptions {
   headers?: Record<string, string>;
 }
 
-interface ApiResponse<T = any> {
-  status: string;
-  data?: T;
-  message?: string;
-  error?: string;
-}
-
 export function useApi() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -30,7 +23,7 @@ export function useApi() {
   const callApi = useCallback(async <T = any>(
     endpoint: string,
     options: ApiCallOptions = {}
-  ): Promise<ApiResponse<T> | null> => {
+  ): Promise<T> => {
     const {
       method = 'GET',
       data,
