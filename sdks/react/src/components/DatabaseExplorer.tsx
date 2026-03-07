@@ -369,17 +369,7 @@ export function DatabaseExplorer({
         <div className="flex-1 flex flex-col overflow-hidden">
           {/* SQL Editor */}
           <div className="shrink-0 border-b border-gray-200 dark:border-dashboard-border">
-            <div className="flex">
-              <textarea
-                ref={textareaRef}
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                onKeyDown={handleKeyDown}
-                placeholder="Write your SQL query here..."
-                className="flex-1 min-w-0 h-28 sm:h-32 p-3 font-mono text-sm resize-none focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-inset border-0 dark:bg-dashboard-surface dark:text-dashboard-text dark:placeholder-gray-500"
-                spellCheck={false}
-              />
-              <div className="shrink-0 p-2">
+              <div className="flex items-center justify-end px-2 py-1 bg-gray-50 dark:bg-dashboard-subtle border-b border-gray-100 dark:border-dashboard-border">
                 <button
                   onClick={executeQuery}
                   disabled={isExecuting || !query.trim() || !hasQueryApi}
@@ -389,7 +379,15 @@ export function DatabaseExplorer({
                   {isExecuting ? 'Running...' : 'Run'}
                 </button>
               </div>
-            </div>
+              <textarea
+                ref={textareaRef}
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                onKeyDown={handleKeyDown}
+                placeholder="Write your SQL query here... (Ctrl+Enter to execute)"
+                className="w-full h-28 sm:h-32 p-3 font-mono text-sm resize-none focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-inset border-0 dark:bg-dashboard-surface dark:text-dashboard-text dark:placeholder-gray-500"
+                spellCheck={false}
+              />
           </div>
 
           {/* Results area */}
