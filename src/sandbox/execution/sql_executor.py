@@ -366,9 +366,27 @@ class SQLExecutor(BaseExecutor[SQLExecutionResult]):
         if not connection_id:
             raise ValidationError("Connection ID is required")
 
-        # Check cache
+        # Check cache and validate existing connection
         if connection_id in self._connection_pool:
-            return self._connection_pool[connection_id]
+            connector, connection = self._connection_pool[connection_id]
+            # Validate the cached connection is still alive
+            try:
+                is_valid = await asyncio.wait_for(
+                    connector.test_connection(connection),
+                    timeout=5.0,
+                )
+            except Exception:
+                is_valid = False
+
+            if is_valid:
+                return connector, connection
+
+            # Connection is stale, discard and recreate
+            try:
+                await connector.close_connection(connection)
+            except Exception:
+                pass
+            del self._connection_pool[connection_id]
 
         # Get connection config
         config = get_config()

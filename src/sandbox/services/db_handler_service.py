@@ -398,6 +398,7 @@ class SQLServerHandler(BaseDBHandler):
                 user=connection_data.get("username"),
                 password=connection_data.get("password"),
                 login_timeout=10,
+                tds_version="7.0",
             )
             conn.close()
             return ConnectionTestResult(success=True, message="Connection successful")
@@ -416,6 +417,7 @@ class SQLServerHandler(BaseDBHandler):
             database=connection_data.get("database"),
             user=connection_data.get("username"),
             password=connection_data.get("password"),
+            tds_version="7.0",
         )
 
         try:
@@ -443,6 +445,7 @@ class SQLServerHandler(BaseDBHandler):
             database=connection_data.get("database"),
             user=connection_data.get("username"),
             password=connection_data.get("password"),
+            tds_version="7.0",
         )
 
         try:
@@ -2845,6 +2848,7 @@ class DBHandlerService:
                     database=connection_data.get("database"),
                     user=connection_data.get("username") or connection_data.get("user"),
                     password=connection_data.get("password"),
+                    tds_version="7.0",
                 )
                 try:
                     cursor = conn.cursor()
@@ -2966,6 +2970,7 @@ class DBHandlerService:
                     database=connection_data.get("database"),
                     user=connection_data.get("username") or connection_data.get("user"),
                     password=connection_data.get("password"),
+                    tds_version="7.0",
                 )
                 try:
                     cursor = conn.cursor()
