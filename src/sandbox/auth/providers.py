@@ -43,7 +43,7 @@ class StaticKeyAuthProvider(AuthProvider):
         for key_config in keys:
             raw_key = key_config["key"]
             self._keys[raw_key] = key_config
-        logger.info(f"Static auth provider initialized with {len(keys)} key(s)")
+        logger.info(f"Static auth provider initialized with {len(self._keys)} key(s)")
 
     async def verify(self, api_key: str) -> AuthResult | None:
         # 1. Check in-memory static keys (from YAML config)
