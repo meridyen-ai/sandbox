@@ -82,7 +82,18 @@ export function DatabaseExplorer({
     setLoadError(null);
     try {
       const response = await api.query.fullSync();
-      const conns = response?.connections ?? [];
+      const rawConns = response?.connections ?? [];
+      // Normalize column fields: sandbox returns {name, type} but we need {name, data_type}
+      const conns = rawConns.map((c: any) => ({
+        ...c,
+        tables: (c.tables || []).map((t: any) => ({
+          ...t,
+          columns: (t.columns || []).map((col: any) => ({
+            name: col.name || col.column_name || '',
+            data_type: col.data_type || col.type || 'unknown',
+          })),
+        })),
+      }));
       if (conns.length > 0) {
         setConnections(conns);
         if (!selectedConnection) {
@@ -372,14 +383,13 @@ export function DatabaseExplorer({
                   </button>
                   {expandedTables.has(table.name) && table.columns && (
                     <div className="ml-5 border-l border-gray-200 dark:border-dashboard-border">
-                      {table.columns.map((col) => (
+                      {table.columns.map((col, ci) => (
                         <div
-                          key={col.name}
-                          className="flex items-center gap-1.5 px-2 py-0.5 text-xs text-gray-600 dark:text-gray-400 min-w-0"
-                          title={`${col.name} (${col.data_type || ''})`}
+                          key={col.name || ci}
+                          className="pl-4 pr-2 py-0.5 text-xs text-gray-600 dark:text-gray-400"
+                          title={`${col.name} (${col.data_type})`}
                         >
-                          <Columns className="w-3 h-3 text-gray-400 dark:text-gray-500 shrink-0" />
-                          <span className="truncate flex-1 min-w-0">{col.name}</span>
+                          {'• '}{col.name} <span className="text-gray-400 dark:text-gray-500 text-[10px]">{col.data_type}</span>
                         </div>
                       ))}
                     </div>
