@@ -295,6 +295,103 @@ class PostgreSQLConnector(BaseConnector[Connection]):
             for r in result
         ]
 
+    async def get_all_columns(
+        self, conn: Connection, schema: str | None = None
+    ) -> dict[str, list[dict[str, Any]]]:
+        """
+        Batch-fetch columns for ALL tables in one query.
+        Returns dict: table_name -> [columns].
+        This is ~50-100x faster than calling get_columns() per table.
+        """
+        schema = schema or self.config.schema_name or "public"
+
+        query = """
+            SELECT
+                c.table_name,
+                c.column_name,
+                c.data_type,
+                c.is_nullable,
+                c.column_default,
+                c.character_maximum_length,
+                c.numeric_precision,
+                c.numeric_scale,
+                c.ordinal_position,
+                CASE WHEN pk.column_name IS NOT NULL THEN true ELSE false END AS is_primary_key,
+                CASE WHEN uq.column_name IS NOT NULL THEN true ELSE false END AS is_unique,
+                CASE WHEN fk.column_name IS NOT NULL THEN true ELSE false END AS is_foreign_key,
+                fk.foreign_table_schema,
+                fk.foreign_table_name,
+                fk.foreign_column_name
+            FROM information_schema.columns c
+            LEFT JOIN (
+                SELECT tc.table_name, kcu.column_name
+                FROM information_schema.table_constraints tc
+                JOIN information_schema.key_column_usage kcu
+                    ON tc.constraint_name = kcu.constraint_name
+                    AND tc.table_schema = kcu.table_schema
+                WHERE tc.table_schema = $1
+                    AND tc.constraint_type = 'PRIMARY KEY'
+            ) pk ON pk.table_name = c.table_name AND pk.column_name = c.column_name
+            LEFT JOIN (
+                SELECT DISTINCT tc.table_name, kcu.column_name
+                FROM information_schema.table_constraints tc
+                JOIN information_schema.key_column_usage kcu
+                    ON tc.constraint_name = kcu.constraint_name
+                    AND tc.table_schema = kcu.table_schema
+                WHERE tc.table_schema = $1
+                    AND tc.constraint_type = 'UNIQUE'
+            ) uq ON uq.table_name = c.table_name AND uq.column_name = c.column_name
+            LEFT JOIN (
+                SELECT
+                    tc.table_name,
+                    kcu.column_name,
+                    ccu.table_schema AS foreign_table_schema,
+                    ccu.table_name AS foreign_table_name,
+                    ccu.column_name AS foreign_column_name
+                FROM information_schema.table_constraints tc
+                JOIN information_schema.key_column_usage kcu
+                    ON tc.constraint_name = kcu.constraint_name
+                    AND tc.table_schema = kcu.table_schema
+                JOIN information_schema.constraint_column_usage ccu
+                    ON tc.constraint_name = ccu.constraint_name
+                    AND tc.table_schema = ccu.table_schema
+                WHERE tc.table_schema = $1
+                    AND tc.constraint_type = 'FOREIGN KEY'
+            ) fk ON fk.table_name = c.table_name AND fk.column_name = c.column_name
+            WHERE c.table_schema = $1
+              AND c.table_name IN (
+                  SELECT table_name FROM information_schema.tables
+                  WHERE table_schema = $1 AND table_type = 'BASE TABLE'
+              )
+            ORDER BY c.table_name, c.ordinal_position
+        """
+
+        result = await conn.fetch(query, schema)
+
+        tables: dict[str, list[dict[str, Any]]] = {}
+        for r in result:
+            table_name = r["table_name"]
+            if table_name not in tables:
+                tables[table_name] = []
+            tables[table_name].append({
+                "name": r["column_name"],
+                "type": r["data_type"],
+                "nullable": r["is_nullable"] == "YES",
+                "default": r["column_default"],
+                "max_length": r["character_maximum_length"],
+                "precision": r["numeric_precision"],
+                "scale": r["numeric_scale"],
+                "is_primary_key": r["is_primary_key"],
+                "is_unique": r["is_unique"],
+                "is_foreign_key": r["is_foreign_key"],
+                "foreign_table": (
+                    f"{r['foreign_table_schema']}.{r['foreign_table_name']}.{r['foreign_column_name']}"
+                    if r["is_foreign_key"] else None
+                ),
+            })
+
+        return tables
+
     async def test_connection(self, conn: Connection) -> bool:
         """Test if connection is valid."""
         try:
