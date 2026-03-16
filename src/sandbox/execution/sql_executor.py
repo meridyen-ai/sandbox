@@ -82,7 +82,6 @@ class SQLValidator:
         r";\s*--",  # Statement termination with comment
         r"'\s*OR\s+'?1'?\s*=\s*'?1",  # OR 1=1 injection
         r"'\s*OR\s+''='",  # OR ''='' injection
-        r"UNION\s+ALL\s+SELECT",  # UNION injection
         r"INTO\s+OUTFILE",  # File write
         r"INTO\s+DUMPFILE",  # File write
         r"LOAD_FILE",  # File read

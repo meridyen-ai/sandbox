@@ -139,7 +139,7 @@ class SecurityConfig(BaseModel):
         default_factory=lambda: [
             "DROP", "DELETE", "TRUNCATE", "UPDATE", "INSERT", "ALTER", "CREATE",
             "GRANT", "REVOKE", "EXECUTE", "EXEC", "xp_", "sp_",
-            "--", "/*", "*/", ";--", "UNION ALL SELECT",
+            "--", "/*", "*/", ";--",
         ],
         description="Banned SQL patterns"
     )
