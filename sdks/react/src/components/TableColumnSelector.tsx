@@ -63,6 +63,25 @@ function schemaDataToTableWithColumns(data: SchemaData): TableWithColumns[] {
   }))
 }
 
+/** Ensure every entry's `columns` is a string[] (backend may store as a dict). */
+function normalizeSchema(raw: Record<string, unknown>): SelectedSchema {
+  const out: SelectedSchema = {}
+  for (const [key, value] of Object.entries(raw)) {
+    if (key.startsWith('_')) continue
+    const entry = value as { selected?: boolean; columns?: unknown }
+    let cols: string[]
+    if (Array.isArray(entry.columns)) {
+      cols = entry.columns
+    } else if (entry.columns && typeof entry.columns === 'object') {
+      cols = Object.keys(entry.columns)
+    } else {
+      cols = []
+    }
+    out[key] = { selected: entry.selected ?? false, columns: cols }
+  }
+  return out
+}
+
 export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
   connectionId,
   connectionName,
@@ -87,7 +106,7 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
     null
   )
   const [selectedSchema, setSelectedSchema] = useState<SelectedSchema>(
-    initialSelectedSchema || {}
+    initialSelectedSchema ? normalizeSchema(initialSelectedSchema) : {}
   )
   const [activeTab, setActiveTab] = useState<TabType>('all')
 
