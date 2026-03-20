@@ -35,8 +35,8 @@ class PostgreSQLConnector(BaseConnector[Connection]):
         cfg = self.config
 
         try:
-            # Build SSL context if enabled
-            ssl_context = None
+            # Build SSL context if enabled, explicitly disable if not
+            ssl_context = False  # Explicitly disable SSL negotiation
             if cfg.ssl_enabled:
                 import ssl
                 ssl_context = ssl.create_default_context()
