@@ -177,7 +177,7 @@ class MSSQLConnector(BaseConnector[Any]):
                 SELECT TABLE_NAME
                 FROM INFORMATION_SCHEMA.TABLES
                 WHERE TABLE_SCHEMA = %s
-                  AND TABLE_TYPE = 'BASE TABLE'
+                  AND TABLE_TYPE IN ('BASE TABLE', 'VIEW')
                 ORDER BY TABLE_NAME
                 """,
                 (schema,),

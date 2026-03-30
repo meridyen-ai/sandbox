@@ -109,16 +109,21 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
     initialSelectedSchema ? normalizeSchema(initialSelectedSchema) : {}
   )
   const [activeTab, setActiveTab] = useState<TabType>('all')
+  const [refreshing, setRefreshing] = useState(false)
 
   useEffect(() => {
     loadSchema()
   }, [connectionId])
 
-  const loadSchema = async () => {
-    setLoading(true)
+  const loadSchema = async (forceRefresh?: boolean) => {
+    if (forceRefresh) {
+      setRefreshing(true)
+    } else {
+      setLoading(true)
+    }
     setError(null)
     try {
-      const schemaData = await api.schema.sync(connectionId, true, 10)
+      const schemaData = await api.schema.sync(connectionId, true, 10, forceRefresh)
       const data = schemaDataToTableWithColumns(schemaData)
       setSchema(data)
 
@@ -152,6 +157,7 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
       )
     } finally {
       setLoading(false)
+      setRefreshing(false)
     }
   }
 
@@ -410,9 +416,17 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
           <div className="px-4 py-3 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900">
             <div className="flex items-center gap-2">
               <Database className="w-4 h-4 text-blue-600" />
-              <span className="font-medium text-gray-900 dark:text-white text-sm truncate">
+              <span className="font-medium text-gray-900 dark:text-white text-sm truncate flex-1">
                 {connectionName}
               </span>
+              <button
+                onClick={() => loadSchema(true)}
+                disabled={refreshing}
+                className="p-1 hover:bg-gray-200 dark:hover:bg-gray-700 rounded transition-colors disabled:opacity-50"
+                title="Reload schema from database"
+              >
+                <RefreshCw className={`w-4 h-4 text-gray-500 hover:text-blue-600 ${refreshing ? 'animate-spin' : ''}`} />
+              </button>
             </div>
           </div>
 
