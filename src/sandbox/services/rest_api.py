@@ -948,6 +948,41 @@ def register_routes(app: FastAPI) -> None:
 
         return JSONResponse(content={"connections": connections})
 
+    @app.get("/api/v1/connections/{connection_id}", tags=["Connections"])
+    async def get_connection(
+        connection_id: str,
+        token_data: dict = Depends(verify_sandbox_token),
+    ) -> JSONResponse:
+        """
+        Return one connection including credentials.
+
+        Used by MVP schema sync when the workspace mirror row does not store secrets.
+        Requires the same API key / auth as other sandbox routes.
+        """
+        config = get_config()
+        for conn in config.database_connections:
+            if str(conn.id) != str(connection_id):
+                continue
+            pwd = ""
+            if conn.password is not None:
+                pwd = conn.password.get_secret_value()
+            db_type_val = conn.db_type.value if hasattr(conn.db_type, "value") else str(conn.db_type)
+            return JSONResponse(
+                content={
+                    "id": conn.id,
+                    "name": conn.name,
+                    "db_type": db_type_val,
+                    "host": conn.host,
+                    "port": conn.port,
+                    "database": conn.database,
+                    "username": conn.username,
+                    "password": pwd,
+                    "schema_name": conn.schema_name,
+                    "ssl_enabled": getattr(conn, "ssl_enabled", False),
+                }
+            )
+        raise HTTPException(status_code=404, detail="Connection not found")
+
     @app.post("/api/v1/connections", tags=["Connections"])
     async def create_connection(
         connection: ConnectionConfig,
@@ -1877,24 +1912,45 @@ def register_routes(app: FastAPI) -> None:
 
                 if include_samples:
                     try:
-                        if selected_columns:
-                            col_list = ", ".join(f'"{c}"' for c in selected_columns)
-                        else:
-                            col_list = "*"
-
                         is_mssql = conn_config.db_type == DatabaseType.MSSQL
 
                         if is_mssql:
+                            # T-SQL uses [schema].[table], not PostgreSQL-style double quotes.
+                            def _mssql_esc(n: str) -> str:
+                                return str(n).replace("]", "]]")
+
+                            if selected_columns:
+                                col_list = ", ".join(
+                                    f"[{_mssql_esc(c)}]" for c in selected_columns
+                                )
+                            else:
+                                col_list = "*"
                             top_clause = f"TOP {sample_limit} "
-                            limit_clause = ""
+                            if conn_config.schema_name:
+                                from_part = (
+                                    f"[{_mssql_esc(conn_config.schema_name)}]"
+                                    f".[{_mssql_esc(table_name)}]"
+                                )
+                            else:
+                                from_part = f"[{_mssql_esc(table_name)}]"
+                            sample_query = f"SELECT {top_clause}{col_list} FROM {from_part}"
                         else:
+                            if selected_columns:
+                                col_list = ", ".join(f'"{c}"' for c in selected_columns)
+                            else:
+                                col_list = "*"
                             top_clause = ""
                             limit_clause = f" LIMIT {sample_limit}"
-
-                        if conn_config.schema_name:
-                            sample_query = f'SELECT {top_clause}{col_list} FROM "{conn_config.schema_name}"."{table_name}"{limit_clause}'
-                        else:
-                            sample_query = f'SELECT {top_clause}{col_list} FROM "{table_name}"{limit_clause}'
+                            if conn_config.schema_name:
+                                sample_query = (
+                                    f'SELECT {top_clause}{col_list} FROM '
+                                    f'"{conn_config.schema_name}"."{table_name}"{limit_clause}'
+                                )
+                            else:
+                                sample_query = (
+                                    f'SELECT {top_clause}{col_list} FROM '
+                                    f'"{table_name}"{limit_clause}'
+                                )
 
                         result = await connector.execute(conn, sample_query)
                         table_data["sample_data"] = {
@@ -1993,17 +2049,46 @@ def register_routes(app: FastAPI) -> None:
 
                             if include_samples:
                                 try:
-                                    if sel_cols:
-                                        col_list = ", ".join(f'"{c}"' for c in sel_cols)
-                                    else:
-                                        col_list = "*"
                                     is_mssql = conn_config.db_type == DatabaseType.MSSQL
-                                    top_clause = f"TOP {sample_limit} " if is_mssql else ""
-                                    limit_clause = "" if is_mssql else f" LIMIT {sample_limit}"
-                                    if conn_config.schema_name:
-                                        sample_query = f'SELECT {top_clause}{col_list} FROM "{conn_config.schema_name}"."{tname}"{limit_clause}'
+
+                                    def _mssql_esc2(n: str) -> str:
+                                        return str(n).replace("]", "]]")
+
+                                    if is_mssql:
+                                        if sel_cols:
+                                            col_list = ", ".join(
+                                                f"[{_mssql_esc2(c)}]" for c in sel_cols
+                                            )
+                                        else:
+                                            col_list = "*"
+                                        top_clause = f"TOP {sample_limit} "
+                                        if conn_config.schema_name:
+                                            from_part = (
+                                                f"[{_mssql_esc2(conn_config.schema_name)}]"
+                                                f".[{_mssql_esc2(tname)}]"
+                                            )
+                                        else:
+                                            from_part = f"[{_mssql_esc2(tname)}]"
+                                        sample_query = (
+                                            f"SELECT {top_clause}{col_list} FROM {from_part}"
+                                        )
                                     else:
-                                        sample_query = f'SELECT {top_clause}{col_list} FROM "{tname}"{limit_clause}'
+                                        if sel_cols:
+                                            col_list = ", ".join(f'"{c}"' for c in sel_cols)
+                                        else:
+                                            col_list = "*"
+                                        top_clause = ""
+                                        limit_clause = f" LIMIT {sample_limit}"
+                                        if conn_config.schema_name:
+                                            sample_query = (
+                                                f'SELECT {top_clause}{col_list} FROM '
+                                                f'"{conn_config.schema_name}"."{tname}"{limit_clause}'
+                                            )
+                                        else:
+                                            sample_query = (
+                                                f'SELECT {top_clause}{col_list} FROM '
+                                                f'"{tname}"{limit_clause}'
+                                            )
                                     async with connector.get_connection() as sconn:
                                         result = await connector.execute(sconn, sample_query)
                                     table_data["sample_data"] = {

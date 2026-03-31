@@ -300,6 +300,15 @@ class SandboxConfig(BaseSettings):
         description="Database connections"
     )
 
+    handlers_catalog_mark_all_available: bool = Field(
+        False,
+        description=(
+            "When True, GET /api/v1/handlers sets available=true for every handler so the UI can "
+            "offer all connection types. Connection tests and queries still enforce installed drivers. "
+            "Airgapped execution_mode enables the same behavior automatically (minimal images omit DB extras)."
+        ),
+    )
+
     @classmethod
     def from_yaml(cls, config_path: str | Path) -> "SandboxConfig":
         """Load configuration from YAML file."""
