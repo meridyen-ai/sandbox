@@ -73,6 +73,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
+# FreeTDS configuration for MSSQL connections
+# TDS 7.0 avoids TLS handshake issues with certain SQL Server configurations
+RUN printf '[global]\ntds version = 7.0\nencryption = off\nclient charset = UTF-8\ntext size = 64512\n' \
+    > /etc/freetds/freetds.conf
+
 # Security: Create non-root user
 ARG APP_UID=1000
 ARG APP_GID=1000

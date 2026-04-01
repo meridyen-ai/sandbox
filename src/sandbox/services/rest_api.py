@@ -948,6 +948,41 @@ def register_routes(app: FastAPI) -> None:
 
         return JSONResponse(content={"connections": connections})
 
+    @app.get("/api/v1/connections/{connection_id}", tags=["Connections"])
+    async def get_connection(
+        connection_id: str,
+        token_data: dict = Depends(verify_sandbox_token),
+    ) -> JSONResponse:
+        """
+        Return one connection including credentials.
+
+        Used by MVP schema sync when the workspace mirror row does not store secrets.
+        Requires the same API key / auth as other sandbox routes.
+        """
+        config = get_config()
+        for conn in config.database_connections:
+            if str(conn.id) != str(connection_id):
+                continue
+            pwd = ""
+            if conn.password is not None:
+                pwd = conn.password.get_secret_value()
+            db_type_val = conn.db_type.value if hasattr(conn.db_type, "value") else str(conn.db_type)
+            return JSONResponse(
+                content={
+                    "id": conn.id,
+                    "name": conn.name,
+                    "db_type": db_type_val,
+                    "host": conn.host,
+                    "port": conn.port,
+                    "database": conn.database,
+                    "username": conn.username,
+                    "password": pwd,
+                    "schema_name": conn.schema_name,
+                    "ssl_enabled": getattr(conn, "ssl_enabled", False),
+                }
+            )
+        raise HTTPException(status_code=404, detail="Connection not found")
+
     @app.post("/api/v1/connections", tags=["Connections"])
     async def create_connection(
         connection: ConnectionConfig,
@@ -1754,9 +1789,19 @@ def register_routes(app: FastAPI) -> None:
                 default_schema = "dbo" if conn_config.db_type == DatabaseType.MSSQL else "public"
                 schema_prefix = conn_config.schema_name or default_schema
 
-                # For each table, get columns and optionally sample data
+                # Batch-fetch all columns in one query if connector supports it
+                all_columns_batch = None
+                if hasattr(connector, 'get_all_columns'):
+                    try:
+                        all_columns_batch = await connector.get_all_columns(
+                            conn, schema=conn_config.schema_name
+                        )
+                    except Exception as e:
+                        logger.warning("batch_columns_failed", error=str(e))
+
+                # Build tables list
+                tables_to_process = []
                 for table_name in tables:
-                    # If selected_tables is configured, only sync selected tables
                     if selected_tables_config:
                         full_name = f"{schema_prefix}.{table_name}"
                         table_selection = selected_tables_config.get(full_name)
@@ -1764,15 +1809,18 @@ def register_routes(app: FastAPI) -> None:
                             continue
                         selected_columns = table_selection.get("columns", [])
                     else:
-                        selected_columns = None  # Include all columns
+                        selected_columns = None
+                    tables_to_process.append((table_name, selected_columns))
 
-                    columns_info = await connector.get_columns(
-                        conn,
-                        table_name,
-                        schema=conn_config.schema_name
-                    )
+                for table_name, selected_columns in tables_to_process:
+                    # Use batch result or fall back to per-table fetch
+                    if all_columns_batch and table_name in all_columns_batch:
+                        columns_info = all_columns_batch[table_name]
+                    else:
+                        columns_info = await connector.get_columns(
+                            conn, table_name, schema=conn_config.schema_name
+                        )
 
-                    # Filter columns if selection exists
                     if selected_columns is not None and selected_columns:
                         columns_info = [
                             col for col in columns_info
@@ -1785,7 +1833,6 @@ def register_routes(app: FastAPI) -> None:
                         "sample_data": None
                     }
 
-                    # Get sample data if requested
                     if include_samples:
                         try:
                             if selected_columns:
@@ -1794,12 +1841,8 @@ def register_routes(app: FastAPI) -> None:
                                 col_list = "*"
 
                             is_mssql = conn_config.db_type == DatabaseType.MSSQL
-                            if is_mssql:
-                                top_clause = f"TOP {sample_limit} "
-                                limit_clause = ""
-                            else:
-                                top_clause = ""
-                                limit_clause = f" LIMIT {sample_limit}"
+                            top_clause = f"TOP {sample_limit} " if is_mssql else ""
+                            limit_clause = "" if is_mssql else f" LIMIT {sample_limit}"
 
                             if conn_config.schema_name:
                                 sample_query = f'SELECT {top_clause}{col_list} FROM "{conn_config.schema_name}"."{table_name}"{limit_clause}'
@@ -1817,11 +1860,7 @@ def register_routes(app: FastAPI) -> None:
                                 "total_rows": result.row_count
                             }
                         except Exception as e:
-                            logger.warning(
-                                "failed_to_get_samples",
-                                table=table_name,
-                                error=str(e)
-                            )
+                            logger.warning("failed_to_get_samples", table=table_name, error=str(e))
                             table_data["sample_data"] = None
 
                     schema_data["tables"].append(table_data)
@@ -1873,24 +1912,45 @@ def register_routes(app: FastAPI) -> None:
 
                 if include_samples:
                     try:
-                        if selected_columns:
-                            col_list = ", ".join(f'"{c}"' for c in selected_columns)
-                        else:
-                            col_list = "*"
-
                         is_mssql = conn_config.db_type == DatabaseType.MSSQL
 
                         if is_mssql:
+                            # T-SQL uses [schema].[table], not PostgreSQL-style double quotes.
+                            def _mssql_esc(n: str) -> str:
+                                return str(n).replace("]", "]]")
+
+                            if selected_columns:
+                                col_list = ", ".join(
+                                    f"[{_mssql_esc(c)}]" for c in selected_columns
+                                )
+                            else:
+                                col_list = "*"
                             top_clause = f"TOP {sample_limit} "
-                            limit_clause = ""
+                            if conn_config.schema_name:
+                                from_part = (
+                                    f"[{_mssql_esc(conn_config.schema_name)}]"
+                                    f".[{_mssql_esc(table_name)}]"
+                                )
+                            else:
+                                from_part = f"[{_mssql_esc(table_name)}]"
+                            sample_query = f"SELECT {top_clause}{col_list} FROM {from_part}"
                         else:
+                            if selected_columns:
+                                col_list = ", ".join(f'"{c}"' for c in selected_columns)
+                            else:
+                                col_list = "*"
                             top_clause = ""
                             limit_clause = f" LIMIT {sample_limit}"
-
-                        if conn_config.schema_name:
-                            sample_query = f'SELECT {top_clause}{col_list} FROM "{conn_config.schema_name}"."{table_name}"{limit_clause}'
-                        else:
-                            sample_query = f'SELECT {top_clause}{col_list} FROM "{table_name}"{limit_clause}'
+                            if conn_config.schema_name:
+                                sample_query = (
+                                    f'SELECT {top_clause}{col_list} FROM '
+                                    f'"{conn_config.schema_name}"."{table_name}"{limit_clause}'
+                                )
+                            else:
+                                sample_query = (
+                                    f'SELECT {top_clause}{col_list} FROM '
+                                    f'"{table_name}"{limit_clause}'
+                                )
 
                         result = await connector.execute(conn, sample_query)
                         table_data["sample_data"] = {
@@ -1956,15 +2016,108 @@ def register_routes(app: FastAPI) -> None:
                         selected_columns = None
                     tables_to_sync.append((table_name, selected_columns))
 
-                # Fetch all tables in parallel (each task gets its own connection)
+                # Try batch column fetch (1 query for ALL tables) if connector supports it
+                all_columns_batch = None
+                if tables_to_sync and hasattr(connector, 'get_all_columns'):
+                    try:
+                        async with connector.get_connection() as conn:
+                            all_columns_batch = await connector.get_all_columns(
+                                conn, schema=conn_config.schema_name
+                            )
+                        logger.info(
+                            "full_sync_batch_columns",
+                            connection=conn_config.id,
+                            tables=len(all_columns_batch),
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "full_sync_batch_columns_failed",
+                            connection=conn_config.id,
+                            error=str(e),
+                        )
+
+                # Build table data
                 if tables_to_sync:
-                    table_results = await asyncio.gather(
-                        *[
-                            _sync_table(connector, conn_config, tname, sel_cols, include_samples, sample_limit)
-                            for tname, sel_cols in tables_to_sync
-                        ],
-                        return_exceptions=True,
-                    )
+                    if all_columns_batch:
+                        # Fast path: use batch-fetched columns, only fetch sample data in parallel
+                        async def _build_table_from_batch(tname, sel_cols):
+                            columns_info = all_columns_batch.get(tname, [])
+                            if sel_cols is not None and sel_cols:
+                                columns_info = [c for c in columns_info if c.get("name") in sel_cols]
+
+                            table_data = {"name": tname, "columns": columns_info, "sample_data": None}
+
+                            if include_samples:
+                                try:
+                                    is_mssql = conn_config.db_type == DatabaseType.MSSQL
+
+                                    def _mssql_esc2(n: str) -> str:
+                                        return str(n).replace("]", "]]")
+
+                                    if is_mssql:
+                                        if sel_cols:
+                                            col_list = ", ".join(
+                                                f"[{_mssql_esc2(c)}]" for c in sel_cols
+                                            )
+                                        else:
+                                            col_list = "*"
+                                        top_clause = f"TOP {sample_limit} "
+                                        if conn_config.schema_name:
+                                            from_part = (
+                                                f"[{_mssql_esc2(conn_config.schema_name)}]"
+                                                f".[{_mssql_esc2(tname)}]"
+                                            )
+                                        else:
+                                            from_part = f"[{_mssql_esc2(tname)}]"
+                                        sample_query = (
+                                            f"SELECT {top_clause}{col_list} FROM {from_part}"
+                                        )
+                                    else:
+                                        if sel_cols:
+                                            col_list = ", ".join(f'"{c}"' for c in sel_cols)
+                                        else:
+                                            col_list = "*"
+                                        top_clause = ""
+                                        limit_clause = f" LIMIT {sample_limit}"
+                                        if conn_config.schema_name:
+                                            sample_query = (
+                                                f'SELECT {top_clause}{col_list} FROM '
+                                                f'"{conn_config.schema_name}"."{tname}"{limit_clause}'
+                                            )
+                                        else:
+                                            sample_query = (
+                                                f'SELECT {top_clause}{col_list} FROM '
+                                                f'"{tname}"{limit_clause}'
+                                            )
+                                    async with connector.get_connection() as sconn:
+                                        result = await connector.execute(sconn, sample_query)
+                                    table_data["sample_data"] = {
+                                        "columns": result.columns,
+                                        "rows": [
+                                            {col: _make_json_safe(val) for col, val in zip(result.columns, row)}
+                                            for row in result.rows
+                                        ],
+                                        "total_rows": result.row_count,
+                                    }
+                                except Exception as e:
+                                    logger.warning("full_sync_sample_error", connection=conn_config.id, table=tname, error=str(e))
+
+                            return table_data
+
+                        table_results = await asyncio.gather(
+                            *[_build_table_from_batch(tname, sel_cols) for tname, sel_cols in tables_to_sync],
+                            return_exceptions=True,
+                        )
+                    else:
+                        # Fallback: fetch columns per table in parallel
+                        table_results = await asyncio.gather(
+                            *[
+                                _sync_table(connector, conn_config, tname, sel_cols, include_samples, sample_limit)
+                                for tname, sel_cols in tables_to_sync
+                            ],
+                            return_exceptions=True,
+                        )
+
                     for i, result in enumerate(table_results):
                         if isinstance(result, Exception):
                             logger.warning(

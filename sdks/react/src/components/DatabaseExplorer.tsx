@@ -14,18 +14,42 @@ export interface DatabaseExplorerProps {
   connectionId?: string;
   onClose?: () => void;
   fullscreen?: boolean;
+  onQueryResult?: (result: QueryResult | null, query: string) => void;
+  /** Custom renderer for query results. When provided, replaces the built-in result table. */
+  renderResult?: (result: QueryResult, executionTime: number | null) => React.ReactNode;
+  /** When true, hides the built-in result section entirely. Use with onQueryResult to render your own. */
+  hideResults?: boolean;
+  /** When true, hides the built-in connection dropdown. Use with connectionId to provide your own selector. */
+  hideConnectionSelector?: boolean;
+  /** Custom React node to render in the header instead of the built-in connection dropdown. */
+  connectionSelectorSlot?: React.ReactNode;
+  /** Initial SQL query to pre-fill the editor with. */
+  initialQuery?: string;
 }
 
 export function DatabaseExplorer({
   connectionId,
   onClose,
-  fullscreen: initialFullscreen = false
+  fullscreen: initialFullscreen = false,
+  onQueryResult,
+  renderResult,
+  hideResults = false,
+  hideConnectionSelector = false,
+  connectionSelectorSlot,
+  initialQuery,
 }: DatabaseExplorerProps) {
   const api = useSandboxApi();
   const [isFullscreen, setIsFullscreen] = useState(initialFullscreen);
   const [connections, setConnections] = useState<ConnectionWithSchema[]>([]);
   const [selectedConnection, setSelectedConnection] = useState<string | undefined>(connectionId);
-  const [query, setQuery] = useState('');
+
+  // Sync with external connectionId prop
+  useEffect(() => {
+    if (connectionId && connectionId !== selectedConnection) {
+      setSelectedConnection(connectionId);
+    }
+  }, [connectionId]);
+  const [query, setQuery] = useState(initialQuery || '');
   const [result, setResult] = useState<QueryResult | null>(null);
   const [queryError, setQueryError] = useState<string | null>(null);
   const [isExecuting, setIsExecuting] = useState(false);
@@ -58,7 +82,18 @@ export function DatabaseExplorer({
     setLoadError(null);
     try {
       const response = await api.query.fullSync();
-      const conns = response?.connections ?? [];
+      const rawConns = response?.connections ?? [];
+      // Normalize column fields: sandbox returns {name, type} but we need {name, data_type}
+      const conns = rawConns.map((c: any) => ({
+        ...c,
+        tables: (c.tables || []).map((t: any) => ({
+          ...t,
+          columns: (t.columns || []).map((col: any) => ({
+            name: col.name || col.column_name || '',
+            data_type: col.data_type || col.type || 'unknown',
+          })),
+        })),
+      }));
       if (conns.length > 0) {
         setConnections(conns);
         if (!selectedConnection) {
@@ -88,12 +123,14 @@ export function DatabaseExplorer({
       setExecutionTime(Math.round(performance.now() - startTime));
 
       if (response?.status === 'success' && response?.data) {
-        setResult({
+        const queryResult = {
           columns: response.data.columns || [],
           rows: response.data.rows || [],
           row_count: response.data.row_count || 0,
           total_rows_available: response.data.total_rows_available,
-        });
+        };
+        setResult(queryResult);
+        onQueryResult?.(queryResult, query.trim());
       } else if (response?.status === 'error') {
         setQueryError(response?.message || 'Query execution failed');
       }
@@ -212,7 +249,9 @@ export function DatabaseExplorer({
         <div className="flex items-center gap-2 min-w-0">
           <Database className="w-5 h-5 text-blue-600 dark:text-blue-400 shrink-0" />
           <h2 className="text-base sm:text-lg font-semibold text-gray-800 dark:text-dashboard-text whitespace-nowrap">Query Explorer</h2>
-          {connections.length > 0 && (
+          {connectionSelectorSlot ? (
+            connectionSelectorSlot
+          ) : !hideConnectionSelector && connections.length > 0 ? (
             <select
               value={selectedConnection}
               onChange={(e) => setSelectedConnection(e.target.value)}
@@ -224,7 +263,7 @@ export function DatabaseExplorer({
                 </option>
               ))}
             </select>
-          )}
+          ) : null}
         </div>
         <div className="flex items-center gap-2 shrink-0">
           <button
@@ -344,15 +383,13 @@ export function DatabaseExplorer({
                   </button>
                   {expandedTables.has(table.name) && table.columns && (
                     <div className="ml-5 border-l border-gray-200 dark:border-dashboard-border">
-                      {table.columns.map((col) => (
+                      {table.columns.map((col, ci) => (
                         <div
-                          key={col.name}
-                          className="flex items-center gap-1 px-2 py-0.5 text-xs text-gray-600 dark:text-gray-400"
-                          title={col.data_type}
+                          key={col.name || ci}
+                          className="pl-4 pr-2 py-0.5 text-xs text-gray-600 dark:text-gray-400"
+                          title={`${col.name} (${col.data_type})`}
                         >
-                          <Columns className="w-3 h-3 text-gray-400 dark:text-gray-500 shrink-0" />
-                          <span className="truncate">{col.name}</span>
-                          <span className="text-gray-400 dark:text-gray-500 ml-auto text-[10px] shrink-0">{col.data_type}</span>
+                          {'• '}{col.name} <span className="text-gray-400 dark:text-gray-500 text-[10px]">{col.data_type}</span>
                         </div>
                       ))}
                     </div>
@@ -369,17 +406,7 @@ export function DatabaseExplorer({
         <div className="flex-1 flex flex-col overflow-hidden">
           {/* SQL Editor */}
           <div className="shrink-0 border-b border-gray-200 dark:border-dashboard-border">
-            <div className="flex">
-              <textarea
-                ref={textareaRef}
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                onKeyDown={handleKeyDown}
-                placeholder="Write your SQL query here..."
-                className="flex-1 min-w-0 h-28 sm:h-32 p-3 font-mono text-sm resize-none focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-inset border-0 dark:bg-dashboard-surface dark:text-dashboard-text dark:placeholder-gray-500"
-                spellCheck={false}
-              />
-              <div className="shrink-0 p-2">
+              <div className="flex items-center justify-end px-2 py-1 bg-gray-50 dark:bg-dashboard-subtle border-b border-gray-100 dark:border-dashboard-border">
                 <button
                   onClick={executeQuery}
                   disabled={isExecuting || !query.trim() || !hasQueryApi}
@@ -389,7 +416,15 @@ export function DatabaseExplorer({
                   {isExecuting ? 'Running...' : 'Run'}
                 </button>
               </div>
-            </div>
+              <textarea
+                ref={textareaRef}
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                onKeyDown={handleKeyDown}
+                placeholder="Write your SQL query here... (Ctrl+Enter to execute)"
+                className="w-full h-28 sm:h-32 p-3 font-mono text-sm resize-none focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-inset border-0 dark:bg-dashboard-surface dark:text-dashboard-text dark:placeholder-gray-500"
+                spellCheck={false}
+              />
           </div>
 
           {/* Results area */}
@@ -412,7 +447,12 @@ export function DatabaseExplorer({
               </div>
             )}
 
-            {result && !isExecuting && (
+            {result && !isExecuting && !hideResults && (
+              renderResult ? (
+                <div className="flex flex-col h-full">
+                  {renderResult(result, executionTime)}
+                </div>
+              ) : (
               <div className="flex flex-col h-full">
                 {/* Status bar */}
                 <div className="shrink-0 flex items-center justify-between px-4 py-1.5 bg-gray-50 dark:bg-dashboard-elevated border-b border-gray-200 dark:border-dashboard-border text-xs text-gray-500 dark:text-dashboard-text-secondary">
@@ -477,6 +517,7 @@ export function DatabaseExplorer({
                   )}
                 </div>
               </div>
+              )
             )}
 
             {!result && !queryError && !isExecuting && (

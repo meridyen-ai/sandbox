@@ -76,7 +76,7 @@ export interface SandboxUIApi {
     saveSelectedTables: (connectionId: string, tables: SelectedSchema) => Promise<void>
   }
   schema: {
-    sync: (connectionId: string, includeSamples?: boolean, sampleLimit?: number) => Promise<SchemaData>
+    sync: (connectionId: string, includeSamples?: boolean, sampleLimit?: number, forceRefresh?: boolean) => Promise<SchemaData>
   }
   files?: {
     upload: (file: File, name: string, options: {

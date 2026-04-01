@@ -95,6 +95,14 @@ class BaseDBHandler(ABC):
     @classmethod
     def get_info(cls) -> HandlerInfo:
         """Get handler information."""
+        # `available` in the catalog reflects optional drivers unless we are in airgapped mode or
+        # SANDBOX_HANDLERS_CATALOG_MARK_ALL_AVAILABLE=1 — minimal images omit DB packages but the UI
+        # should still list every source type; connection attempts validate drivers at runtime.
+        from sandbox.core.config import get_config
+
+        cfg = get_config()
+        mark_all = cfg.handlers_catalog_mark_all_available or cfg.is_airgapped()
+        available = True if mark_all else cls.is_available()
         return HandlerInfo(
             name=cls.name,
             type=cls.type,
@@ -102,7 +110,7 @@ class BaseDBHandler(ABC):
             description=cls.description,
             icon=cls.icon,
             connection_args=cls.connection_args,
-            available=cls.is_available(),
+            available=available,
         )
 
     @classmethod
@@ -387,17 +395,32 @@ class SQLServerHandler(BaseDBHandler):
                 return False
 
     @classmethod
+    def _pymssql_kwargs(cls, connection_data: Dict[str, Any], **extra) -> Dict[str, Any]:
+        """Normalize host/port/user — JSON null port must not reach pymssql as None (breaks connect)."""
+        raw_port = connection_data.get("port", 1433)
+        if raw_port is None or raw_port == "":
+            port = 1433
+        else:
+            try:
+                port = int(raw_port)
+            except (TypeError, ValueError):
+                port = 1433
+        return {
+            "server": connection_data.get("host") or connection_data.get("server"),
+            "port": port,
+            "database": connection_data.get("database"),
+            "user": connection_data.get("username") or connection_data.get("user"),
+            "password": connection_data.get("password"),
+            **extra,
+        }
+
+    @classmethod
     def test_connection(cls, connection_data: Dict[str, Any]) -> ConnectionTestResult:
         try:
             import pymssql
 
             conn = pymssql.connect(
-                server=connection_data.get("host"),
-                port=connection_data.get("port", 1433),
-                database=connection_data.get("database"),
-                user=connection_data.get("username"),
-                password=connection_data.get("password"),
-                login_timeout=10,
+                **cls._pymssql_kwargs(connection_data, login_timeout=10, tds_version="7.0"),
             )
             conn.close()
             return ConnectionTestResult(success=True, message="Connection successful")
@@ -410,13 +433,7 @@ class SQLServerHandler(BaseDBHandler):
     def get_tables(cls, connection_data: Dict[str, Any]) -> List[Dict[str, Any]]:
         import pymssql
 
-        conn = pymssql.connect(
-            server=connection_data.get("host"),
-            port=connection_data.get("port", 1433),
-            database=connection_data.get("database"),
-            user=connection_data.get("username"),
-            password=connection_data.get("password"),
-        )
+        conn = pymssql.connect(**cls._pymssql_kwargs(connection_data, tds_version="7.0"))
 
         try:
             cursor = conn.cursor()
@@ -437,22 +454,26 @@ class SQLServerHandler(BaseDBHandler):
     def get_columns(cls, connection_data: Dict[str, Any], table_name: str) -> List[Dict[str, Any]]:
         import pymssql
 
-        conn = pymssql.connect(
-            server=connection_data.get("host"),
-            port=connection_data.get("port", 1433),
-            database=connection_data.get("database"),
-            user=connection_data.get("username"),
-            password=connection_data.get("password"),
-        )
+        conn = pymssql.connect(**cls._pymssql_kwargs(connection_data, tds_version="7.0"))
 
         try:
             cursor = conn.cursor()
-            cursor.execute("""
-                SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT
-                FROM INFORMATION_SCHEMA.COLUMNS
-                WHERE TABLE_NAME = %s
-                ORDER BY ORDINAL_POSITION
-            """, (table_name,))
+            # table_name may be "schema.table" from MVP cache; qualify to avoid wrong schema
+            if "." in table_name:
+                schema_part, name_part = table_name.split(".", 1)
+                cursor.execute("""
+                    SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT
+                    FROM INFORMATION_SCHEMA.COLUMNS
+                    WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+                    ORDER BY ORDINAL_POSITION
+                """, (schema_part, name_part))
+            else:
+                cursor.execute("""
+                    SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT
+                    FROM INFORMATION_SCHEMA.COLUMNS
+                    WHERE TABLE_NAME = %s
+                    ORDER BY ORDINAL_POSITION
+                """, (table_name,))
 
             columns = [
                 {
@@ -2676,6 +2697,18 @@ class DenodoHandler(BaseDBHandler):
             conn.close()
 
 
+# Alternate names from clients/UI → HANDLERS keys
+DB_TYPE_ALIASES: Dict[str, str] = {
+    "mssql": "sqlserver",
+}
+
+
+def _resolve_db_type(db_type: Optional[str]) -> Optional[str]:
+    if db_type is None:
+        return None
+    return DB_TYPE_ALIASES.get(db_type.lower(), db_type)
+
+
 # Registry of all available handlers
 HANDLERS: Dict[str, type[BaseDBHandler]] = {
     # Databases
@@ -2725,12 +2758,14 @@ class DBHandlerService:
     @staticmethod
     def get_handler(db_type: str) -> Optional[type[BaseDBHandler]]:
         """Get a handler class by database type."""
-        return HANDLERS.get(db_type)
+        key = _resolve_db_type(db_type)
+        return HANDLERS.get(key) if key is not None else None
 
     @staticmethod
     def get_handler_info(db_type: str) -> Optional[HandlerInfo]:
         """Get handler information by database type."""
-        handler = HANDLERS.get(db_type)
+        key = _resolve_db_type(db_type)
+        handler = HANDLERS.get(key) if key is not None else None
         if handler:
             return handler.get_info()
         return None
@@ -2738,7 +2773,7 @@ class DBHandlerService:
     @staticmethod
     def test_connection(db_type: str, connection_data: Dict[str, Any]) -> ConnectionTestResult:
         """Test a database connection."""
-        handler = HANDLERS.get(db_type)
+        handler = HANDLERS.get(_resolve_db_type(db_type))
         if not handler:
             return ConnectionTestResult(
                 success=False,
@@ -2758,7 +2793,7 @@ class DBHandlerService:
     @staticmethod
     def get_tables(db_type: str, connection_data: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Get tables from a database."""
-        handler = HANDLERS.get(db_type)
+        handler = HANDLERS.get(_resolve_db_type(db_type))
         if not handler:
             raise ValueError(f"Unknown database type: {db_type}")
         return handler.get_tables(connection_data)
@@ -2766,7 +2801,7 @@ class DBHandlerService:
     @staticmethod
     def get_columns(db_type: str, connection_data: Dict[str, Any], table_name: str) -> List[Dict[str, Any]]:
         """Get columns for a table."""
-        handler = HANDLERS.get(db_type)
+        handler = HANDLERS.get(_resolve_db_type(db_type))
         if not handler:
             raise ValueError(f"Unknown database type: {db_type}")
         return handler.get_columns(connection_data, table_name)
@@ -2777,7 +2812,7 @@ class DBHandlerService:
         Get sample data from a table.
         Returns a dictionary mapping column names to sample values.
         """
-        handler = HANDLERS.get(db_type)
+        handler = HANDLERS.get(_resolve_db_type(db_type))
         if not handler:
             raise ValueError(f"Unknown database type: {db_type}")
 
@@ -2837,7 +2872,7 @@ class DBHandlerService:
                 finally:
                     conn.close()
 
-            elif db_type == "sqlserver":
+            elif _resolve_db_type(db_type) == "sqlserver":
                 import pymssql
                 conn = pymssql.connect(
                     server=connection_data.get("host"),
@@ -2845,6 +2880,7 @@ class DBHandlerService:
                     database=connection_data.get("database"),
                     user=connection_data.get("username") or connection_data.get("user"),
                     password=connection_data.get("password"),
+                    tds_version="7.0",
                 )
                 try:
                     cursor = conn.cursor()
@@ -2892,7 +2928,7 @@ class DBHandlerService:
         Get multiple sample rows from a table.
         Returns a list of dictionaries, each representing a row.
         """
-        handler = HANDLERS.get(db_type)
+        handler = HANDLERS.get(_resolve_db_type(db_type))
         if not handler:
             raise ValueError(f"Unknown database type: {db_type}")
 
@@ -2958,7 +2994,7 @@ class DBHandlerService:
                 finally:
                     conn.close()
 
-            elif db_type == "sqlserver":
+            elif _resolve_db_type(db_type) == "sqlserver":
                 import pymssql
                 conn = pymssql.connect(
                     server=connection_data.get("host"),
@@ -2966,6 +3002,7 @@ class DBHandlerService:
                     database=connection_data.get("database"),
                     user=connection_data.get("username") or connection_data.get("user"),
                     password=connection_data.get("password"),
+                    tds_version="7.0",
                 )
                 try:
                     cursor = conn.cursor()
@@ -3024,7 +3061,7 @@ class DBHandlerService:
         Get statistics for a specific column.
         Returns null_count, min_value, max_value, avg_value, sum_value, distinct_count.
         """
-        handler = HANDLERS.get(db_type)
+        handler = HANDLERS.get(_resolve_db_type(db_type))
         if not handler:
             raise ValueError(f"Unknown database type: {db_type}")
 

@@ -82,7 +82,6 @@ class SQLValidator:
         r";\s*--",  # Statement termination with comment
         r"'\s*OR\s+'?1'?\s*=\s*'?1",  # OR 1=1 injection
         r"'\s*OR\s+''='",  # OR ''='' injection
-        r"UNION\s+ALL\s+SELECT",  # UNION injection
         r"INTO\s+OUTFILE",  # File write
         r"INTO\s+DUMPFILE",  # File write
         r"LOAD_FILE",  # File read
@@ -239,6 +238,8 @@ class SQLExecutor(BaseExecutor[SQLExecutionResult]):
         self.masker = DataMasker(security_config)
         # Stores (connector, raw_connection) tuples per connection_id
         self._connection_pool: dict[str, tuple[Any, Any]] = {}
+        # Per-connection locks to serialize concurrent access (FreeTDS/pymssql is not thread-safe)
+        self._connection_locks: dict[str, asyncio.Lock] = {}
 
     async def validate(self, context: ExecutionContext, **kwargs: Any) -> list[str]:
         """Validate SQL execution request."""
@@ -285,24 +286,32 @@ class SQLExecutor(BaseExecutor[SQLExecutionResult]):
         self._log_start(context, "sql", query_preview=query[:100])
 
         try:
-            # Get connector and connection (database-agnostic)
-            connector, connection = await self._get_connection(context.connection_id)
+            # Acquire per-connection lock to serialize concurrent access
+            # (FreeTDS/pymssql is not thread-safe for shared connections)
+            conn_id = context.connection_id or ""
+            if conn_id not in self._connection_locks:
+                self._connection_locks[conn_id] = asyncio.Lock()
+            lock = self._connection_locks[conn_id]
 
-            # Execute with timeout
-            timeout = context.get_timeout(self.config)
-            max_rows = context.get_max_rows(self.config)
+            async with lock:
+                # Get connector and connection (database-agnostic)
+                connector, connection = await self._get_connection(context.connection_id)
 
-            try:
-                rows, columns = await asyncio.wait_for(
-                    self._execute_query(connector, connection, query, parameters, max_rows),
-                    timeout=timeout,
-                )
-            except asyncio.TimeoutError:
-                raise TimeoutError(
-                    f"Query execution timed out after {timeout} seconds",
-                    timeout_seconds=timeout,
-                    execution_type="sql",
-                )
+                # Execute with timeout
+                timeout = context.get_timeout(self.config)
+                max_rows = context.get_max_rows(self.config)
+
+                try:
+                    rows, columns = await asyncio.wait_for(
+                        self._execute_query(connector, connection, query, parameters, max_rows),
+                        timeout=timeout,
+                    )
+                except asyncio.TimeoutError:
+                    raise TimeoutError(
+                        f"Query execution timed out after {timeout} seconds",
+                        timeout_seconds=timeout,
+                        execution_type="sql",
+                    )
 
             # Process results
             masked_rows, masked_cols = self.masker.mask_rows(
@@ -366,9 +375,27 @@ class SQLExecutor(BaseExecutor[SQLExecutionResult]):
         if not connection_id:
             raise ValidationError("Connection ID is required")
 
-        # Check cache
+        # Check cache and validate existing connection
         if connection_id in self._connection_pool:
-            return self._connection_pool[connection_id]
+            connector, connection = self._connection_pool[connection_id]
+            # Validate the cached connection is still alive
+            try:
+                is_valid = await asyncio.wait_for(
+                    connector.test_connection(connection),
+                    timeout=5.0,
+                )
+            except Exception:
+                is_valid = False
+
+            if is_valid:
+                return connector, connection
+
+            # Connection is stale, discard and recreate
+            try:
+                await connector.close_connection(connection)
+            except Exception:
+                pass
+            del self._connection_pool[connection_id]
 
         # Get connection config
         config = get_config()

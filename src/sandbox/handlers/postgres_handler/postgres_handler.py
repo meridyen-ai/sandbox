@@ -74,7 +74,7 @@ class PostgresHandler(MetaDatabaseHandler):
                 database=self.connection_args["database"],
                 user=self.connection_args["user"],
                 password=self.connection_args["password"],
-                sslmode=self.connection_args.get("sslmode", "prefer"),
+                sslmode=self.connection_args.get("sslmode") or self.connection_args.get("ssl_mode", "prefer"),
             )
             self._connection.autocommit = True
             self.is_connected = True

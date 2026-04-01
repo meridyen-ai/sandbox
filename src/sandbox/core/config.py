@@ -139,7 +139,7 @@ class SecurityConfig(BaseModel):
         default_factory=lambda: [
             "DROP", "DELETE", "TRUNCATE", "UPDATE", "INSERT", "ALTER", "CREATE",
             "GRANT", "REVOKE", "EXECUTE", "EXEC", "xp_", "sp_",
-            "--", "/*", "*/", ";--", "UNION ALL SELECT",
+            "--", "/*", "*/", ";--",
         ],
         description="Banned SQL patterns"
     )
@@ -298,6 +298,15 @@ class SandboxConfig(BaseSettings):
     database_connections: list[DatabaseConnectionConfig] = Field(
         default_factory=list,
         description="Database connections"
+    )
+
+    handlers_catalog_mark_all_available: bool = Field(
+        False,
+        description=(
+            "When True, GET /api/v1/handlers sets available=true for every handler so the UI can "
+            "offer all connection types. Connection tests and queries still enforce installed drivers. "
+            "Airgapped execution_mode enables the same behavior automatically (minimal images omit DB extras)."
+        ),
     )
 
     @classmethod
