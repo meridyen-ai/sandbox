@@ -2,7 +2,10 @@
 # Meridyen Sandbox Makefile
 # =============================================================================
 
-.PHONY: help build build-airgapped run run-airgapped stop dev test lint format clean sandbox sandbox-dev sandbox-stop
+.PHONY: help build build-airgapped run run-airgapped stop dev test lint format clean sandbox sandbox-dev sandbox-stop rebuild-sandbox rebuild-sandbox-full
+
+# Stack file: hybrid (API + postgres) or standalone (API + postgres + frontend container)
+SANDBOX_COMPOSE ?= docker-compose.hybrid.yaml
 
 # Default target
 help:
@@ -41,6 +44,11 @@ help:
 	@echo "  make sandbox-dev     - Run backend + UI with hot reload"
 	@echo "  make sandbox-stop    - Stop sandbox processes"
 	@echo ""
+	@echo "Rebuild (pick stack with SANDBOX_COMPOSE=…):"
+	@echo "  make rebuild-sandbox      - Rebuild sandbox image + recreate sandbox container only (keeps DB volume)"
+	@echo "  make rebuild-sandbox-full - build-ui + rebuild sandbox + recreate all services (postgres, frontend if in compose)"
+	@echo "  Example standalone stack: make rebuild-sandbox-full SANDBOX_COMPOSE=docker-compose.sandbox.yaml"
+	@echo ""
 	@echo "Cleanup Commands:"
 	@echo "  make clean           - Remove containers and volumes"
 	@echo "  make clean-all       - Remove everything including images"
@@ -48,6 +56,18 @@ help:
 # =============================================================================
 # Build Commands
 # =============================================================================
+
+# Rebuild only the sandbox app image and container; does not touch postgres data or run frontend build.
+rebuild-sandbox:
+	docker compose -f $(SANDBOX_COMPOSE) build --no-cache sandbox
+	docker compose -f $(SANDBOX_COMPOSE) up -d --no-deps --force-recreate sandbox
+	@echo "✅ Sandbox service rebuilt (compose: $(SANDBOX_COMPOSE))"
+
+# Rebuild frontend (npm), sandbox image, and recreate every service in the compose file (postgres + optional frontend).
+rebuild-sandbox-full: build-ui
+	docker compose -f $(SANDBOX_COMPOSE) build --no-cache sandbox
+	docker compose -f $(SANDBOX_COMPOSE) up -d --build --force-recreate
+	@echo "✅ Full rebuild done (compose: $(SANDBOX_COMPOSE)) — DB volume kept; use 'make clean' first to wipe DB data"
 
 build:
 	docker build -t meridyen/sandbox:latest .
