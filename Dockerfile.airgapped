@@ -27,9 +27,9 @@ COPY src/sandbox/__init__.py src/sandbox/
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Install with airgapped extras (includes transformers, torch)
+# Install airgapped (LLM) plus core SQL connectors so execute/sql works (asyncpg, pymssql, etc.)
 RUN pip install --upgrade pip setuptools wheel && \
-    pip install --no-cache-dir ".[airgapped]"
+    pip install --no-cache-dir ".[airgapped,postgresql,mysql,mssql]"
 
 # -----------------------------------------------------------------------------
 # Production Runtime with Local LLM
