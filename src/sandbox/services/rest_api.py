@@ -2523,7 +2523,7 @@ def register_routes(app: FastAPI) -> None:
                     filename VARCHAR(500) NOT NULL,
                     file_type VARCHAR(20) NOT NULL,
                     file_size INTEGER,
-                    file_data BYTEA,
+                    storage_path TEXT,
                     source_path TEXT,
                     source_type VARCHAR(50),
                     status VARCHAR(20) DEFAULT 'pending',
@@ -2536,6 +2536,16 @@ def register_routes(app: FastAPI) -> None:
                     updated_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """))
+
+            # Migration: replace file_data BYTEA with storage_path
+            for col_sql in [
+                "ALTER TABLE document_kb_documents ADD COLUMN IF NOT EXISTS storage_path TEXT",
+                "ALTER TABLE document_kb_documents DROP COLUMN IF EXISTS file_data",
+            ]:
+                try:
+                    conn.execute(sql_text(col_sql))
+                except Exception:
+                    pass
 
             # Migration: add path columns if table already exists
             for col_sql in [
@@ -2632,26 +2642,46 @@ def register_routes(app: FastAPI) -> None:
     async def upload_document(
         file: UploadFile = File(...),
         workspace_id: str = Form(""),
+        folder_path: str = Form(""),
     ):
-        """Upload a document file to the sandbox for storage."""
-        from sqlalchemy import text as sql_text
+        """
+        Upload a document file to the sandbox filesystem.
+        Preserves directory structure when folder_path is provided.
 
+        Files are stored at: /app/data/documents/{workspace_id}/{folder_path}/{filename}
+        No S3, no BYTEA — just local filesystem in the sandbox volume.
+        """
         content = await file.read()
         file_id = str(uuid.uuid4())
+        original_filename = file.filename or "unknown"
+        ext = Path(original_filename).suffix
 
-        # Store file bytes in a temporary holding area (in-memory or DB)
-        # We'll store it when process is called, but also cache it here
-        # so the file is available for processing
-        data_dir = Path("/app/data/documents")
-        data_dir.mkdir(parents=True, exist_ok=True)
-        file_path = data_dir / f"{file_id}{Path(file.filename or '').suffix}"
+        # Build storage path preserving directory structure
+        base_dir = Path("/app/data/documents")
+        if workspace_id:
+            base_dir = base_dir / workspace_id
+        if folder_path:
+            # Sanitize folder_path to prevent path traversal
+            safe_folder = Path(folder_path.replace("..", "").strip("/"))
+            base_dir = base_dir / safe_folder
+
+        base_dir.mkdir(parents=True, exist_ok=True)
+
+        # Use file_id + original extension for uniqueness, but keep original name accessible
+        storage_filename = f"{file_id}{ext}"
+        file_path = base_dir / storage_filename
         file_path.write_bytes(content)
+
+        # Full path relative to /app/data/documents for retrieval
+        relative_path = str(file_path.relative_to(Path("/app/data/documents")))
 
         return {
             "file_id": file_id,
-            "filename": file.filename,
+            "filename": original_filename,
             "size": len(content),
             "path": str(file_path),
+            "storage_path": relative_path,
+            "folder_path": folder_path,
         }
 
     # --- Process Document ---
@@ -2684,18 +2714,23 @@ def register_routes(app: FastAPI) -> None:
         if not file_path or not file_path.exists():
             raise HTTPException(status_code=404, detail=f"File {file_id} not found")
 
-        file_bytes = file_path.read_bytes()
+        file_size = file_path.stat().st_size
+        # Compute storage_path relative to /app/data/documents
+        try:
+            storage_rel = str(file_path.relative_to(Path("/app/data/documents")))
+        except ValueError:
+            storage_rel = str(file_path)
 
         engine = _get_doc_db_engine()
         with engine.connect() as conn:
             conn.execute(
                 sql_text("""
                     INSERT INTO document_kb_documents
-                        (knowledge_base_id, filename, file_type, file_size, file_data, source_path, source_type, status, progress)
-                    VALUES (:kb_id, :fname, :ftype, :fsize, :data, :spath, :stype, 'processing', 0)
+                        (knowledge_base_id, filename, file_type, file_size, storage_path, source_path, source_type, status, progress)
+                    VALUES (:kb_id, :fname, :ftype, :fsize, :spath_disk, :spath, :stype, 'processing', 0)
                 """),
-                {"kb_id": kb_id, "fname": filename, "ftype": file_type, "fsize": len(file_bytes),
-                 "data": file_bytes, "spath": source_path or None, "stype": source_type or None},
+                {"kb_id": kb_id, "fname": filename, "ftype": file_type, "fsize": file_size,
+                 "spath_disk": storage_rel, "spath": source_path or None, "stype": source_type or None},
             )
             conn.commit()
             row = conn.execute(
@@ -2861,44 +2896,54 @@ def register_routes(app: FastAPI) -> None:
                 if not elements:
                     raise ValueError("Unstructured could not extract any content from the document")
 
+                # Track running character offset for highlight positioning
+                char_offset = 0
+
                 for el in elements:
                     text = str(el).strip()
                     if not text:
                         continue
 
-                el_type = type(el).__name__
-                page_num = el.metadata.page_number if hasattr(el.metadata, 'page_number') else None
+                    el_type = type(el).__name__
+                    page_num = el.metadata.page_number if hasattr(el.metadata, 'page_number') else None
 
-                # Format special elements for better context
-                if el_type == "Table":
-                    text = f"[TABLE]\n{text}\n[/TABLE]"
-                elif el_type == "Title":
-                    text = f"## {text}"
-                elif el_type == "Image":
-                    text = f"[IMAGE TEXT] {text} [/IMAGE TEXT]"
+                    # Format special elements for better context
+                    if el_type == "Table":
+                        text = f"[TABLE]\n{text}\n[/TABLE]"
+                    elif el_type == "Title":
+                        text = f"## {text}"
+                    elif el_type == "Image":
+                        text = f"[IMAGE TEXT] {text} [/IMAGE TEXT]"
 
-                extracted_text_parts.append(text)
+                    # Track start/end char positions in the full extracted_text
+                    start_char = char_offset
+                    end_char = char_offset + len(text)
+                    char_offset = end_char + 2  # +2 for the "\n\n" separator
 
-                # Create LlamaIndex Document with rich metadata
-                metadata = {
-                    "filename": filename,
-                    "file_type": file_type,
-                    "file_path": source_path or filename,
-                    "source_path": source_path,
-                    "source_type": "upload" if not source_path else source_path.split(":")[0] if ":" in source_path else "upload",
-                    "element_type": el_type,
-                    "doc_id": doc_id,
-                    "kb_id": kb_id,
-                }
-                if page_num is not None:
-                    metadata["page_num"] = page_num
+                    extracted_text_parts.append(text)
 
-                # Extract directory path from source_path for folder-level filtering
-                if source_path:
-                    parts = source_path.rsplit("/", 1)
-                    metadata["directory"] = parts[0] if len(parts) > 1 else ""
+                    # Create LlamaIndex Document with rich metadata including char offsets
+                    metadata = {
+                        "filename": filename,
+                        "file_type": file_type,
+                        "file_path": source_path or filename,
+                        "source_path": source_path,
+                        "source_type": "upload" if not source_path else source_path.split(":")[0] if ":" in source_path else "upload",
+                        "element_type": el_type,
+                        "doc_id": doc_id,
+                        "kb_id": kb_id,
+                        "start_char": start_char,
+                        "end_char": end_char,
+                    }
+                    if page_num is not None:
+                        metadata["page_num"] = page_num
 
-                li_documents.append(LIDocument(text=text, metadata=metadata))
+                    # Extract directory path from source_path for folder-level filtering
+                    if source_path:
+                        parts = source_path.rsplit("/", 1)
+                        metadata["directory"] = parts[0] if len(parts) > 1 else ""
+
+                    li_documents.append(LIDocument(text=text, metadata=metadata))
 
             extracted_text = "\n\n".join(extracted_text_parts)
 
@@ -3103,6 +3148,14 @@ def register_routes(app: FastAPI) -> None:
                         "source_type": meta.get("source_type", ""),
                         "directory": meta.get("directory", ""),
                         "element_type": meta.get("element_type", ""),
+                        # Text highlight offsets
+                        "start_char": meta.get("start_char"),
+                        "end_char": meta.get("end_char"),
+                        # Audio/video timestamp offsets
+                        "timestamp_start": meta.get("timestamp_start"),
+                        "timestamp_end": meta.get("timestamp_end"),
+                        "timestamp": meta.get("timestamp"),
+                        "file_type": meta.get("file_type", ""),
                     })
 
             except Exception as e:
@@ -3157,7 +3210,7 @@ def register_routes(app: FastAPI) -> None:
                 sql_text("""
                     SELECT id, filename, file_type, file_size, status, error_message,
                            chunk_count, progress, created_at, updated_at,
-                           source_path, source_type
+                           source_path, source_type, storage_path
                     FROM document_kb_documents
                     WHERE knowledge_base_id = :kb_id
                     ORDER BY created_at DESC
@@ -3173,6 +3226,7 @@ def register_routes(app: FastAPI) -> None:
                     "created_at": row[8].isoformat() if row[8] else None,
                     "updated_at": row[9].isoformat() if row[9] else None,
                     "source_path": row[10], "source_type": row[11],
+                    "storage_path": row[12],
                 })
 
         return {"documents": docs}
@@ -3198,27 +3252,38 @@ def register_routes(app: FastAPI) -> None:
                     headers={"Content-Disposition": "inline"},
                 )
 
-        # Fall back to DB (file_data column)
+        # Fall back to DB storage_path
         from sqlalchemy import text as sql_text
         engine = _get_doc_db_engine()
         with engine.connect() as conn:
-            # Try matching file_id in filename pattern
             result = conn.execute(
-                sql_text("SELECT file_data, filename, file_type FROM document_kb_documents WHERE id = :id"),
+                sql_text("SELECT storage_path, filename, file_type FROM document_kb_documents WHERE id = :id"),
                 {"id": int(file_id) if file_id.isdigit() else 0},
             ).fetchone()
             if result and result[0]:
-                ct_map = {
-                    "pdf": "application/pdf",
-                    "txt": "text/plain; charset=utf-8",
-                    "md": "text/plain; charset=utf-8",
-                    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                }
-                return Response(
-                    content=bytes(result[0]),
-                    media_type=ct_map.get(result[2], "application/octet-stream"),
-                    headers={"Content-Disposition": f"inline; filename={result[1]}"},
-                )
+                stored_file = Path("/app/data/documents") / result[0]
+                if stored_file.exists():
+                    ct_map = {
+                        "pdf": "application/pdf",
+                        "txt": "text/plain; charset=utf-8",
+                        "md": "text/plain; charset=utf-8",
+                        "csv": "text/csv; charset=utf-8",
+                        "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                        "png": "image/png",
+                        "jpg": "image/jpeg",
+                        "jpeg": "image/jpeg",
+                        "mp3": "audio/mpeg",
+                        "wav": "audio/wav",
+                        "mp4": "video/mp4",
+                        "webm": "video/webm",
+                    }
+                    return Response(
+                        content=stored_file.read_bytes(),
+                        media_type=ct_map.get(result[2], "application/octet-stream"),
+                        headers={"Content-Disposition": f"inline; filename={result[1]}"},
+                    )
 
         raise HTTPException(status_code=404, detail="File not found")
 
