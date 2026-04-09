@@ -368,8 +368,25 @@ def get_config() -> SandboxConfig:
                 config = SandboxConfig.from_yaml(path)
                 break
 
-    # Load persisted connections (from /app/data/connections.json)
-    load_persisted_connections(config)
+    # Load persisted connections from postgres (with JSON file migration)
+    try:
+        from sandbox.core.connection_store import init_connection_store, list_connections
+        from pydantic import SecretStr as _SecretStr
+
+        init_connection_store()
+
+        for row in list_connections():
+            conn_data = dict(row)
+            conn_data["password"] = _SecretStr(conn_data.get("password", ""))
+            conn_data["db_type"] = DatabaseType(conn_data["db_type"])
+            conn = DatabaseConnectionConfig(**conn_data)
+            if not any(c.id == conn.id for c in config.database_connections):
+                config.database_connections.append(conn)
+
+        logger.info("Loaded %d connections from postgres", len(config.database_connections))
+    except Exception as e:
+        logger.error("Failed to load connections from postgres, falling back to JSON: %s", e)
+        load_persisted_connections(config)
 
     return config
 

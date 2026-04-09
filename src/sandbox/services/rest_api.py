@@ -929,21 +929,22 @@ def register_routes(app: FastAPI) -> None:
         token_data: dict = Depends(verify_sandbox_token),
     ) -> JSONResponse:
         """List configured database connections."""
-        config = get_config()
+        from sandbox.core.connection_store import list_connections as db_list_connections
 
+        rows = db_list_connections()
         connections = []
-        for conn in config.database_connections:
+        for row in rows:
             connections.append({
-                "id": conn.id,
-                "name": conn.name,
-                "db_type": conn.db_type.value,
-                "host": conn.host,
-                "port": conn.port,
-                "database": conn.database,
-                "schema": conn.schema_name,
-                "is_default": getattr(conn, 'is_default', False),
-                "created_at": conn.created_at,
-                "updated_at": conn.updated_at,
+                "id": row["id"],
+                "name": row["name"],
+                "db_type": row["db_type"],
+                "host": row["host"],
+                "port": row["port"],
+                "database": row["database"],
+                "schema": row.get("schema_name"),
+                "is_default": False,
+                "created_at": row.get("created_at"),
+                "updated_at": row.get("updated_at"),
             })
 
         return JSONResponse(content={"connections": connections})
@@ -959,29 +960,26 @@ def register_routes(app: FastAPI) -> None:
         Used by MVP schema sync when the workspace mirror row does not store secrets.
         Requires the same API key / auth as other sandbox routes.
         """
-        config = get_config()
-        for conn in config.database_connections:
-            if str(conn.id) != str(connection_id):
-                continue
-            pwd = ""
-            if conn.password is not None:
-                pwd = conn.password.get_secret_value()
-            db_type_val = conn.db_type.value if hasattr(conn.db_type, "value") else str(conn.db_type)
-            return JSONResponse(
-                content={
-                    "id": conn.id,
-                    "name": conn.name,
-                    "db_type": db_type_val,
-                    "host": conn.host,
-                    "port": conn.port,
-                    "database": conn.database,
-                    "username": conn.username,
-                    "password": pwd,
-                    "schema_name": conn.schema_name,
-                    "ssl_enabled": getattr(conn, "ssl_enabled", False),
-                }
-            )
-        raise HTTPException(status_code=404, detail="Connection not found")
+        from sandbox.core.connection_store import get_connection as db_get_connection
+
+        row = db_get_connection(connection_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Connection not found")
+
+        return JSONResponse(
+            content={
+                "id": row["id"],
+                "name": row["name"],
+                "db_type": row["db_type"],
+                "host": row["host"],
+                "port": row["port"],
+                "database": row["database"],
+                "username": row["username"],
+                "password": row["password"],
+                "schema_name": row.get("schema_name"),
+                "ssl_enabled": row.get("ssl_enabled", False),
+            }
+        )
 
     @app.post("/api/v1/connections", tags=["Connections"])
     async def create_connection(
@@ -989,18 +987,28 @@ def register_routes(app: FastAPI) -> None:
         token_data: dict = Depends(verify_sandbox_token),
     ) -> JSONResponse:
         """Create a new database connection."""
+        from sandbox.core.connection_store import create_connection as db_create_connection
         from sandbox.core.config import DatabaseConnectionConfig, DatabaseType, get_config
         from pydantic import SecretStr
         import uuid
-        from datetime import datetime, timezone
 
-        config = get_config()
-
-        # Generate ID if not provided
         conn_id = connection.id or str(uuid.uuid4())
 
-        # Create connection config
-        now = datetime.now(timezone.utc).isoformat()
+        row = db_create_connection({
+            "id": conn_id,
+            "name": connection.name,
+            "db_type": connection.normalized_db_type,
+            "host": connection.host,
+            "port": connection.port,
+            "database": connection.database,
+            "username": connection.username,
+            "password": connection.password,
+            "schema_name": connection.schema_name,
+            "ssl_enabled": connection.ssl_enabled,
+        })
+
+        # Also add to in-memory config so queries work immediately
+        config = get_config()
         new_conn = DatabaseConnectionConfig(
             id=conn_id,
             name=connection.name,
@@ -1012,15 +1020,12 @@ def register_routes(app: FastAPI) -> None:
             password=SecretStr(connection.password),
             schema_name=connection.schema_name,
             ssl_enabled=connection.ssl_enabled,
-            created_at=now,
-            updated_at=now,
+            created_at=row["created_at"] if row else None,
+            updated_at=row["updated_at"] if row else None,
         )
-
-        # Add to config and persist to file
+        # Remove existing with same id if any
+        config.database_connections = [c for c in config.database_connections if c.id != conn_id]
         config.database_connections.append(new_conn)
-
-        from sandbox.core.config import save_persisted_connections
-        save_persisted_connections(config)
 
         return JSONResponse(
             status_code=201,
@@ -1038,16 +1043,30 @@ def register_routes(app: FastAPI) -> None:
         token_data: dict = Depends(verify_sandbox_token),
     ) -> JSONResponse:
         """Update an existing database connection."""
+        from sandbox.core.connection_store import update_connection as db_update_connection
+        from sandbox.core.config import DatabaseConnectionConfig, DatabaseType, get_config
         from pydantic import SecretStr
-        from datetime import datetime, timezone
-        config = get_config()
 
-        # Find and update connection
+        row = db_update_connection(connection_id, {
+            "name": connection.name,
+            "db_type": connection.normalized_db_type,
+            "host": connection.host,
+            "port": connection.port,
+            "database": connection.database,
+            "username": connection.username,
+            "password": connection.password,
+            "schema_name": connection.schema_name,
+            "ssl_enabled": connection.ssl_enabled,
+        })
+
+        if not row:
+            raise HTTPException(status_code=404, detail="Connection not found")
+
+        # Update in-memory config
+        config = get_config()
         for idx, conn in enumerate(config.database_connections):
             if conn.id == connection_id:
-                from sandbox.core.config import DatabaseConnectionConfig, DatabaseType
-
-                updated_conn = DatabaseConnectionConfig(
+                config.database_connections[idx] = DatabaseConnectionConfig(
                     id=connection_id,
                     name=connection.name,
                     db_type=DatabaseType(connection.normalized_db_type),
@@ -1058,20 +1077,15 @@ def register_routes(app: FastAPI) -> None:
                     password=SecretStr(connection.password),
                     schema_name=connection.schema_name,
                     ssl_enabled=connection.ssl_enabled,
-                    created_at=conn.created_at,
-                    updated_at=datetime.now(timezone.utc).isoformat(),
+                    created_at=row.get("created_at"),
+                    updated_at=row.get("updated_at"),
                 )
-                config.database_connections[idx] = updated_conn
+                break
 
-                from sandbox.core.config import save_persisted_connections
-                save_persisted_connections(config)
-
-                return JSONResponse(content={
-                    "id": connection_id,
-                    "message": "Connection updated successfully"
-                })
-
-        raise HTTPException(status_code=404, detail="Connection not found")
+        return JSONResponse(content={
+            "id": connection_id,
+            "message": "Connection updated successfully"
+        })
 
     @app.delete("/api/v1/connections/{connection_id}", tags=["Connections"])
     async def delete_connection(
@@ -1079,21 +1093,19 @@ def register_routes(app: FastAPI) -> None:
         token_data: dict = Depends(verify_sandbox_token),
     ) -> JSONResponse:
         """Delete a database connection."""
+        from sandbox.core.connection_store import delete_connection as db_delete_connection
+
+        deleted = db_delete_connection(connection_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Connection not found")
+
+        # Remove from in-memory config
         config = get_config()
+        config.database_connections = [c for c in config.database_connections if c.id != connection_id]
 
-        # Find and remove connection
-        for idx, conn in enumerate(config.database_connections):
-            if conn.id == connection_id:
-                config.database_connections.pop(idx)
-
-                from sandbox.core.config import save_persisted_connections
-                save_persisted_connections(config)
-
-                return JSONResponse(content={
-                    "message": "Connection deleted successfully"
-                })
-
-        raise HTTPException(status_code=404, detail="Connection not found")
+        return JSONResponse(content={
+            "message": "Connection deleted successfully"
+        })
 
     @app.get("/api/v1/connections/{connection_id}/selected-tables", tags=["Connections"])
     async def get_selected_tables(
@@ -1101,16 +1113,16 @@ def register_routes(app: FastAPI) -> None:
         token_data: dict = Depends(verify_sandbox_token),
     ) -> JSONResponse:
         """Get selected tables/columns for a connection."""
-        config = get_config()
+        from sandbox.core.connection_store import get_selected_tables as db_get_selected_tables
 
-        for conn in config.database_connections:
-            if conn.id == connection_id:
-                return JSONResponse(content={
-                    "connection_id": connection_id,
-                    "selected_tables": conn.selected_tables or {},
-                })
+        tables = db_get_selected_tables(connection_id)
+        if tables is None:
+            raise HTTPException(status_code=404, detail="Connection not found")
 
-        raise HTTPException(status_code=404, detail="Connection not found")
+        return JSONResponse(content={
+            "connection_id": connection_id,
+            "selected_tables": tables,
+        })
 
     @app.put("/api/v1/connections/{connection_id}/selected-tables", tags=["Connections"])
     async def save_selected_tables(
@@ -1119,23 +1131,25 @@ def register_routes(app: FastAPI) -> None:
         token_data: dict = Depends(verify_sandbox_token),
     ) -> JSONResponse:
         """Save selected tables/columns for a connection."""
-        from sandbox.core.config import save_persisted_connections
-        from datetime import datetime, timezone
+        from sandbox.core.connection_store import save_selected_tables as db_save_selected_tables
 
+        selected = payload.get("selected_tables", {})
+        updated = db_save_selected_tables(connection_id, selected)
+        if not updated:
+            raise HTTPException(status_code=404, detail="Connection not found")
+
+        # Update in-memory config
         config = get_config()
-
         for conn in config.database_connections:
             if conn.id == connection_id:
-                conn.selected_tables = payload.get("selected_tables", {})
-                conn.updated_at = datetime.now(timezone.utc).isoformat()
-                save_persisted_connections(config)
-                return JSONResponse(content={
-                    "connection_id": connection_id,
-                    "message": "Selected tables saved successfully",
-                    "selected_tables": conn.selected_tables,
-                })
+                conn.selected_tables = selected
+                break
 
-        raise HTTPException(status_code=404, detail="Connection not found")
+        return JSONResponse(content={
+            "connection_id": connection_id,
+            "message": "Selected tables saved successfully",
+            "selected_tables": selected,
+        })
 
     @app.post("/api/v1/connections/test", tags=["Connections"])
     async def test_connection(
@@ -1207,8 +1221,9 @@ def register_routes(app: FastAPI) -> None:
         import os
         import pandas as pd
         from sandbox.core.config import (
-            DatabaseConnectionConfig, DatabaseType, get_config, save_persisted_connections,
+            DatabaseConnectionConfig, DatabaseType, get_config,
         )
+        from sandbox.core.connection_store import create_connection as db_create_connection
         from sandbox.services.file_loader import (
             create_upload_database, sanitize_table_name,
             load_csv_to_postgres, load_excel_sheet_to_postgres,
@@ -1304,6 +1319,17 @@ def register_routes(app: FastAPI) -> None:
 
                 # Create ONE connection for the upload database
                 conn_id = str(uuid.uuid4())
+                db_create_connection({
+                    "id": conn_id,
+                    "name": name,
+                    "db_type": "postgresql",
+                    "host": db_config["host"],
+                    "port": db_config["port"],
+                    "database": db_config["database"],
+                    "username": db_config["username"],
+                    "password": db_config["password"],
+                    "ssl_enabled": False,
+                })
                 new_conn = DatabaseConnectionConfig(
                     id=conn_id,
                     name=name,
@@ -1318,7 +1344,6 @@ def register_routes(app: FastAPI) -> None:
                     updated_at=now,
                 )
                 config.database_connections.append(new_conn)
-                save_persisted_connections(config)
 
                 # Build backward-compatible connections list
                 connections = [
@@ -1369,6 +1394,17 @@ def register_routes(app: FastAPI) -> None:
                     raise HTTPException(status_code=400, detail="CSV file is empty")
 
                 conn_id = str(uuid.uuid4())
+                db_create_connection({
+                    "id": conn_id,
+                    "name": name,
+                    "db_type": "postgresql",
+                    "host": db_config["host"],
+                    "port": db_config["port"],
+                    "database": db_config["database"],
+                    "username": db_config["username"],
+                    "password": db_config["password"],
+                    "ssl_enabled": False,
+                })
                 new_conn = DatabaseConnectionConfig(
                     id=conn_id,
                     name=name,
@@ -1383,7 +1419,6 @@ def register_routes(app: FastAPI) -> None:
                     updated_at=now,
                 )
                 config.database_connections.append(new_conn)
-                save_persisted_connections(config)
 
                 # Clean up source file after successful load
                 if os.path.exists(file_path):
@@ -1477,8 +1512,9 @@ def register_routes(app: FastAPI) -> None:
         import os
         import pandas as pd
         from sandbox.core.config import (
-            DatabaseConnectionConfig, DatabaseType, get_config, save_persisted_connections,
+            DatabaseConnectionConfig, DatabaseType, get_config,
         )
+        from sandbox.core.connection_store import create_connection as db_create_connection
         from sandbox.services.file_loader import (
             create_upload_database, sanitize_table_name,
             load_dataframe_to_postgres, load_csv_to_postgres,
@@ -1691,6 +1727,17 @@ def register_routes(app: FastAPI) -> None:
 
             # Create ONE connection pointing to the upload database (same as CSV)
             conn_id = str(uuid.uuid4())
+            db_create_connection({
+                "id": conn_id,
+                "name": body.name,
+                "db_type": "postgresql",
+                "host": db_config["host"],
+                "port": db_config["port"],
+                "database": db_config["database"],
+                "username": db_config["username"],
+                "password": db_config["password"],
+                "ssl_enabled": False,
+            })
             new_conn = DatabaseConnectionConfig(
                 id=conn_id,
                 name=body.name,
@@ -1705,7 +1752,6 @@ def register_routes(app: FastAPI) -> None:
                 updated_at=now,
             )
             config.database_connections.append(new_conn)
-            save_persisted_connections(config)
 
             return JSONResponse(
                 status_code=201,
