@@ -2896,6 +2896,33 @@ def register_routes(app: FastAPI) -> None:
                 if not elements:
                     raise ValueError("Unstructured could not extract any content from the document")
 
+                # For PDFs: extract word-level bounding boxes using PyMuPDF
+                # Unstructured handles parsing/OCR, PyMuPDF provides precise word positions
+                pdf_page_words = {}  # page_num → list of {"text", "bbox", "page_width", "page_height"}
+                if file_type.lower() == "pdf":
+                    try:
+                        import fitz
+                        doc = fitz.open(file_path)
+                        for page_idx in range(len(doc)):
+                            page = doc[page_idx]
+                            page_num_1 = page_idx + 1
+                            words = []
+                            for w in page.get_text("words"):
+                                if w[4].strip():
+                                    words.append({
+                                        "text": w[4],
+                                        "bbox": [round(w[0], 1), round(w[1], 1), round(w[2], 1), round(w[3], 1)],
+                                    })
+                            pdf_page_words[page_num_1] = {
+                                "words": words,
+                                "page_width": round(page.rect.width, 1),
+                                "page_height": round(page.rect.height, 1),
+                            }
+                        doc.close()
+                        logger.info("pymupdf_words_extracted", doc_id=doc_id, pages=len(pdf_page_words))
+                    except Exception as e:
+                        logger.warning("pymupdf_extraction_failed", doc_id=doc_id, error=str(e))
+
                 # Track running character offset for highlight positioning
                 char_offset = 0
 
@@ -2906,6 +2933,25 @@ def register_routes(app: FastAPI) -> None:
 
                     el_type = type(el).__name__
                     page_num = el.metadata.page_number if hasattr(el.metadata, 'page_number') else None
+
+                    # PPTX: page_number = slide number
+                    # XLSX: page_name = sheet name
+                    page_name = getattr(el.metadata, 'page_name', None)  # Sheet name for XLSX
+
+                    # Extract bounding box coordinates from Unstructured (hi_res strategy)
+                    bbox = None
+                    page_width = None
+                    page_height = None
+                    coords = getattr(el.metadata, 'coordinates', None)
+                    if coords and coords.points and coords.system:
+                        # points is list of (x, y) tuples defining the bounding polygon
+                        pts = coords.points
+                        x_vals = [p[0] for p in pts]
+                        y_vals = [p[1] for p in pts]
+                        bbox = [round(min(x_vals), 1), round(min(y_vals), 1),
+                                round(max(x_vals), 1), round(max(y_vals), 1)]
+                        page_width = round(coords.system.width, 1) if hasattr(coords.system, 'width') else None
+                        page_height = round(coords.system.height, 1) if hasattr(coords.system, 'height') else None
 
                     # Format special elements for better context
                     if el_type == "Table":
@@ -2922,7 +2968,7 @@ def register_routes(app: FastAPI) -> None:
 
                     extracted_text_parts.append(text)
 
-                    # Create LlamaIndex Document with rich metadata including char offsets
+                    # Create LlamaIndex Document with rich metadata
                     metadata = {
                         "filename": filename,
                         "file_type": file_type,
@@ -2937,6 +2983,40 @@ def register_routes(app: FastAPI) -> None:
                     }
                     if page_num is not None:
                         metadata["page_num"] = page_num
+                    if page_name:
+                        metadata["page_name"] = page_name  # Sheet name (XLSX) or slide label (PPTX)
+
+                    # For PDFs: map element text to word-level bounding boxes
+                    if page_num and page_num in pdf_page_words:
+                        page_data = pdf_page_words[page_num]
+                        page_words_list = page_data["words"]
+                        pw = page_data["page_width"]
+                        ph = page_data["page_height"]
+                        metadata["page_width"] = pw
+                        metadata["page_height"] = ph
+
+                        # Find matching words on this page for this element's text
+                        el_text_clean = str(el).replace("\n", " ").strip()
+                        el_first_words = el_text_clean.split()[:3]
+                        page_word_texts = [w["text"] for w in page_words_list]
+
+                        matched_bboxes = []
+                        for si in range(len(page_word_texts)):
+                            if page_word_texts[si:si + len(el_first_words)] == el_first_words:
+                                # Found start — collect word bboxes for the element length
+                                end_idx = min(si + len(el_text_clean.split()) + 5, len(page_words_list))
+                                matched_bboxes = [{"bbox": w["bbox"]} for w in page_words_list[si:end_idx]]
+                                break
+
+                        if matched_bboxes:
+                            import json as _json2
+                            metadata["word_positions_json"] = _json2.dumps({
+                                "page_num": page_num,
+                                "page_width": pw,
+                                "page_height": ph,
+                                "word_count": len(matched_bboxes),
+                                "words": matched_bboxes[:200],  # Limit to 200 words max
+                            })
 
                     # Extract directory path from source_path for folder-level filtering
                     if source_path:
@@ -3064,6 +3144,18 @@ def register_routes(app: FastAPI) -> None:
 
     # --- Query KB Vectors ---
     @app.post("/api/v1/documents/query", tags=["Documents"])
+    def _json_parse_safe(val):
+        """Parse a JSON string, return None if invalid."""
+        if not val:
+            return None
+        if isinstance(val, dict):
+            return val
+        try:
+            import json
+            return json.loads(val)
+        except Exception:
+            return None
+
     async def query_kb_vectors(request: Request):
         """
         Search for similar document chunks using LlamaIndex's VectorStoreIndex.
@@ -3142,15 +3234,21 @@ def register_routes(app: FastAPI) -> None:
                         "content": node.get_content(),
                         "similarity": float(similarity),
                         "page_num": meta.get("page_num"),
-                        "word_positions": None,
+                        "word_positions": _json_parse_safe(meta.get("word_positions_json")),
                         "filename": meta.get("filename", ""),
                         "source_path": meta.get("source_path", ""),
                         "source_type": meta.get("source_type", ""),
                         "directory": meta.get("directory", ""),
                         "element_type": meta.get("element_type", ""),
-                        # Text highlight offsets
-                        "start_char": meta.get("start_char"),
-                        "end_char": meta.get("end_char"),
+                        # Text highlight offsets — from LlamaIndex node or element metadata
+                        "start_char": node.start_char_idx if node.start_char_idx is not None else meta.get("start_char"),
+                        "end_char": node.end_char_idx if node.end_char_idx is not None else meta.get("end_char"),
+                        # PDF bounding box [x0, y0, x1, y1] in page coordinates
+                        "bbox": meta.get("bbox"),
+                        "page_width": meta.get("page_width"),
+                        "page_height": meta.get("page_height"),
+                        # Sheet name (XLSX) or slide label (PPTX)
+                        "page_name": meta.get("page_name"),
                         # Audio/video timestamp offsets
                         "timestamp_start": meta.get("timestamp_start"),
                         "timestamp_end": meta.get("timestamp_end"),
