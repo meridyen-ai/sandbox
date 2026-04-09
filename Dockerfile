@@ -33,6 +33,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     poppler-utils \
     libmagic1 \
     pandoc \
+    # Audio/Video processing
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
@@ -82,6 +84,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     poppler-utils \
     libmagic1 \
     pandoc \
+    # Audio/Video processing
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 

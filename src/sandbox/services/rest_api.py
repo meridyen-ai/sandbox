@@ -2745,46 +2745,126 @@ def register_routes(app: FastAPI) -> None:
                 c.execute(sql_text("UPDATE document_kb_documents SET progress=:p, updated_at=NOW() WHERE id=:id"), {"p": prog, "id": doc_id})
                 c.commit()
 
+        AUDIO_TYPES = {"mp3", "wav", "m4a", "ogg", "flac", "wma"}
+        VIDEO_TYPES = {"mp4", "mkv", "avi", "mov", "webm"}
+
         try:
             _update_prog(5)
 
-            # ── Step 1: Parse with Unstructured ──
-            logger.info("unstructured_parsing_start", doc_id=doc_id, filename=filename, ocr=ocr_strategy)
-
-            from unstructured.partition.auto import partition
-
-            partition_kwargs = {
-                "filename": file_path,
-                "strategy": "hi_res",
-            }
-
-            if ocr_strategy == "google_vision" and google_vision_credentials:
-                import tempfile
-                creds_file = tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w")
-                creds_file.write(google_vision_credentials)
-                creds_file.close()
-                os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = creds_file.name
-                partition_kwargs["ocr_agent"] = "google_vision"
-            else:
-                partition_kwargs["ocr_agent"] = "tesseract"
-
-            elements = partition(**partition_kwargs)
-
-            if not elements:
-                raise ValueError("Unstructured could not extract any content from the document")
-
-            _update_prog(20)
-
-            # ── Step 2: Convert Unstructured elements → LlamaIndex Documents ──
             from llama_index.core.schema import Document as LIDocument
-
             li_documents = []
             extracted_text_parts = []
+            is_media = file_type.lower() in (AUDIO_TYPES | VIDEO_TYPES)
 
-            for el in elements:
-                text = str(el).strip()
-                if not text:
-                    continue
+            if is_media:
+                # ── Audio/Video: Transcribe with faster-whisper ──
+                logger.info("whisper_transcription_start", doc_id=doc_id, filename=filename, file_type=file_type)
+
+                audio_path = file_path
+
+                # If video, extract audio track with ffmpeg
+                if file_type.lower() in VIDEO_TYPES:
+                    import subprocess
+                    audio_path = file_path + ".wav"
+                    subprocess.run(
+                        ["ffmpeg", "-i", file_path, "-vn", "-acodec", "pcm_s16le",
+                         "-ar", "16000", "-ac", "1", audio_path, "-y"],
+                        capture_output=True, check=True, timeout=600,
+                    )
+                    logger.info("video_audio_extracted", doc_id=doc_id)
+
+                _update_prog(10)
+
+                # Transcribe with faster-whisper (small model, CPU)
+                from faster_whisper import WhisperModel
+                model = WhisperModel("small", device="cpu", compute_type="int8")
+                segments, info = model.transcribe(audio_path, beam_size=5)
+
+                logger.info("whisper_transcribing", doc_id=doc_id,
+                            language=info.language, duration=f"{info.duration:.1f}s")
+
+                _update_prog(15)
+
+                # Build timestamped transcript as LlamaIndex documents
+                segment_list = list(segments)
+                for i, seg in enumerate(segment_list):
+                    text = seg.text.strip()
+                    if not text:
+                        continue
+
+                    # Format timestamp
+                    start_m, start_s = divmod(int(seg.start), 60)
+                    start_h, start_m = divmod(start_m, 60)
+                    end_m, end_s = divmod(int(seg.end), 60)
+                    end_h, end_m = divmod(end_m, 60)
+                    timestamp = f"{start_h:02d}:{start_m:02d}:{start_s:02d} → {end_h:02d}:{end_m:02d}:{end_s:02d}"
+
+                    extracted_text_parts.append(f"[{timestamp}] {text}")
+
+                    metadata = {
+                        "filename": filename,
+                        "file_type": file_type,
+                        "file_path": source_path or filename,
+                        "source_path": source_path,
+                        "element_type": "Transcript",
+                        "doc_id": doc_id,
+                        "kb_id": kb_id,
+                        "timestamp_start": round(seg.start, 2),
+                        "timestamp_end": round(seg.end, 2),
+                        "timestamp": timestamp,
+                        "language": info.language,
+                    }
+                    if source_path:
+                        parts = source_path.rsplit("/", 1)
+                        metadata["directory"] = parts[0] if len(parts) > 1 else ""
+
+                    li_documents.append(LIDocument(text=f"[{timestamp}] {text}", metadata=metadata))
+
+                    # Update progress proportionally
+                    if i % 20 == 0:
+                        pct = 15 + int((i / max(len(segment_list), 1)) * 5)
+                        _update_prog(min(pct, 20))
+
+                # Clean up extracted audio if it was from video
+                if file_type.lower() in VIDEO_TYPES and os.path.exists(audio_path) and audio_path != file_path:
+                    try:
+                        os.remove(audio_path)
+                    except OSError:
+                        pass
+
+                logger.info("whisper_transcription_done", doc_id=doc_id,
+                            segments=len(li_documents), language=info.language)
+
+            else:
+                # ── Documents: Parse with Unstructured ──
+                logger.info("unstructured_parsing_start", doc_id=doc_id, filename=filename, ocr=ocr_strategy)
+
+                from unstructured.partition.auto import partition
+
+                partition_kwargs = {
+                    "filename": file_path,
+                    "strategy": "hi_res",
+                }
+
+                if ocr_strategy == "google_vision" and google_vision_credentials:
+                    import tempfile
+                    creds_file = tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w")
+                    creds_file.write(google_vision_credentials)
+                    creds_file.close()
+                    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = creds_file.name
+                    partition_kwargs["ocr_agent"] = "google_vision"
+                else:
+                    partition_kwargs["ocr_agent"] = "tesseract"
+
+                elements = partition(**partition_kwargs)
+
+                if not elements:
+                    raise ValueError("Unstructured could not extract any content from the document")
+
+                for el in elements:
+                    text = str(el).strip()
+                    if not text:
+                        continue
 
                 el_type = type(el).__name__
                 page_num = el.metadata.page_number if hasattr(el.metadata, 'page_number') else None
@@ -2831,8 +2911,9 @@ def register_routes(app: FastAPI) -> None:
                           {"t": extracted_text, "id": doc_id})
                 c.commit()
 
-            logger.info("unstructured_parsing_done", doc_id=doc_id, elements=len(elements),
-                        li_docs=len(li_documents), chars=len(extracted_text))
+            logger.info("parsing_done", doc_id=doc_id,
+                        li_docs=len(li_documents), chars=len(extracted_text),
+                        media=is_media)
             _update_prog(30)
 
             # ── Step 3: Build LlamaIndex VectorStoreIndex with PGVectorStore ──

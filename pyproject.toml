@@ -74,6 +74,10 @@ dependencies = [
     "llama-index-embeddings-openai>=0.3.0",
     "llama-index-readers-file>=0.4.0",
     "psycopg2-binary>=2.9.0",
+
+    # Audio/Video processing — transcription with faster-whisper
+    "faster-whisper>=1.0.0",
+    "pydub>=0.25.0",
 ]
 
 [project.optional-dependencies]
