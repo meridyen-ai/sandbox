@@ -2483,6 +2483,679 @@ def register_routes(app: FastAPI) -> None:
             raise HTTPException(status_code=502, detail=str(e))
 
     # ==========================================================================
+    # Document Knowledge Base APIs
+    # ==========================================================================
+    # These endpoints store document files, KB vectors, and chunks in the
+    # sandbox's own PostgreSQL (with pgvector). This keeps user data on their
+    # infrastructure for security.
+
+    def _get_doc_db_engine():
+        """Reuse the sandbox's upload DB engine for document KB storage."""
+        return _get_api_key_engine()
+
+    def _ensure_doc_kb_tables():
+        """Create document KB tables with pgvector in sandbox postgres. Idempotent."""
+        from sqlalchemy import text as sql_text
+        engine = _get_doc_db_engine()
+        with engine.connect() as conn:
+            try:
+                conn.execute(sql_text("CREATE EXTENSION IF NOT EXISTS vector"))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+
+            conn.execute(sql_text("""
+                CREATE TABLE IF NOT EXISTS document_knowledge_bases (
+                    id SERIAL PRIMARY KEY,
+                    workspace_id TEXT,
+                    connection_id TEXT,
+                    name VARCHAR(200) NOT NULL,
+                    description TEXT,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+
+            conn.execute(sql_text("""
+                CREATE TABLE IF NOT EXISTS document_kb_documents (
+                    id SERIAL PRIMARY KEY,
+                    knowledge_base_id INTEGER NOT NULL REFERENCES document_knowledge_bases(id) ON DELETE CASCADE,
+                    filename VARCHAR(500) NOT NULL,
+                    file_type VARCHAR(20) NOT NULL,
+                    file_size INTEGER,
+                    file_data BYTEA,
+                    source_path TEXT,
+                    source_type VARCHAR(50),
+                    status VARCHAR(20) DEFAULT 'pending',
+                    error_message TEXT,
+                    extracted_text TEXT,
+                    summary TEXT,
+                    chunk_count INTEGER DEFAULT 0,
+                    progress INTEGER DEFAULT 0,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+
+            # Migration: add path columns if table already exists
+            for col_sql in [
+                "ALTER TABLE document_kb_documents ADD COLUMN IF NOT EXISTS source_path TEXT",
+                "ALTER TABLE document_kb_documents ADD COLUMN IF NOT EXISTS source_type VARCHAR(50)",
+            ]:
+                try:
+                    conn.execute(sql_text(col_sql))
+                except Exception:
+                    pass
+
+            conn.execute(sql_text("""
+                CREATE TABLE IF NOT EXISTS document_kb_chunks (
+                    id SERIAL PRIMARY KEY,
+                    document_id INTEGER NOT NULL REFERENCES document_kb_documents(id) ON DELETE CASCADE,
+                    knowledge_base_id INTEGER NOT NULL REFERENCES document_knowledge_bases(id) ON DELETE CASCADE,
+                    chunk_index INTEGER NOT NULL,
+                    content TEXT NOT NULL,
+                    token_count INTEGER,
+                    embedding vector(1536),
+                    page_num INTEGER,
+                    word_positions JSONB,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+
+            # Indexes
+            for idx_sql in [
+                "CREATE INDEX IF NOT EXISTS idx_dkb_ws ON document_knowledge_bases(workspace_id)",
+                "CREATE INDEX IF NOT EXISTS idx_dkbd_kb ON document_kb_documents(knowledge_base_id)",
+                "CREATE INDEX IF NOT EXISTS idx_dkbd_status ON document_kb_documents(status)",
+                "CREATE INDEX IF NOT EXISTS idx_dkbc_doc ON document_kb_chunks(document_id)",
+                "CREATE INDEX IF NOT EXISTS idx_dkbc_kb ON document_kb_chunks(knowledge_base_id)",
+            ]:
+                conn.execute(sql_text(idx_sql))
+
+            try:
+                conn.execute(sql_text("""
+                    CREATE INDEX IF NOT EXISTS idx_dkbc_embedding
+                    ON document_kb_chunks USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)
+                """))
+            except Exception:
+                pass
+
+            conn.commit()
+        logger.info("document_kb_tables_ensured")
+
+    # Initialize tables on startup
+    try:
+        _ensure_doc_kb_tables()
+    except Exception as e:
+        logger.warning("document_kb_tables_init_failed", error=str(e))
+
+    # --- Create Knowledge Base ---
+    @app.post("/api/v1/documents/create-kb", tags=["Documents"])
+    async def create_knowledge_base(request: Request):
+        """Create a new knowledge base."""
+        from sqlalchemy import text as sql_text
+        body = await request.json()
+        name = body.get("name", "Untitled KB")
+        description = body.get("description", "")
+        workspace_id = body.get("workspace_id", "")
+        connection_id = body.get("connection_id", "")
+
+        engine = _get_doc_db_engine()
+        with engine.connect() as conn:
+            # Check if already exists for this connection
+            if connection_id:
+                row = conn.execute(
+                    sql_text("SELECT id FROM document_knowledge_bases WHERE connection_id = :cid"),
+                    {"cid": connection_id},
+                ).fetchone()
+                if row:
+                    return {"kb_id": str(row[0]), "name": name, "status": "exists"}
+
+            conn.execute(
+                sql_text("""
+                    INSERT INTO document_knowledge_bases (workspace_id, connection_id, name, description)
+                    VALUES (:ws, :cid, :name, :desc)
+                """),
+                {"ws": workspace_id, "cid": connection_id, "name": name, "desc": description},
+            )
+            conn.commit()
+            row = conn.execute(
+                sql_text("SELECT id FROM document_knowledge_bases WHERE connection_id = :cid ORDER BY id DESC LIMIT 1"),
+                {"cid": connection_id or f"auto-{uuid.uuid4()}"},
+            ).fetchone()
+            kb_id = str(row[0]) if row else "0"
+
+        return {"kb_id": kb_id, "name": name, "status": "created"}
+
+    # --- Upload Document ---
+    @app.post("/api/v1/documents/upload", tags=["Documents"])
+    async def upload_document(
+        file: UploadFile = File(...),
+        workspace_id: str = Form(""),
+    ):
+        """Upload a document file to the sandbox for storage."""
+        from sqlalchemy import text as sql_text
+
+        content = await file.read()
+        file_id = str(uuid.uuid4())
+
+        # Store file bytes in a temporary holding area (in-memory or DB)
+        # We'll store it when process is called, but also cache it here
+        # so the file is available for processing
+        data_dir = Path("/app/data/documents")
+        data_dir.mkdir(parents=True, exist_ok=True)
+        file_path = data_dir / f"{file_id}{Path(file.filename or '').suffix}"
+        file_path.write_bytes(content)
+
+        return {
+            "file_id": file_id,
+            "filename": file.filename,
+            "size": len(content),
+            "path": str(file_path),
+        }
+
+    # --- Process Document ---
+    @app.post("/api/v1/documents/process", tags=["Documents"])
+    async def process_document(request: Request):
+        """
+        Process a document using Unstructured (parsing) + OpenAI (embeddings).
+        Supports OCR strategies: "local" (Tesseract) or "google_vision".
+        """
+        from sqlalchemy import text as sql_text
+
+        body = await request.json()
+        file_id = body.get("file_id", "")
+        filename = body.get("filename", "unknown")
+        file_type = body.get("file_type", "txt")
+        kb_id = int(body.get("kb_id", 0))
+        workspace_id = body.get("workspace_id", "")
+        ocr_strategy = body.get("ocr_strategy", "local")  # "local" or "google_vision"
+        google_vision_credentials = body.get("google_vision_credentials")  # JSON string
+        source_path = body.get("source_path", "")  # e.g. "Google Drive:/Reports/Q3/financial.pdf"
+        source_type = body.get("source_type", "")  # e.g. "google_drive", "s3", "upload"
+
+        # Find the uploaded file
+        data_dir = Path("/app/data/documents")
+        file_path = None
+        for p in data_dir.glob(f"{file_id}*"):
+            file_path = p
+            break
+
+        if not file_path or not file_path.exists():
+            raise HTTPException(status_code=404, detail=f"File {file_id} not found")
+
+        file_bytes = file_path.read_bytes()
+
+        engine = _get_doc_db_engine()
+        with engine.connect() as conn:
+            conn.execute(
+                sql_text("""
+                    INSERT INTO document_kb_documents
+                        (knowledge_base_id, filename, file_type, file_size, file_data, source_path, source_type, status, progress)
+                    VALUES (:kb_id, :fname, :ftype, :fsize, :data, :spath, :stype, 'processing', 0)
+                """),
+                {"kb_id": kb_id, "fname": filename, "ftype": file_type, "fsize": len(file_bytes),
+                 "data": file_bytes, "spath": source_path or None, "stype": source_type or None},
+            )
+            conn.commit()
+            row = conn.execute(
+                sql_text("SELECT id FROM document_kb_documents WHERE knowledge_base_id = :kb_id AND filename = :fname ORDER BY id DESC LIMIT 1"),
+                {"kb_id": kb_id, "fname": filename},
+            ).fetchone()
+            doc_id = row[0]
+
+        import threading
+        def _process_bg():
+            try:
+                _run_unstructured_pipeline(
+                    engine, doc_id, str(file_path), file_type, kb_id, filename,
+                    ocr_strategy, google_vision_credentials, source_path,
+                )
+            except Exception as e:
+                logger.error("document_processing_failed", doc_id=doc_id, error=str(e))
+
+        threading.Thread(target=_process_bg, daemon=True).start()
+        return {"doc_id": str(doc_id), "status": "processing", "file_id": file_id}
+
+    def _run_unstructured_pipeline(
+        engine, doc_id: int, file_path: str, file_type: str,
+        kb_id: int, filename: str,
+        ocr_strategy: str = "local",
+        google_vision_credentials: str | None = None,
+        source_path: str = "",
+    ):
+        """
+        Document processing pipeline using Unstructured (parsing) + LlamaIndex (indexing).
+
+        - Unstructured: extracts structured elements (text, tables, headers, images/OCR)
+        - LlamaIndex: chunks with metadata, embeds with OpenAI, stores in PGVectorStore
+
+        OCR strategies for scanned/non-digital documents:
+          - "local": Tesseract OCR (free, on-premise)
+          - "google_vision": Google Cloud Vision OCR (best accuracy)
+
+        LlamaIndex automatically tracks file paths, page numbers, and element types
+        as metadata on each node, enabling path-based filtering during retrieval.
+        """
+        from sqlalchemy import text as sql_text
+        import json as _json
+
+        def _update_prog(prog):
+            with engine.connect() as c:
+                c.execute(sql_text("UPDATE document_kb_documents SET progress=:p, updated_at=NOW() WHERE id=:id"), {"p": prog, "id": doc_id})
+                c.commit()
+
+        try:
+            _update_prog(5)
+
+            # ── Step 1: Parse with Unstructured ──
+            logger.info("unstructured_parsing_start", doc_id=doc_id, filename=filename, ocr=ocr_strategy)
+
+            from unstructured.partition.auto import partition
+
+            partition_kwargs = {
+                "filename": file_path,
+                "strategy": "hi_res",
+            }
+
+            if ocr_strategy == "google_vision" and google_vision_credentials:
+                import tempfile
+                creds_file = tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w")
+                creds_file.write(google_vision_credentials)
+                creds_file.close()
+                os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = creds_file.name
+                partition_kwargs["ocr_agent"] = "google_vision"
+            else:
+                partition_kwargs["ocr_agent"] = "tesseract"
+
+            elements = partition(**partition_kwargs)
+
+            if not elements:
+                raise ValueError("Unstructured could not extract any content from the document")
+
+            _update_prog(20)
+
+            # ── Step 2: Convert Unstructured elements → LlamaIndex Documents ──
+            from llama_index.core.schema import Document as LIDocument
+
+            li_documents = []
+            extracted_text_parts = []
+
+            for el in elements:
+                text = str(el).strip()
+                if not text:
+                    continue
+
+                el_type = type(el).__name__
+                page_num = el.metadata.page_number if hasattr(el.metadata, 'page_number') else None
+
+                # Format special elements for better context
+                if el_type == "Table":
+                    text = f"[TABLE]\n{text}\n[/TABLE]"
+                elif el_type == "Title":
+                    text = f"## {text}"
+                elif el_type == "Image":
+                    text = f"[IMAGE TEXT] {text} [/IMAGE TEXT]"
+
+                extracted_text_parts.append(text)
+
+                # Create LlamaIndex Document with rich metadata
+                metadata = {
+                    "filename": filename,
+                    "file_type": file_type,
+                    "file_path": source_path or filename,
+                    "source_path": source_path,
+                    "source_type": "upload" if not source_path else source_path.split(":")[0] if ":" in source_path else "upload",
+                    "element_type": el_type,
+                    "doc_id": doc_id,
+                    "kb_id": kb_id,
+                }
+                if page_num is not None:
+                    metadata["page_num"] = page_num
+
+                # Extract directory path from source_path for folder-level filtering
+                if source_path:
+                    parts = source_path.rsplit("/", 1)
+                    metadata["directory"] = parts[0] if len(parts) > 1 else ""
+
+                li_documents.append(LIDocument(text=text, metadata=metadata))
+
+            extracted_text = "\n\n".join(extracted_text_parts)
+
+            if not extracted_text.strip():
+                raise ValueError("No text content extracted from document")
+
+            # Save extracted text to DB
+            with engine.connect() as c:
+                c.execute(sql_text("UPDATE document_kb_documents SET extracted_text=:t, updated_at=NOW() WHERE id=:id"),
+                          {"t": extracted_text, "id": doc_id})
+                c.commit()
+
+            logger.info("unstructured_parsing_done", doc_id=doc_id, elements=len(elements),
+                        li_docs=len(li_documents), chars=len(extracted_text))
+            _update_prog(30)
+
+            # ── Step 3: Build LlamaIndex VectorStoreIndex with PGVectorStore ──
+            from llama_index.core import VectorStoreIndex, Settings
+            from llama_index.core.node_parser import SentenceSplitter
+            from llama_index.embeddings.openai import OpenAIEmbedding
+            from llama_index.vector_stores.postgres import PGVectorStore
+
+            openai_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENAI_KEY", "")
+
+            # Configure LlamaIndex settings
+            Settings.embed_model = OpenAIEmbedding(
+                model="text-embedding-3-small",
+                dimensions=1536,
+                api_key=openai_key,
+            )
+            Settings.chunk_size = 512
+            Settings.chunk_overlap = 50
+
+            # Connect LlamaIndex to sandbox postgres via PGVectorStore
+            db_host = os.environ.get("SANDBOX_UPLOAD_DB_HOST", "sandbox-postgres")
+            db_port = os.environ.get("SANDBOX_UPLOAD_DB_PORT", "5432")
+            db_name = os.environ.get("SANDBOX_UPLOAD_DB_NAME", "sandbox_uploads")
+            db_user = os.environ.get("SANDBOX_UPLOAD_DB_USER", "sandbox")
+            db_pass = os.environ.get("SANDBOX_UPLOAD_DB_PASSWORD", "sandbox_password")
+
+            # Each KB gets its own table for isolation
+            table_name = f"llamaindex_kb_{kb_id}"
+
+            vector_store = PGVectorStore.from_params(
+                host=db_host,
+                port=db_port,
+                database=db_name,
+                user=db_user,
+                password=db_pass,
+                table_name=table_name,
+                embed_dim=1536,
+            )
+
+            _update_prog(40)
+
+            # ── Step 4: Index documents — LlamaIndex handles chunking + embedding + storage ──
+            # SentenceSplitter respects element boundaries better than character splitting
+            node_parser = SentenceSplitter(chunk_size=512, chunk_overlap=50)
+
+            logger.info("llamaindex_indexing_start", doc_id=doc_id, documents=len(li_documents))
+
+            index = VectorStoreIndex.from_documents(
+                li_documents,
+                vector_store=vector_store,
+                transformations=[node_parser],
+                show_progress=False,
+            )
+
+            # Count how many nodes (chunks) were created
+            chunk_count = len(li_documents)  # Approximate — actual nodes may differ
+            try:
+                # Try to get actual node count from the index
+                all_nodes = index.docstore.docs
+                chunk_count = len(all_nodes) if all_nodes else chunk_count
+            except Exception:
+                pass
+
+            logger.info("llamaindex_indexing_done", doc_id=doc_id, chunks=chunk_count)
+            _update_prog(85)
+
+            # ── Step 5: Generate summary ──
+            import openai as _openai
+            client = _openai.OpenAI(api_key=openai_key)
+            summary = ""
+            try:
+                summary_resp = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {"role": "system", "content": "Summarize this document in 2-3 sentences."},
+                        {"role": "user", "content": extracted_text[:8000]},
+                    ],
+                    max_tokens=200,
+                )
+                summary = summary_resp.choices[0].message.content or ""
+            except Exception:
+                pass
+
+            # ── Finalize ──
+            with engine.connect() as c:
+                c.execute(
+                    sql_text("UPDATE document_kb_documents SET status='ready', chunk_count=:cc, summary=:s, progress=100, updated_at=NOW() WHERE id=:id"),
+                    {"cc": chunk_count, "s": summary, "id": doc_id},
+                )
+                c.commit()
+
+            logger.info("document_processed", doc_id=doc_id, filename=filename,
+                        chunks=chunk_count, ocr=ocr_strategy, source_path=source_path)
+
+        except Exception as e:
+            logger.error("document_processing_error", doc_id=doc_id, error=str(e))
+            with engine.connect() as c:
+                c.execute(
+                    sql_text("UPDATE document_kb_documents SET status='failed', error_message=:err, updated_at=NOW() WHERE id=:id"),
+                    {"err": str(e), "id": doc_id},
+                )
+                c.commit()
+
+    # --- Query KB Vectors ---
+    @app.post("/api/v1/documents/query", tags=["Documents"])
+    async def query_kb_vectors(request: Request):
+        """
+        Search for similar document chunks using LlamaIndex's VectorStoreIndex.
+        Supports path-based filtering (search within specific directories).
+        """
+        body = await request.json()
+        query_embedding = body.get("query_embedding", [])
+        kb_ids = body.get("kb_ids", [])
+        top_k = body.get("top_k", 10)
+        threshold = body.get("similarity_threshold", 0.3)
+        # Optional path filter — search only within a specific directory
+        path_filter = body.get("path_filter", "")  # e.g. "Google Drive:/Reports"
+
+        if not query_embedding or not kb_ids:
+            return {"chunks": []}
+
+        from llama_index.core import VectorStoreIndex, Settings
+        from llama_index.core.vector_stores.types import (
+            VectorStoreQuery,
+            VectorStoreQueryMode,
+            MetadataFilters,
+            MetadataFilter,
+            FilterOperator,
+        )
+        from llama_index.vector_stores.postgres import PGVectorStore
+        from llama_index.embeddings.openai import OpenAIEmbedding
+
+        openai_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENAI_KEY", "")
+        Settings.embed_model = OpenAIEmbedding(
+            model="text-embedding-3-small", dimensions=1536, api_key=openai_key,
+        )
+
+        db_host = os.environ.get("SANDBOX_UPLOAD_DB_HOST", "sandbox-postgres")
+        db_port = os.environ.get("SANDBOX_UPLOAD_DB_PORT", "5432")
+        db_name = os.environ.get("SANDBOX_UPLOAD_DB_NAME", "sandbox_uploads")
+        db_user = os.environ.get("SANDBOX_UPLOAD_DB_USER", "sandbox")
+        db_pass = os.environ.get("SANDBOX_UPLOAD_DB_PASSWORD", "sandbox_password")
+
+        all_chunks = []
+
+        for kb_id in kb_ids:
+            table_name = f"llamaindex_kb_{kb_id}"
+
+            try:
+                vector_store = PGVectorStore.from_params(
+                    host=db_host, port=db_port, database=db_name,
+                    user=db_user, password=db_pass,
+                    table_name=table_name, embed_dim=1536,
+                )
+
+                # Build metadata filters
+                filters = []
+                if path_filter:
+                    filters.append(MetadataFilter(
+                        key="source_path", value=path_filter, operator=FilterOperator.CONTAINS,
+                    ))
+
+                # Query using LlamaIndex's vector store directly
+                query = VectorStoreQuery(
+                    query_embedding=query_embedding,
+                    similarity_top_k=top_k,
+                    mode=VectorStoreQueryMode.DEFAULT,
+                    filters=MetadataFilters(filters=filters) if filters else None,
+                )
+
+                result = vector_store.query(query)
+
+                for node, similarity in zip(result.nodes or [], result.similarities or []):
+                    if similarity < threshold:
+                        continue
+                    meta = node.metadata or {}
+                    all_chunks.append({
+                        "chunk_id": node.node_id,
+                        "document_id": str(meta.get("doc_id", "")),
+                        "kb_id": str(kb_id),
+                        "content": node.get_content(),
+                        "similarity": float(similarity),
+                        "page_num": meta.get("page_num"),
+                        "word_positions": None,
+                        "filename": meta.get("filename", ""),
+                        "source_path": meta.get("source_path", ""),
+                        "source_type": meta.get("source_type", ""),
+                        "directory": meta.get("directory", ""),
+                        "element_type": meta.get("element_type", ""),
+                    })
+
+            except Exception as e:
+                logger.warning("kb_query_failed", kb_id=kb_id, error=str(e))
+
+        # Sort by similarity descending, take top_k
+        all_chunks.sort(key=lambda c: c["similarity"], reverse=True)
+        all_chunks = all_chunks[:top_k]
+
+        return {"chunks": all_chunks}
+
+    # --- KB Status ---
+    @app.get("/api/v1/documents/kb-status", tags=["Documents"])
+    async def get_kb_status(kb_id: str, workspace_id: str = ""):
+        """Get knowledge base processing status."""
+        from sqlalchemy import text as sql_text
+
+        engine = _get_doc_db_engine()
+        with engine.connect() as conn:
+            result = conn.execute(
+                sql_text("""
+                    SELECT
+                        COUNT(*) as total,
+                        COUNT(*) FILTER (WHERE status = 'ready') as ready,
+                        COUNT(*) FILTER (WHERE status = 'processing') as processing,
+                        COUNT(*) FILTER (WHERE status = 'failed') as failed,
+                        COUNT(*) FILTER (WHERE status = 'pending') as pending,
+                        COALESCE(SUM(chunk_count), 0) as total_chunks
+                    FROM document_kb_documents
+                    WHERE knowledge_base_id = :kb_id
+                """),
+                {"kb_id": int(kb_id)},
+            )
+            row = result.fetchone()
+            if not row:
+                return {"total": 0, "ready": 0, "processing": 0, "failed": 0, "pending": 0, "total_chunks": 0}
+
+            return {
+                "total": row[0], "ready": row[1], "processing": row[2],
+                "failed": row[3], "pending": row[4], "total_chunks": row[5],
+            }
+
+    # --- List KB Documents ---
+    @app.get("/api/v1/documents/list", tags=["Documents"])
+    async def list_kb_documents(kb_id: str, workspace_id: str = ""):
+        """List all documents in a knowledge base."""
+        from sqlalchemy import text as sql_text
+
+        engine = _get_doc_db_engine()
+        with engine.connect() as conn:
+            result = conn.execute(
+                sql_text("""
+                    SELECT id, filename, file_type, file_size, status, error_message,
+                           chunk_count, progress, created_at, updated_at,
+                           source_path, source_type
+                    FROM document_kb_documents
+                    WHERE knowledge_base_id = :kb_id
+                    ORDER BY created_at DESC
+                """),
+                {"kb_id": int(kb_id)},
+            )
+            docs = []
+            for row in result.fetchall():
+                docs.append({
+                    "id": row[0], "filename": row[1], "file_type": row[2],
+                    "file_size": row[3], "status": row[4], "error_message": row[5],
+                    "chunk_count": row[6], "progress": row[7] or 0,
+                    "created_at": row[8].isoformat() if row[8] else None,
+                    "updated_at": row[9].isoformat() if row[9] else None,
+                    "source_path": row[10], "source_type": row[11],
+                })
+
+        return {"documents": docs}
+
+    # --- Serve Document File ---
+    @app.get("/api/v1/documents/file/{file_id}", tags=["Documents"])
+    async def get_document_file(file_id: str, workspace_id: str = ""):
+        """Serve a document file from sandbox storage."""
+        # Check filesystem first
+        data_dir = Path("/app/data/documents")
+        for p in data_dir.glob(f"{file_id}*"):
+            if p.exists():
+                ext = p.suffix.lower()
+                ct_map = {
+                    ".pdf": "application/pdf",
+                    ".txt": "text/plain; charset=utf-8",
+                    ".md": "text/plain; charset=utf-8",
+                    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                }
+                return Response(
+                    content=p.read_bytes(),
+                    media_type=ct_map.get(ext, "application/octet-stream"),
+                    headers={"Content-Disposition": "inline"},
+                )
+
+        # Fall back to DB (file_data column)
+        from sqlalchemy import text as sql_text
+        engine = _get_doc_db_engine()
+        with engine.connect() as conn:
+            # Try matching file_id in filename pattern
+            result = conn.execute(
+                sql_text("SELECT file_data, filename, file_type FROM document_kb_documents WHERE id = :id"),
+                {"id": int(file_id) if file_id.isdigit() else 0},
+            ).fetchone()
+            if result and result[0]:
+                ct_map = {
+                    "pdf": "application/pdf",
+                    "txt": "text/plain; charset=utf-8",
+                    "md": "text/plain; charset=utf-8",
+                    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                }
+                return Response(
+                    content=bytes(result[0]),
+                    media_type=ct_map.get(result[2], "application/octet-stream"),
+                    headers={"Content-Disposition": f"inline; filename={result[1]}"},
+                )
+
+        raise HTTPException(status_code=404, detail="File not found")
+
+    # --- Delete Document ---
+    @app.delete("/api/v1/documents/{doc_id}", tags=["Documents"])
+    async def delete_kb_document(doc_id: str, kb_id: str = "", workspace_id: str = ""):
+        """Delete a document and its chunks from the knowledge base."""
+        from sqlalchemy import text as sql_text
+
+        engine = _get_doc_db_engine()
+        with engine.connect() as conn:
+            conn.execute(sql_text("DELETE FROM document_kb_chunks WHERE document_id = :id"), {"id": int(doc_id)})
+            conn.execute(sql_text("DELETE FROM document_kb_documents WHERE id = :id"), {"id": int(doc_id)})
+            conn.commit()
+
+        return {"status": "deleted", "doc_id": doc_id}
+
+    # ==========================================================================
     # Metrics
     # ==========================================================================
 

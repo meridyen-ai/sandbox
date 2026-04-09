@@ -27,6 +27,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     unixodbc-dev \
     # SSL
     libssl-dev \
+    # Unstructured document processing dependencies
+    tesseract-ocr \
+    tesseract-ocr-eng \
+    poppler-utils \
+    libmagic1 \
+    pandoc \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
@@ -70,6 +76,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     # Security: CA certificates
     ca-certificates \
+    # Unstructured document processing: OCR + PDF rendering
+    tesseract-ocr \
+    tesseract-ocr-eng \
+    poppler-utils \
+    libmagic1 \
+    pandoc \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
