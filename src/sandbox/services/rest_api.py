@@ -2724,20 +2724,54 @@ def register_routes(app: FastAPI) -> None:
             storage_rel = str(file_path)
 
         engine = _get_doc_db_engine()
+        # Ensure file_id column + unique index exist (idempotent migration)
+        with engine.connect() as conn:
+            conn.execute(sql_text(
+                "ALTER TABLE document_kb_documents ADD COLUMN IF NOT EXISTS file_id varchar(500)"
+            ))
+            conn.execute(sql_text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_dkbd_kb_file "
+                "ON document_kb_documents (knowledge_base_id, file_id) WHERE file_id IS NOT NULL"
+            ))
+            conn.commit()
+
+        # UPSERT keyed by (kb_id, file_id) — reindexing the same file updates the
+        # existing row instead of creating duplicates (fixes the "124 rows for 21 files" bug).
         with engine.connect() as conn:
             conn.execute(
                 sql_text("""
                     INSERT INTO document_kb_documents
-                        (knowledge_base_id, filename, file_type, file_size, storage_path, source_path, source_type, status, progress)
-                    VALUES (:kb_id, :fname, :ftype, :fsize, :spath_disk, :spath, :stype, 'processing', 0)
+                        (knowledge_base_id, filename, file_type, file_size,
+                         storage_path, source_path, source_type, file_id,
+                         status, progress, error_message, chunk_count)
+                    VALUES (:kb_id, :fname, :ftype, :fsize,
+                            :spath_disk, :spath, :stype, :fid,
+                            'processing', 0, NULL, 0)
+                    ON CONFLICT (knowledge_base_id, file_id) WHERE file_id IS NOT NULL
+                    DO UPDATE SET
+                        filename = EXCLUDED.filename,
+                        file_type = EXCLUDED.file_type,
+                        file_size = EXCLUDED.file_size,
+                        storage_path = EXCLUDED.storage_path,
+                        source_path = EXCLUDED.source_path,
+                        source_type = EXCLUDED.source_type,
+                        status = 'processing',
+                        progress = 0,
+                        error_message = NULL,
+                        chunk_count = 0,
+                        updated_at = NOW()
                 """),
                 {"kb_id": kb_id, "fname": filename, "ftype": file_type, "fsize": file_size,
-                 "spath_disk": storage_rel, "spath": source_path or None, "stype": source_type or None},
+                 "spath_disk": storage_rel, "spath": source_path or None,
+                 "stype": source_type or None, "fid": file_id},
             )
             conn.commit()
             row = conn.execute(
-                sql_text("SELECT id FROM document_kb_documents WHERE knowledge_base_id = :kb_id AND filename = :fname ORDER BY id DESC LIMIT 1"),
-                {"kb_id": kb_id, "fname": filename},
+                sql_text(
+                    "SELECT id FROM document_kb_documents "
+                    "WHERE knowledge_base_id = :kb_id AND file_id = :fid"
+                ),
+                {"kb_id": kb_id, "fid": file_id},
             ).fetchone()
             doc_id = row[0]
 
@@ -2750,6 +2784,7 @@ def register_routes(app: FastAPI) -> None:
                 _run_unstructured_pipeline,
                 engine, doc_id, str(file_path), file_type, kb_id, filename,
                 ocr_strategy, google_vision_credentials, source_path,
+                file_id,
             )
         except Exception as e:
             logger.error("document_processing_failed", doc_id=doc_id, error=str(e))
@@ -2779,6 +2814,7 @@ def register_routes(app: FastAPI) -> None:
         ocr_strategy: str = "local",
         google_vision_credentials: str | None = None,
         source_path: str = "",
+        file_id: str = "",
     ):
         """
         Document processing pipeline using Unstructured (parsing) + LlamaIndex (indexing).
@@ -2865,6 +2901,7 @@ def register_routes(app: FastAPI) -> None:
                     extracted_text_parts.append(f"[{timestamp}] {text}")
 
                     metadata = {
+                        "file_id": file_id,
                         "filename": filename,
                         "file_type": file_type,
                         "file_path": source_path or filename,
@@ -2957,7 +2994,16 @@ def register_routes(app: FastAPI) -> None:
                 char_offset = 0
 
                 for el in elements:
-                    text = str(el).strip()
+                    # Some Unstructured elements (e.g. Image elements from OCR with no
+                    # detected text) have a broken __str__ that returns None. Prefer
+                    # .text (a plain str attribute) and skip elements without usable text.
+                    raw = getattr(el, "text", None)
+                    if raw is None:
+                        try:
+                            raw = str(el)
+                        except Exception:
+                            raw = None
+                    text = (raw or "").strip() if isinstance(raw, str) else ""
                     if not text:
                         continue
 
@@ -3000,6 +3046,7 @@ def register_routes(app: FastAPI) -> None:
 
                     # Create LlamaIndex Document with rich metadata
                     metadata = {
+                        "file_id": file_id,
                         "filename": filename,
                         "file_type": file_type,
                         "file_path": source_path or filename,
@@ -3058,7 +3105,39 @@ def register_routes(app: FastAPI) -> None:
             extracted_text = "\n\n".join(extracted_text_parts)
 
             if not extracted_text.strip():
-                raise ValueError("No text content extracted from document")
+                # Image with no OCR-extractable text (e.g. photo, illustration, low-quality scan).
+                # Instead of failing, index a synthetic placeholder so the file is still
+                # findable by filename in RAG search. A proper fix would caption the image
+                # with a vision model (GPT-4V, BLIP) — see follow-up.
+                IMAGE_TYPES = {"jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff"}
+                if file_type.lower() in IMAGE_TYPES:
+                    placeholder_text = (
+                        f"[Image file: {filename}]\n"
+                        f"No text could be extracted by OCR. This is likely a photo, "
+                        f"illustration, or diagram without legible text."
+                    )
+                    extracted_text_parts.append(placeholder_text)
+                    extracted_text = placeholder_text
+                    synthetic_meta = {
+                        "file_id": file_id,
+                        "filename": filename,
+                        "file_type": file_type,
+                        "file_path": source_path or filename,
+                        "source_path": source_path,
+                        "source_type": "upload" if not source_path else (source_path.split(":")[0] if ":" in source_path else "upload"),
+                        "element_type": "Image",
+                        "doc_id": doc_id,
+                        "kb_id": kb_id,
+                        "modality": "image",
+                        "has_text": False,
+                    }
+                    if source_path:
+                        parts = source_path.rsplit("/", 1)
+                        synthetic_meta["directory"] = parts[0] if len(parts) > 1 else ""
+                    li_documents.append(LIDocument(text=placeholder_text, metadata=synthetic_meta))
+                    logger.info("image_indexed_as_placeholder", doc_id=doc_id, file_id=file_id, filename=filename)
+                else:
+                    raise ValueError("No text content extracted from document")
 
             # Save extracted text to DB
             with engine.connect() as c:
@@ -3111,6 +3190,29 @@ def register_routes(app: FastAPI) -> None:
             # Wrap in StorageContext — this is what actually makes VectorStoreIndex
             # persist nodes to the vector store (without it, the index is in-memory only)
             storage_context = StorageContext.from_defaults(vector_store=vector_store)
+
+            # Dedup on reindex: delete any existing vectors for this file_id in this KB.
+            # file_id is the stable identity of the file bytes on disk — unlike doc_id,
+            # it survives re-uploads and ties all chunks (document pages, video segments,
+            # image OCR regions) back to one physical file.
+            # PGVectorStore creates tables as data_<table_name>, e.g. data_llamaindex_kb_2.
+            # On first index of a fresh KB the table doesn't exist yet — catch and skip.
+            if file_id:
+                try:
+                    with engine.connect() as c:
+                        deleted = c.execute(
+                            sql_text(
+                                f"DELETE FROM data_{table_name} "
+                                f"WHERE metadata_->>'file_id' = :fid"
+                            ),
+                            {"fid": file_id},
+                        )
+                        c.commit()
+                        logger.info("vector_dedup_prereindex", doc_id=doc_id, file_id=file_id,
+                                    deleted=deleted.rowcount if hasattr(deleted, 'rowcount') else 0)
+                except Exception as e:
+                    # Table doesn't exist yet (first index of this KB) — safe to ignore
+                    logger.info("vector_dedup_skipped", doc_id=doc_id, reason=str(e)[:100])
 
             _update_prog(40)
 
@@ -3291,6 +3393,9 @@ def register_routes(app: FastAPI) -> None:
                         "timestamp_end": meta.get("timestamp_end"),
                         "timestamp": meta.get("timestamp"),
                         "file_type": meta.get("file_type", ""),
+                        # Stable file identity — the sandbox storage UUID, used by
+                        # the backend to serve the raw file via /files/{file_id}.
+                        "file_id": meta.get("file_id", ""),
                     })
 
             except Exception as e:
@@ -3536,9 +3641,26 @@ def register_routes(app: FastAPI) -> None:
             ".mkv": "video/x-matroska",
             ".mov": "video/quicktime",
         }
+        media_type = ct_map.get(ext, "application/octet-stream")
+
+        # For media files (video/audio) and large files, use FileResponse which
+        # supports HTTP range requests natively — browsers need this to seek
+        # inside a 100+ MB video without downloading the entire file first.
+        # Reading the whole file into memory would block and break playback.
+        media_exts = {
+            ".mp4", ".webm", ".mkv", ".mov", ".avi",
+            ".mp3", ".wav", ".m4a", ".ogg", ".flac",
+        }
+        if ext in media_exts or Path(file_path).stat().st_size > 5 * 1024 * 1024:
+            return FileResponse(
+                path=str(file_path),
+                media_type=media_type,
+                headers={"Content-Disposition": "inline"},
+            )
+
         return Response(
             content=Path(file_path).read_bytes(),
-            media_type=ct_map.get(ext, "application/octet-stream"),
+            media_type=media_type,
             headers={"Content-Disposition": "inline"},
         )
 
