@@ -112,6 +112,12 @@ all-databases = [
     "meridyen-sandbox[postgresql,mysql,mssql,oracle,saphana,clickhouse,odbc,snowflake,bigquery,databricks,trino,athena,gsheets,excel,looker,teradata]",
 ]
 
+# Essential connectors for development — much smaller image
+# (~2GB instead of 8GB, faster builds, faster container startup)
+dev-essentials = [
+    "meridyen-sandbox[postgresql,mysql,excel,gsheets]",
+]
+
 # Development tools
 dev = [
     "pytest>=7.4.0",

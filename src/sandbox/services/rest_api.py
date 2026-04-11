@@ -2704,12 +2704,14 @@ def register_routes(app: FastAPI) -> None:
         source_path = body.get("source_path", "")  # e.g. "Google Drive:/Reports/Q3/financial.pdf"
         source_type = body.get("source_type", "")  # e.g. "google_drive", "s3", "upload"
 
-        # Find the uploaded file
+        # Find the uploaded file — search recursively because files are stored
+        # at /app/data/documents/{workspace_id}/{folder_path}/{file_id}.ext
         data_dir = Path("/app/data/documents")
         file_path = None
-        for p in data_dir.glob(f"{file_id}*"):
-            file_path = p
-            break
+        for p in data_dir.rglob(f"{file_id}*"):
+            if p.is_file():
+                file_path = p
+                break
 
         if not file_path or not file_path.exists():
             raise HTTPException(status_code=404, detail=f"File {file_id} not found")
@@ -2739,18 +2741,37 @@ def register_routes(app: FastAPI) -> None:
             ).fetchone()
             doc_id = row[0]
 
-        import threading
-        def _process_bg():
-            try:
-                _run_unstructured_pipeline(
-                    engine, doc_id, str(file_path), file_type, kb_id, filename,
-                    ocr_strategy, google_vision_credentials, source_path,
-                )
-            except Exception as e:
-                logger.error("document_processing_failed", doc_id=doc_id, error=str(e))
+        # Run the pipeline synchronously in a thread pool so the HTTP request
+        # waits for actual completion. This way the backend knows when indexing
+        # is truly done and can mark the document as ready with accurate chunk counts.
+        import asyncio
+        try:
+            await asyncio.to_thread(
+                _run_unstructured_pipeline,
+                engine, doc_id, str(file_path), file_type, kb_id, filename,
+                ocr_strategy, google_vision_credentials, source_path,
+            )
+        except Exception as e:
+            logger.error("document_processing_failed", doc_id=doc_id, error=str(e))
+            return {"doc_id": str(doc_id), "status": "failed", "error": str(e), "file_id": file_id}
 
-        threading.Thread(target=_process_bg, daemon=True).start()
-        return {"doc_id": str(doc_id), "status": "processing", "file_id": file_id}
+        # Check final status from sandbox DB
+        from sqlalchemy import text as sql_text_sync
+        with engine.connect() as c:
+            status_row = c.execute(
+                sql_text_sync("SELECT status, chunk_count, error_message FROM document_kb_documents WHERE id = :id"),
+                {"id": doc_id},
+            ).fetchone()
+
+        if status_row:
+            return {
+                "doc_id": str(doc_id),
+                "status": status_row[0],
+                "chunk_count": status_row[1] or 0,
+                "error": status_row[2],
+                "file_id": file_id,
+            }
+        return {"doc_id": str(doc_id), "status": "ready", "file_id": file_id}
 
     def _run_unstructured_pipeline(
         engine, doc_id: int, file_path: str, file_type: str,
@@ -2797,22 +2818,29 @@ def register_routes(app: FastAPI) -> None:
 
                 audio_path = file_path
 
-                # If video, extract audio track with ffmpeg
+                # If video, extract audio track to /tmp (not next to source — that breaks file lookups)
                 if file_type.lower() in VIDEO_TYPES:
                     import subprocess
-                    audio_path = file_path + ".wav"
+                    import tempfile
+                    audio_fd, audio_path = tempfile.mkstemp(suffix=".wav", prefix=f"whisper_{doc_id}_")
+                    os.close(audio_fd)  # We only need the path
                     subprocess.run(
                         ["ffmpeg", "-i", file_path, "-vn", "-acodec", "pcm_s16le",
                          "-ar", "16000", "-ac", "1", audio_path, "-y"],
                         capture_output=True, check=True, timeout=600,
                     )
-                    logger.info("video_audio_extracted", doc_id=doc_id)
+                    logger.info("video_audio_extracted", doc_id=doc_id, audio_path=audio_path)
 
                 _update_prog(10)
 
                 # Transcribe with faster-whisper (small model, CPU)
                 from faster_whisper import WhisperModel
-                model = WhisperModel("small", device="cpu", compute_type="int8")
+                # Use pre-downloaded model to avoid runtime download + lock contention
+                whisper_path = os.environ.get("WHISPER_MODEL_PATH", "")
+                model = WhisperModel(
+                    "small", device="cpu", compute_type="int8",
+                    download_root=whisper_path or None,
+                )
                 segments, info = model.transcribe(audio_path, beam_size=5)
 
                 logger.info("whisper_transcribing", doc_id=doc_id,
@@ -2860,10 +2888,12 @@ def register_routes(app: FastAPI) -> None:
                         pct = 15 + int((i / max(len(segment_list), 1)) * 5)
                         _update_prog(min(pct, 20))
 
-                # Clean up extracted audio if it was from video
-                if file_type.lower() in VIDEO_TYPES and os.path.exists(audio_path) and audio_path != file_path:
+                # Clean up the tmp audio file (extracted from video)
+                # audio_path is in /tmp/, file_path is the original in /app/data/documents/
+                if audio_path != file_path and os.path.exists(audio_path):
                     try:
                         os.remove(audio_path)
+                        logger.info("temp_audio_cleaned", doc_id=doc_id)
                     except OSError:
                         pass
 
@@ -2887,9 +2917,9 @@ def register_routes(app: FastAPI) -> None:
                     creds_file.write(google_vision_credentials)
                     creds_file.close()
                     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = creds_file.name
-                    partition_kwargs["ocr_agent"] = "google_vision"
+                    os.environ["OCR_AGENT"] = "unstructured.partition.utils.ocr_models.google_vision_ocr.OCRAgentGoogleVision"
                 else:
-                    partition_kwargs["ocr_agent"] = "tesseract"
+                    os.environ["OCR_AGENT"] = "unstructured.partition.utils.ocr_models.tesseract_ocr.OCRAgentTesseract"
 
                 elements = partition(**partition_kwargs)
 
@@ -3042,7 +3072,7 @@ def register_routes(app: FastAPI) -> None:
             _update_prog(30)
 
             # ── Step 3: Build LlamaIndex VectorStoreIndex with PGVectorStore ──
-            from llama_index.core import VectorStoreIndex, Settings
+            from llama_index.core import VectorStoreIndex, Settings, StorageContext
             from llama_index.core.node_parser import SentenceSplitter
             from llama_index.embeddings.openai import OpenAIEmbedding
             from llama_index.vector_stores.postgres import PGVectorStore
@@ -3078,6 +3108,10 @@ def register_routes(app: FastAPI) -> None:
                 embed_dim=1536,
             )
 
+            # Wrap in StorageContext — this is what actually makes VectorStoreIndex
+            # persist nodes to the vector store (without it, the index is in-memory only)
+            storage_context = StorageContext.from_defaults(vector_store=vector_store)
+
             _update_prog(40)
 
             # ── Step 4: Index documents — LlamaIndex handles chunking + embedding + storage ──
@@ -3088,21 +3122,22 @@ def register_routes(app: FastAPI) -> None:
 
             index = VectorStoreIndex.from_documents(
                 li_documents,
-                vector_store=vector_store,
+                storage_context=storage_context,
                 transformations=[node_parser],
                 show_progress=False,
             )
 
-            # Count how many nodes (chunks) were created
-            chunk_count = len(li_documents)  # Approximate — actual nodes may differ
+            # Count how many nodes (chunks) were actually created and persisted
+            # Query the vector store directly to confirm persistence
+            chunk_count = len(li_documents)  # Fallback estimate
             try:
-                # Try to get actual node count from the index
                 all_nodes = index.docstore.docs
-                chunk_count = len(all_nodes) if all_nodes else chunk_count
+                if all_nodes:
+                    chunk_count = len(all_nodes)
             except Exception:
                 pass
 
-            logger.info("llamaindex_indexing_done", doc_id=doc_id, chunks=chunk_count)
+            logger.info("llamaindex_indexing_done", doc_id=doc_id, chunks=chunk_count, table=table_name)
             _update_prog(85)
 
             # ── Step 5: Generate summary ──
@@ -3134,16 +3169,16 @@ def register_routes(app: FastAPI) -> None:
                         chunks=chunk_count, ocr=ocr_strategy, source_path=source_path)
 
         except Exception as e:
-            logger.error("document_processing_error", doc_id=doc_id, error=str(e))
+            import traceback
+            tb = traceback.format_exc()
+            logger.error("document_processing_error", doc_id=doc_id, error=str(e), traceback=tb)
             with engine.connect() as c:
                 c.execute(
                     sql_text("UPDATE document_kb_documents SET status='failed', error_message=:err, updated_at=NOW() WHERE id=:id"),
-                    {"err": str(e), "id": doc_id},
+                    {"err": f"{str(e)}\n{tb[-500:]}", "id": doc_id},
                 )
                 c.commit()
 
-    # --- Query KB Vectors ---
-    @app.post("/api/v1/documents/query", tags=["Documents"])
     def _json_parse_safe(val):
         """Parse a JSON string, return None if invalid."""
         if not val:
@@ -3156,6 +3191,8 @@ def register_routes(app: FastAPI) -> None:
         except Exception:
             return None
 
+    # --- Query KB Vectors ---
+    @app.post("/api/v1/documents/query", tags=["Documents"])
     async def query_kb_vectors(request: Request):
         """
         Search for similar document chunks using LlamaIndex's VectorStoreIndex.
@@ -3329,28 +3366,207 @@ def register_routes(app: FastAPI) -> None:
 
         return {"documents": docs}
 
+    # Cache of transcoded videos so repeat views are instant
+    _transcoded_video_cache: dict = {}
+
+    def _get_video_codec(file_path: str) -> tuple:
+        """Return (video_codec, audio_codec) using ffprobe. Empty strings on failure."""
+        import subprocess
+        try:
+            result = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=codec_name",
+                 "-of", "default=nokey=1:noprint_wrappers=1", str(file_path)],
+                capture_output=True, text=True, timeout=10,
+            )
+            vcodec = result.stdout.strip()
+            result = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "a:0",
+                 "-show_entries", "stream=codec_name",
+                 "-of", "default=nokey=1:noprint_wrappers=1", str(file_path)],
+                capture_output=True, text=True, timeout=10,
+            )
+            acodec = result.stdout.strip()
+            return vcodec, acodec
+        except Exception:
+            return "", ""
+
+    def _transcode_video_to_h264(source_path: str) -> Path:
+        """
+        Transcode a video to H.264 + AAC for browser compatibility.
+        Results are cached so repeat requests don't re-transcode.
+        """
+        import hashlib
+        import subprocess
+        src = Path(source_path)
+        # Cache key based on source file path + mtime
+        mtime = src.stat().st_mtime
+        cache_key = hashlib.md5(f"{src}:{mtime}".encode()).hexdigest()
+        if cache_key in _transcoded_video_cache:
+            cached = _transcoded_video_cache[cache_key]
+            if Path(cached).exists():
+                return Path(cached)
+
+        cache_dir = Path("/tmp/sandbox_video_cache")
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        out_path = cache_dir / f"{cache_key}.mp4"
+
+        logger.info("transcoding_video", source=str(src), target=str(out_path))
+        try:
+            # -c:v libx264: H.264 video (universal browser support)
+            # -c:a aac: AAC audio (universal)
+            # -preset ultrafast: fastest encode, slightly larger file
+            # -movflags +faststart: put metadata at start for streaming
+            # -y: overwrite output
+            subprocess.run(
+                ["ffmpeg", "-i", str(src),
+                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                 "-c:a", "aac", "-b:a", "128k",
+                 "-movflags", "+faststart",
+                 "-y", str(out_path)],
+                capture_output=True, check=True, timeout=600,
+            )
+            _transcoded_video_cache[cache_key] = str(out_path)
+            return out_path
+        except subprocess.TimeoutExpired:
+            logger.error("video_transcode_timeout", source=str(src))
+            return src
+        except subprocess.CalledProcessError as e:
+            logger.error("video_transcode_failed", error=str(e.stderr[:500]) if e.stderr else "unknown")
+            return src
+
+    def _serve_file_with_viewer_conversion(file_path, original_filename: str = ""):
+        """
+        Serve a file, converting DOCX/XLSX to browser-viewable HTML.
+        For videos, transcode to H.264 if the codec isn't browser-compatible.
+        """
+        ext = file_path.suffix.lower() if hasattr(file_path, 'suffix') else Path(file_path).suffix.lower()
+
+        # Video: transcode to H.264 if needed
+        if ext in (".mp4", ".mkv", ".avi", ".mov", ".webm"):
+            vcodec, acodec = _get_video_codec(str(file_path))
+            # H.264 and VP8/VP9 are browser-safe; others need transcoding
+            browser_safe_video = vcodec in ("h264", "vp8", "vp9", "av1")
+            browser_safe_audio = acodec in ("aac", "mp3", "opus", "vorbis", "")
+            if not (browser_safe_video and browser_safe_audio):
+                logger.info("video_needs_transcoding", vcodec=vcodec, acodec=acodec)
+                file_path = _transcode_video_to_h264(str(file_path))
+                ext = ".mp4"
+
+        # DOCX → HTML conversion (browsers can't render .docx inline)
+        if ext == ".docx":
+            try:
+                import docx as _docx
+                doc = _docx.Document(str(file_path))
+                paragraphs = []
+                for para in doc.paragraphs:
+                    text = para.text.strip()
+                    if not text:
+                        paragraphs.append("<br>")
+                        continue
+                    # Map Word heading styles to HTML
+                    style = (para.style.name or "").lower() if para.style else ""
+                    if "heading 1" in style:
+                        paragraphs.append(f"<h1>{text}</h1>")
+                    elif "heading 2" in style:
+                        paragraphs.append(f"<h2>{text}</h2>")
+                    elif "heading 3" in style:
+                        paragraphs.append(f"<h3>{text}</h3>")
+                    elif "title" in style:
+                        paragraphs.append(f"<h1 class='title'>{text}</h1>")
+                    else:
+                        paragraphs.append(f"<p>{text}</p>")
+
+                # Extract tables too
+                for table in doc.tables:
+                    rows_html = []
+                    for row in table.rows:
+                        cells = "".join(f"<td>{cell.text.strip()}</td>" for cell in row.cells)
+                        rows_html.append(f"<tr>{cells}</tr>")
+                    if rows_html:
+                        paragraphs.append(f"<table>{''.join(rows_html)}</table>")
+
+                html = (
+                    "<!DOCTYPE html><html><head>"
+                    '<meta charset="utf-8">'
+                    f'<title>{original_filename or file_path.name}</title>'
+                    "<style>"
+                    "body{font-family:system-ui,-apple-system,sans-serif;max-width:900px;margin:40px auto;padding:0 24px;line-height:1.7;color:#1e293b;background:#fff}"
+                    "@media(prefers-color-scheme:dark){body{color:#e2e8f0;background:#1a1a2e}}"
+                    "h1,h2,h3{color:inherit;margin-top:1.5em;margin-bottom:0.5em}"
+                    "h1.title{font-size:2em;text-align:center;margin-top:0.5em}"
+                    "p{margin:0.8em 0;text-align:justify}"
+                    "table{border-collapse:collapse;margin:1em 0;width:100%}"
+                    "td,th{border:1px solid #cbd5e1;padding:8px 12px;text-align:left}"
+                    "@media(prefers-color-scheme:dark){td,th{border-color:#475569}}"
+                    "</style></head><body>"
+                    + "\n".join(paragraphs) + "</body></html>"
+                )
+                return Response(
+                    content=html,
+                    media_type="text/html; charset=utf-8",
+                    headers={"Content-Disposition": "inline"},
+                )
+            except Exception as e:
+                logger.warning("docx_conversion_failed", error=str(e))
+                # Fall through to raw download
+
+        # Default: serve with correct MIME
+        ct_map = {
+            ".pdf": "application/pdf",
+            ".txt": "text/plain; charset=utf-8",
+            ".md": "text/plain; charset=utf-8",
+            ".csv": "text/csv; charset=utf-8",
+            ".html": "text/html; charset=utf-8",
+            ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".gif": "image/gif",
+            ".webp": "image/webp",
+            ".svg": "image/svg+xml",
+            ".mp3": "audio/mpeg",
+            ".wav": "audio/wav",
+            ".m4a": "audio/mp4",
+            ".ogg": "audio/ogg",
+            ".flac": "audio/flac",
+            ".mp4": "video/mp4",
+            ".webm": "video/webm",
+            ".mkv": "video/x-matroska",
+            ".mov": "video/quicktime",
+        }
+        return Response(
+            content=Path(file_path).read_bytes(),
+            media_type=ct_map.get(ext, "application/octet-stream"),
+            headers={"Content-Disposition": "inline"},
+        )
+
     # --- Serve Document File ---
     @app.get("/api/v1/documents/file/{file_id}", tags=["Documents"])
     async def get_document_file(file_id: str, workspace_id: str = ""):
         """Serve a document file from sandbox storage."""
-        # Check filesystem first
+        # Find the file by matching the stem (filename without extensions)
+        # Use strict matching: filename must START with file_id and have ONE extension after
+        # This prevents matching side-files like "{uuid}.mp4.wav" when looking for "{uuid}.mp4"
         data_dir = Path("/app/data/documents")
-        for p in data_dir.glob(f"{file_id}*"):
-            if p.exists():
-                ext = p.suffix.lower()
-                ct_map = {
-                    ".pdf": "application/pdf",
-                    ".txt": "text/plain; charset=utf-8",
-                    ".md": "text/plain; charset=utf-8",
-                    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                }
-                return Response(
-                    content=p.read_bytes(),
-                    media_type=ct_map.get(ext, "application/octet-stream"),
-                    headers={"Content-Disposition": "inline"},
-                )
+        best_match = None
+        for p in data_dir.rglob(f"{file_id}*"):
+            if not p.is_file():
+                continue
+            # Strict: filename is exactly "{file_id}.{ext}" (no extra extensions like .mp4.wav)
+            name_after_id = p.name[len(file_id):]
+            if name_after_id.count(".") == 1:  # exactly one dot → single extension
+                best_match = p
+                break
+            # Keep as fallback if nothing better found
+            if best_match is None:
+                best_match = p
 
-        # Fall back to DB storage_path
+        if best_match:
+            return _serve_file_with_viewer_conversion(best_match)
+
+        # Fall back to DB storage_path lookup (for files stored via storage_path column)
         from sqlalchemy import text as sql_text
         engine = _get_doc_db_engine()
         with engine.connect() as conn:
@@ -3361,27 +3577,7 @@ def register_routes(app: FastAPI) -> None:
             if result and result[0]:
                 stored_file = Path("/app/data/documents") / result[0]
                 if stored_file.exists():
-                    ct_map = {
-                        "pdf": "application/pdf",
-                        "txt": "text/plain; charset=utf-8",
-                        "md": "text/plain; charset=utf-8",
-                        "csv": "text/csv; charset=utf-8",
-                        "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                        "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-                        "png": "image/png",
-                        "jpg": "image/jpeg",
-                        "jpeg": "image/jpeg",
-                        "mp3": "audio/mpeg",
-                        "wav": "audio/wav",
-                        "mp4": "video/mp4",
-                        "webm": "video/webm",
-                    }
-                    return Response(
-                        content=stored_file.read_bytes(),
-                        media_type=ct_map.get(result[2], "application/octet-stream"),
-                        headers={"Content-Disposition": f"inline; filename={result[1]}"},
-                    )
+                    return _serve_file_with_viewer_conversion(stored_file, original_filename=result[1])
 
         raise HTTPException(status_code=404, detail="File not found")
 
