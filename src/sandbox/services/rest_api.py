@@ -2703,6 +2703,9 @@ def register_routes(app: FastAPI) -> None:
         google_vision_credentials = body.get("google_vision_credentials")  # JSON string
         source_path = body.get("source_path", "")  # e.g. "Google Drive:/Reports/Q3/financial.pdf"
         source_type = body.get("source_type", "")  # e.g. "google_drive", "s3", "upload"
+        # Indexing job id — forwarded to backend vision callbacks so tokens
+        # are attributed to the user/workspace/org that triggered the job.
+        job_id = body.get("job_id", "") or ""
 
         # Find the uploaded file — search recursively because files are stored
         # at /app/data/documents/{workspace_id}/{folder_path}/{file_id}.ext
@@ -2784,7 +2787,7 @@ def register_routes(app: FastAPI) -> None:
                 _run_unstructured_pipeline,
                 engine, doc_id, str(file_path), file_type, kb_id, filename,
                 ocr_strategy, google_vision_credentials, source_path,
-                file_id,
+                file_id, job_id,
             )
         except Exception as e:
             logger.error("document_processing_failed", doc_id=doc_id, error=str(e))
@@ -2808,6 +2811,98 @@ def register_routes(app: FastAPI) -> None:
             }
         return {"doc_id": str(doc_id), "status": "ready", "file_id": file_id}
 
+    def _vision_caption_image(
+        file_path: str,
+        filename: str,
+        job_id: str = "",
+    ) -> tuple[str, str]:
+        """
+        Request an image caption from the backend's internal vision endpoint.
+
+        The backend owns model selection (from Settings/Models UI), API keys,
+        and token accounting via LLMHelper → TokenAccumulator. Passing
+        `job_id` lets the backend attribute the tokens to the user/workspace/
+        organization that triggered the indexing job.
+
+        Returns (description, visible_text). Both empty strings on failure —
+        caller should fall back to a plain filename placeholder.
+        """
+        import base64
+        import httpx
+
+        backend_url = (
+            os.environ.get("MERIDYEN_BACKEND_URL")
+            or os.environ.get("BACKEND_URL")
+            or "http://backend_cloud_dev:8000"
+        )
+        internal_secret = (
+            os.environ.get("INTERNAL_BACKEND_SECRET")
+            or os.environ.get("SANDBOX_API_KEY")
+            or ""
+        )
+
+        try:
+            with open(file_path, "rb") as f:
+                img_bytes = f.read()
+        except Exception as e:
+            logger.warning("vision_caption_read_failed", filename=filename, error=str(e))
+            return "", ""
+
+        ext = Path(file_path).suffix.lower().lstrip(".")
+        mime_map = {
+            "jpg": "image/jpeg", "jpeg": "image/jpeg",
+            "png": "image/png", "gif": "image/gif",
+            "webp": "image/webp", "bmp": "image/bmp", "tiff": "image/tiff",
+        }
+        mime = mime_map.get(ext, "image/jpeg")
+        b64 = base64.b64encode(img_bytes).decode("ascii")
+
+        try:
+            with httpx.Client(timeout=90.0) as client:
+                resp = client.post(
+                    f"{backend_url.rstrip('/')}/api/internal/vision/caption",
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Internal-Secret": internal_secret,
+                    },
+                    json={
+                        "job_id": job_id or "",
+                        "filename": filename,
+                        "mime": mime,
+                        "image_base64": b64,
+                    },
+                )
+        except Exception as e:
+            logger.warning("vision_caption_request_failed", filename=filename, error=str(e))
+            return "", ""
+
+        if resp.status_code != 200:
+            logger.warning(
+                "vision_caption_http_error",
+                filename=filename,
+                status=resp.status_code,
+                body=resp.text[:200],
+            )
+            return "", ""
+
+        try:
+            data = resp.json()
+            description = (data.get("description") or "").strip()
+            visible_text = (data.get("visible_text") or "").strip()
+            logger.info(
+                "vision_caption_ok",
+                filename=filename,
+                desc_len=len(description),
+                text_len=len(visible_text),
+                model=data.get("model_name", ""),
+                total_tokens=data.get("total_tokens", 0),
+                job_id=job_id or "",
+            )
+            return description, visible_text
+        except Exception as e:
+            logger.warning("vision_caption_parse_failed", filename=filename, error=str(e))
+            return "", ""
+
     def _run_unstructured_pipeline(
         engine, doc_id: int, file_path: str, file_type: str,
         kb_id: int, filename: str,
@@ -2815,6 +2910,7 @@ def register_routes(app: FastAPI) -> None:
         google_vision_credentials: str | None = None,
         source_path: str = "",
         file_id: str = "",
+        job_id: str = "",
     ):
         """
         Document processing pipeline using Unstructured (parsing) + LlamaIndex (indexing).
@@ -2943,9 +3039,19 @@ def register_routes(app: FastAPI) -> None:
 
                 from unstructured.partition.auto import partition
 
+                # Use Unstructured's built-in chunker — it knows heading/table/list
+                # boundaries from the document's actual structure, which beats
+                # re-discovering them from plain text downstream. "by_title" starts
+                # a new chunk at each heading, merges short sections, and keeps
+                # tables intact.
                 partition_kwargs = {
                     "filename": file_path,
                     "strategy": "hi_res",
+                    "chunking_strategy": "by_title",
+                    "max_characters": 1000,              # hard cap per chunk (~250 tokens)
+                    "new_after_n_chars": 900,            # soft cap — try to break earlier
+                    "combine_text_under_n_chars": 500,   # merge tiny sections into neighbors
+                    "overlap": 100,                      # char overlap between consecutive chunks
                 }
 
                 if ocr_strategy == "google_vision" and google_vision_credentials:
@@ -2961,7 +3067,59 @@ def register_routes(app: FastAPI) -> None:
                 elements = partition(**partition_kwargs)
 
                 if not elements:
-                    raise ValueError("Unstructured could not extract any content from the document")
+                    # Image with no OCR-extractable text — don't fail. Try a vision
+                    # LLM first (describes the image + reads any visible text), then
+                    # fall back to a filename-only placeholder if the vision call fails.
+                    IMAGE_TYPES_EARLY = {"jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff"}
+                    if file_type.lower() in IMAGE_TYPES_EARLY:
+                        description, visible_text = _vision_caption_image(file_path, filename, job_id=job_id)
+                        if description or visible_text:
+                            # Build a searchable chunk from the vision output. Include
+                            # both the description (for semantic queries like "dashboard")
+                            # and any literal visible text (for queries like "Cell Surge").
+                            chunk_text = f"[Image: {filename}]"
+                            if description:
+                                chunk_text += f"\n\n{description}"
+                            if visible_text:
+                                chunk_text += f"\n\nVisible text in image:\n{visible_text}"
+                            has_text = True
+                            modality = "image"
+                            log_event = "image_indexed_with_vision_llm"
+                        else:
+                            # Vision call failed — fall back to plain placeholder so
+                            # the file remains findable by filename at least.
+                            chunk_text = (
+                                f"[Image file: {filename}]\n"
+                                f"No text could be extracted by OCR and the vision fallback "
+                                f"failed. Likely a photo, illustration, or diagram."
+                            )
+                            has_text = False
+                            modality = "image"
+                            log_event = "image_indexed_as_placeholder_early"
+
+                        extracted_text_parts.append(chunk_text)
+                        synthetic_meta = {
+                            "file_id": file_id,
+                            "filename": filename,
+                            "file_type": file_type,
+                            "file_path": source_path or filename,
+                            "source_path": source_path,
+                            "source_type": "upload" if not source_path else (source_path.split(":")[0] if ":" in source_path else "upload"),
+                            "element_type": "Image",
+                            "doc_id": doc_id,
+                            "kb_id": kb_id,
+                            "chunk_index": 0,
+                            "modality": modality,
+                            "has_text": has_text,
+                        }
+                        if source_path:
+                            parts = source_path.rsplit("/", 1)
+                            synthetic_meta["directory"] = parts[0] if len(parts) > 1 else ""
+                        li_documents.append(LIDocument(text=chunk_text, metadata=synthetic_meta))
+                        logger.info(log_event, doc_id=doc_id, file_id=file_id, filename=filename)
+                        elements = []
+                    else:
+                        raise ValueError("Unstructured could not extract any content from the document")
 
                 # For PDFs: extract word-level bounding boxes using PyMuPDF
                 # Unstructured handles parsing/OCR, PyMuPDF provides precise word positions
@@ -2992,6 +3150,7 @@ def register_routes(app: FastAPI) -> None:
 
                 # Track running character offset for highlight positioning
                 char_offset = 0
+                chunk_index = 0  # 0-based position of this chunk within the file
 
                 for el in elements:
                     # Some Unstructured elements (e.g. Image elements from OCR with no
@@ -3008,19 +3167,36 @@ def register_routes(app: FastAPI) -> None:
                         continue
 
                     el_type = type(el).__name__
-                    page_num = el.metadata.page_number if hasattr(el.metadata, 'page_number') else None
 
-                    # PPTX: page_number = slide number
-                    # XLSX: page_name = sheet name
-                    page_name = getattr(el.metadata, 'page_name', None)  # Sheet name for XLSX
+                    # With chunking_strategy="by_title", elements are CompositeElements
+                    # that aggregate multiple atomic elements. Representative page/bbox
+                    # come from the first orig_element; char offsets in pdf_page_words
+                    # don't map cleanly across the composite, so we only stamp
+                    # page-level metadata and rely on text search for in-page highlighting.
+                    orig_elements = getattr(el.metadata, 'orig_elements', None) or []
+                    first_orig = orig_elements[0] if orig_elements else el
 
-                    # Extract bounding box coordinates from Unstructured (hi_res strategy)
+                    page_num = None
+                    if hasattr(first_orig, 'metadata') and hasattr(first_orig.metadata, 'page_number'):
+                        page_num = first_orig.metadata.page_number
+                    elif hasattr(el.metadata, 'page_number'):
+                        page_num = el.metadata.page_number
+
+                    # PPTX: page_number = slide number; XLSX: page_name = sheet name
+                    page_name = getattr(el.metadata, 'page_name', None)
+                    if not page_name and hasattr(first_orig, 'metadata'):
+                        page_name = getattr(first_orig.metadata, 'page_name', None)
+
+                    # Bounding box from the first original element (approximate — the
+                    # composite may span several paragraphs). Viewer uses text search
+                    # for precise highlighting anyway.
                     bbox = None
                     page_width = None
                     page_height = None
-                    coords = getattr(el.metadata, 'coordinates', None)
+                    coords = None
+                    if hasattr(first_orig, 'metadata'):
+                        coords = getattr(first_orig.metadata, 'coordinates', None)
                     if coords and coords.points and coords.system:
-                        # points is list of (x, y) tuples defining the bounding polygon
                         pts = coords.points
                         x_vals = [p[0] for p in pts]
                         y_vals = [p[1] for p in pts]
@@ -3029,14 +3205,6 @@ def register_routes(app: FastAPI) -> None:
                         page_width = round(coords.system.width, 1) if hasattr(coords.system, 'width') else None
                         page_height = round(coords.system.height, 1) if hasattr(coords.system, 'height') else None
 
-                    # Format special elements for better context
-                    if el_type == "Table":
-                        text = f"[TABLE]\n{text}\n[/TABLE]"
-                    elif el_type == "Title":
-                        text = f"## {text}"
-                    elif el_type == "Image":
-                        text = f"[IMAGE TEXT] {text} [/IMAGE TEXT]"
-
                     # Track start/end char positions in the full extracted_text
                     start_char = char_offset
                     end_char = char_offset + len(text)
@@ -3044,7 +3212,9 @@ def register_routes(app: FastAPI) -> None:
 
                     extracted_text_parts.append(text)
 
-                    # Create LlamaIndex Document with rich metadata
+                    # Composite-chunk metadata. element_type is the first orig element's
+                    # type so we can still distinguish "starts with a table" vs "narrative".
+                    first_orig_type = type(first_orig).__name__ if first_orig is not el else el_type
                     metadata = {
                         "file_id": file_id,
                         "filename": filename,
@@ -3052,48 +3222,23 @@ def register_routes(app: FastAPI) -> None:
                         "file_path": source_path or filename,
                         "source_path": source_path,
                         "source_type": "upload" if not source_path else source_path.split(":")[0] if ":" in source_path else "upload",
-                        "element_type": el_type,
+                        "element_type": first_orig_type,
                         "doc_id": doc_id,
                         "kb_id": kb_id,
+                        "chunk_index": chunk_index,  # 0-based position for neighbor-fetching
                         "start_char": start_char,
                         "end_char": end_char,
                     }
                     if page_num is not None:
                         metadata["page_num"] = page_num
                     if page_name:
-                        metadata["page_name"] = page_name  # Sheet name (XLSX) or slide label (PPTX)
-
-                    # For PDFs: map element text to word-level bounding boxes
-                    if page_num and page_num in pdf_page_words:
-                        page_data = pdf_page_words[page_num]
-                        page_words_list = page_data["words"]
-                        pw = page_data["page_width"]
-                        ph = page_data["page_height"]
-                        metadata["page_width"] = pw
-                        metadata["page_height"] = ph
-
-                        # Find matching words on this page for this element's text
-                        el_text_clean = str(el).replace("\n", " ").strip()
-                        el_first_words = el_text_clean.split()[:3]
-                        page_word_texts = [w["text"] for w in page_words_list]
-
-                        matched_bboxes = []
-                        for si in range(len(page_word_texts)):
-                            if page_word_texts[si:si + len(el_first_words)] == el_first_words:
-                                # Found start — collect word bboxes for the element length
-                                end_idx = min(si + len(el_text_clean.split()) + 5, len(page_words_list))
-                                matched_bboxes = [{"bbox": w["bbox"]} for w in page_words_list[si:end_idx]]
-                                break
-
-                        if matched_bboxes:
-                            import json as _json2
-                            metadata["word_positions_json"] = _json2.dumps({
-                                "page_num": page_num,
-                                "page_width": pw,
-                                "page_height": ph,
-                                "word_count": len(matched_bboxes),
-                                "words": matched_bboxes[:200],  # Limit to 200 words max
-                            })
+                        metadata["page_name"] = page_name
+                    if bbox:
+                        metadata["bbox"] = bbox
+                    if page_width:
+                        metadata["page_width"] = page_width
+                    if page_height:
+                        metadata["page_height"] = page_height
 
                     # Extract directory path from source_path for folder-level filtering
                     if source_path:
@@ -3101,23 +3246,36 @@ def register_routes(app: FastAPI) -> None:
                         metadata["directory"] = parts[0] if len(parts) > 1 else ""
 
                     li_documents.append(LIDocument(text=text, metadata=metadata))
+                    chunk_index += 1
 
             extracted_text = "\n\n".join(extracted_text_parts)
 
             if not extracted_text.strip():
-                # Image with no OCR-extractable text (e.g. photo, illustration, low-quality scan).
-                # Instead of failing, index a synthetic placeholder so the file is still
-                # findable by filename in RAG search. A proper fix would caption the image
-                # with a vision model (GPT-4V, BLIP) — see follow-up.
+                # Images whose elements produced no text: try vision LLM before
+                # falling back to a filename-only placeholder. Matches the early
+                # `if not elements` branch behavior above.
                 IMAGE_TYPES = {"jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff"}
                 if file_type.lower() in IMAGE_TYPES:
-                    placeholder_text = (
-                        f"[Image file: {filename}]\n"
-                        f"No text could be extracted by OCR. This is likely a photo, "
-                        f"illustration, or diagram without legible text."
-                    )
-                    extracted_text_parts.append(placeholder_text)
-                    extracted_text = placeholder_text
+                    description, visible_text = _vision_caption_image(file_path, filename, job_id=job_id)
+                    if description or visible_text:
+                        chunk_text = f"[Image: {filename}]"
+                        if description:
+                            chunk_text += f"\n\n{description}"
+                        if visible_text:
+                            chunk_text += f"\n\nVisible text in image:\n{visible_text}"
+                        has_text = True
+                        log_event = "image_indexed_with_vision_llm"
+                    else:
+                        chunk_text = (
+                            f"[Image file: {filename}]\n"
+                            f"No text could be extracted by OCR and the vision fallback "
+                            f"failed. Likely a photo, illustration, or diagram."
+                        )
+                        has_text = False
+                        log_event = "image_indexed_as_placeholder"
+
+                    extracted_text_parts.append(chunk_text)
+                    extracted_text = chunk_text
                     synthetic_meta = {
                         "file_id": file_id,
                         "filename": filename,
@@ -3128,14 +3286,15 @@ def register_routes(app: FastAPI) -> None:
                         "element_type": "Image",
                         "doc_id": doc_id,
                         "kb_id": kb_id,
+                        "chunk_index": 0,
                         "modality": "image",
-                        "has_text": False,
+                        "has_text": has_text,
                     }
                     if source_path:
                         parts = source_path.rsplit("/", 1)
                         synthetic_meta["directory"] = parts[0] if len(parts) > 1 else ""
-                    li_documents.append(LIDocument(text=placeholder_text, metadata=synthetic_meta))
-                    logger.info("image_indexed_as_placeholder", doc_id=doc_id, file_id=file_id, filename=filename)
+                    li_documents.append(LIDocument(text=chunk_text, metadata=synthetic_meta))
+                    logger.info(log_event, doc_id=doc_id, file_id=file_id, filename=filename)
                 else:
                     raise ValueError("No text content extracted from document")
 
@@ -3164,8 +3323,8 @@ def register_routes(app: FastAPI) -> None:
                 dimensions=1536,
                 api_key=openai_key,
             )
-            Settings.chunk_size = 512
-            Settings.chunk_overlap = 50
+            Settings.chunk_size = 1024
+            Settings.chunk_overlap = 128
 
             # Connect LlamaIndex to sandbox postgres via PGVectorStore
             db_host = os.environ.get("SANDBOX_UPLOAD_DB_HOST", "sandbox-postgres")
@@ -3217,8 +3376,11 @@ def register_routes(app: FastAPI) -> None:
             _update_prog(40)
 
             # ── Step 4: Index documents — LlamaIndex handles chunking + embedding + storage ──
-            # SentenceSplitter respects element boundaries better than character splitting
-            node_parser = SentenceSplitter(chunk_size=512, chunk_overlap=50)
+            # SentenceSplitter respects element boundaries better than character splitting.
+            # 1024 tokens (~700 words, ~1 page) with 128 overlap: each chunk is usually
+            # self-contained enough to answer a question without needing neighbors, while
+            # still fitting ~8x inside text-embedding-3-small's 8192 token budget.
+            node_parser = SentenceSplitter(chunk_size=1024, chunk_overlap=128)
 
             logger.info("llamaindex_indexing_start", doc_id=doc_id, documents=len(li_documents))
 
@@ -3396,6 +3558,9 @@ def register_routes(app: FastAPI) -> None:
                         # Stable file identity — the sandbox storage UUID, used by
                         # the backend to serve the raw file via /files/{file_id}.
                         "file_id": meta.get("file_id", ""),
+                        # Position of this chunk within its file — lets the agent
+                        # request surrounding context via /chunks/neighbors.
+                        "chunk_index": meta.get("chunk_index"),
                     })
 
             except Exception as e:
@@ -3406,6 +3571,79 @@ def register_routes(app: FastAPI) -> None:
         all_chunks = all_chunks[:top_k]
 
         return {"chunks": all_chunks}
+
+    # --- Fetch Neighboring Chunks ---
+    # Returns chunks immediately before/after a given chunk within the same file.
+    # Lets the agent request surrounding context on demand ("small-to-big" retrieval).
+    @app.post("/api/v1/documents/chunks/neighbors", tags=["Documents"])
+    async def get_chunk_neighbors(request: Request):
+        """
+        Fetch chunks surrounding a target chunk by (kb_id, file_id, chunk_index).
+        Body: {"kb_id": 2, "file_id": "abc-...", "chunk_index": 12, "window": 2}
+        Returns up to 2*window neighbors, ordered by chunk_index.
+        """
+        from sqlalchemy import text as sql_text
+
+        body = await request.json()
+        kb_id = int(body.get("kb_id", 0))
+        file_id = body.get("file_id", "")
+        chunk_index = int(body.get("chunk_index", 0))
+        window = int(body.get("window", 2))
+        # Clamp window to avoid huge range queries
+        window = max(1, min(window, 10))
+
+        if not kb_id or not file_id:
+            return {"chunks": []}
+
+        table_name = f"llamaindex_kb_{kb_id}"
+        engine = _get_doc_db_engine()
+        try:
+            with engine.connect() as c:
+                # Query vectors where file_id matches and chunk_index is in the window.
+                # chunk_index is stored as a JSON number in metadata_ so we cast to int.
+                result = c.execute(
+                    sql_text(
+                        f"""
+                        SELECT text, metadata_
+                        FROM data_{table_name}
+                        WHERE metadata_->>'file_id' = :fid
+                          AND (metadata_->>'chunk_index')::int BETWEEN :lo AND :hi
+                          AND (metadata_->>'chunk_index')::int != :current
+                        ORDER BY (metadata_->>'chunk_index')::int ASC
+                        """
+                    ),
+                    {
+                        "fid": file_id,
+                        "lo": chunk_index - window,
+                        "hi": chunk_index + window,
+                        "current": chunk_index,
+                    },
+                )
+                rows = result.fetchall()
+        except Exception as e:
+            import traceback
+            logger.warning(
+                "chunk_neighbors_query_failed",
+                error=str(e),
+                file_id=file_id,
+                traceback=traceback.format_exc()[:500],
+            )
+            return {"chunks": []}
+
+        chunks = []
+        for row in rows:
+            text = row[0]
+            meta = row[1] if isinstance(row[1], dict) else {}
+            chunks.append({
+                "content": text,
+                "chunk_index": int(meta.get("chunk_index", -1)) if meta.get("chunk_index") is not None else None,
+                "file_id": meta.get("file_id", ""),
+                "filename": meta.get("filename", ""),
+                "file_type": meta.get("file_type", ""),
+                "page_num": meta.get("page_num"),
+                "element_type": meta.get("element_type", ""),
+            })
+        return {"chunks": chunks, "file_id": file_id, "target_index": chunk_index, "window": window}
 
     # --- KB Status ---
     @app.get("/api/v1/documents/kb-status", tags=["Documents"])
