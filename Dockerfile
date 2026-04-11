@@ -47,18 +47,36 @@ COPY pyproject.toml ./
 COPY README.md ./
 COPY src/sandbox/__init__.py src/sandbox/
 
-# Create virtual environment
-RUN python -m venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
+# Install uv — a rust-based pip replacement that resolves dependencies ~50x faster.
+# pip's resolver spends 10+ minutes backtracking on the unstructured+llama-index+torch
+# dependency graph. uv resolves the same graph in ~15 seconds.
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    pip install --upgrade pip uv
 
-# Install Python dependencies with pip cache mount — huge speedup for rebuilds
+# Create virtual environment using uv (drop-in for python -m venv)
+RUN uv venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH" \
+    VIRTUAL_ENV=/opt/venv \
+    UV_LINK_MODE=copy
+
+# Install CPU-only torch BEFORE unstructured — otherwise unstructured[image] will pull
+# the default GPU torch wheel, which drags in ~6GB of nvidia-*-cu12 CUDA libraries that
+# we don't need (sandbox runs CPU-only inference). Pinning CPU torch first makes
+# unstructured+detectron2 reuse it via uv's resolver.
+RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
+    uv pip install --index-strategy unsafe-best-match \
+        --extra-index-url https://download.pytorch.org/whl/cpu \
+        "torch>=2.1.0" "torchvision>=0.16.0"
+
+# Install Python dependencies with uv. The uv cache mount replaces pip's cache.
 # DEPS_EXTRA controls which DB connectors to install:
 #   - "all-databases" (default, full production) — ~8GB venv
 #   - "dev-essentials" (postgres+mysql+excel+gsheets) — ~2GB venv, much faster build
 ARG DEPS_EXTRA=all-databases
-RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
-    pip install --upgrade pip setuptools wheel && \
-    pip install ".[${DEPS_EXTRA}]"
+RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
+    uv pip install --index-strategy unsafe-best-match \
+        --extra-index-url https://download.pytorch.org/whl/cpu \
+        ".[${DEPS_EXTRA}]"
 
 # Pre-download spaCy English model (required by Unstructured for hi_res PDF parsing)
 # Installs at build time so sandbox user doesn't need write access at runtime
@@ -66,7 +84,9 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     python -m spacy download en_core_web_sm
 
 # Pre-download faster-whisper small model (avoids runtime download + lock contention)
-RUN python -c "from faster_whisper import WhisperModel; WhisperModel('small', device='cpu', compute_type='int8', download_root='/opt/whisper_models')"
+# Cache mount stores the HuggingFace hub download so rebuilds don't re-fetch 500MB.
+RUN --mount=type=cache,target=/root/.cache/huggingface,sharing=locked \
+    python -c "from faster_whisper import WhisperModel; WhisperModel('small', device='cpu', compute_type='int8', download_root='/opt/whisper_models')"
 ENV WHISPER_MODEL_PATH=/opt/whisper_models
 
 # -----------------------------------------------------------------------------
