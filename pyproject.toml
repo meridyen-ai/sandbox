@@ -115,7 +115,7 @@ all-databases = [
 # Essential connectors for development — much smaller image
 # (~2GB instead of 8GB, faster builds, faster container startup)
 dev-essentials = [
-    "meridyen-sandbox[postgresql,mysql,excel,gsheets]",
+    "meridyen-sandbox[postgresql,mysql,mssql,excel,gsheets]",
 ]
 
 # Development tools
