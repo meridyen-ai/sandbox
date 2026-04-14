@@ -2483,6 +2483,1479 @@ def register_routes(app: FastAPI) -> None:
             raise HTTPException(status_code=502, detail=str(e))
 
     # ==========================================================================
+    # Document Knowledge Base APIs
+    # ==========================================================================
+    # These endpoints store document files, KB vectors, and chunks in the
+    # sandbox's own PostgreSQL (with pgvector). This keeps user data on their
+    # infrastructure for security.
+
+    def _get_doc_db_engine():
+        """Reuse the sandbox's upload DB engine for document KB storage."""
+        return _get_api_key_engine()
+
+    def _ensure_doc_kb_tables():
+        """Create document KB tables with pgvector in sandbox postgres. Idempotent."""
+        from sqlalchemy import text as sql_text
+        engine = _get_doc_db_engine()
+        with engine.connect() as conn:
+            try:
+                conn.execute(sql_text("CREATE EXTENSION IF NOT EXISTS vector"))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+
+            conn.execute(sql_text("""
+                CREATE TABLE IF NOT EXISTS document_knowledge_bases (
+                    id SERIAL PRIMARY KEY,
+                    workspace_id TEXT,
+                    connection_id TEXT,
+                    name VARCHAR(200) NOT NULL,
+                    description TEXT,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+
+            conn.execute(sql_text("""
+                CREATE TABLE IF NOT EXISTS document_kb_documents (
+                    id SERIAL PRIMARY KEY,
+                    knowledge_base_id INTEGER NOT NULL REFERENCES document_knowledge_bases(id) ON DELETE CASCADE,
+                    filename VARCHAR(500) NOT NULL,
+                    file_type VARCHAR(20) NOT NULL,
+                    file_size INTEGER,
+                    storage_path TEXT,
+                    source_path TEXT,
+                    source_type VARCHAR(50),
+                    status VARCHAR(20) DEFAULT 'pending',
+                    error_message TEXT,
+                    extracted_text TEXT,
+                    summary TEXT,
+                    chunk_count INTEGER DEFAULT 0,
+                    progress INTEGER DEFAULT 0,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+
+            # Migration: replace file_data BYTEA with storage_path
+            for col_sql in [
+                "ALTER TABLE document_kb_documents ADD COLUMN IF NOT EXISTS storage_path TEXT",
+                "ALTER TABLE document_kb_documents DROP COLUMN IF EXISTS file_data",
+            ]:
+                try:
+                    conn.execute(sql_text(col_sql))
+                except Exception:
+                    pass
+
+            # Migration: add path columns if table already exists
+            for col_sql in [
+                "ALTER TABLE document_kb_documents ADD COLUMN IF NOT EXISTS source_path TEXT",
+                "ALTER TABLE document_kb_documents ADD COLUMN IF NOT EXISTS source_type VARCHAR(50)",
+            ]:
+                try:
+                    conn.execute(sql_text(col_sql))
+                except Exception:
+                    pass
+
+            conn.execute(sql_text("""
+                CREATE TABLE IF NOT EXISTS document_kb_chunks (
+                    id SERIAL PRIMARY KEY,
+                    document_id INTEGER NOT NULL REFERENCES document_kb_documents(id) ON DELETE CASCADE,
+                    knowledge_base_id INTEGER NOT NULL REFERENCES document_knowledge_bases(id) ON DELETE CASCADE,
+                    chunk_index INTEGER NOT NULL,
+                    content TEXT NOT NULL,
+                    token_count INTEGER,
+                    embedding vector(1536),
+                    page_num INTEGER,
+                    word_positions JSONB,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+
+            # Indexes
+            for idx_sql in [
+                "CREATE INDEX IF NOT EXISTS idx_dkb_ws ON document_knowledge_bases(workspace_id)",
+                "CREATE INDEX IF NOT EXISTS idx_dkbd_kb ON document_kb_documents(knowledge_base_id)",
+                "CREATE INDEX IF NOT EXISTS idx_dkbd_status ON document_kb_documents(status)",
+                "CREATE INDEX IF NOT EXISTS idx_dkbc_doc ON document_kb_chunks(document_id)",
+                "CREATE INDEX IF NOT EXISTS idx_dkbc_kb ON document_kb_chunks(knowledge_base_id)",
+            ]:
+                conn.execute(sql_text(idx_sql))
+
+            try:
+                conn.execute(sql_text("""
+                    CREATE INDEX IF NOT EXISTS idx_dkbc_embedding
+                    ON document_kb_chunks USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)
+                """))
+            except Exception:
+                pass
+
+            conn.commit()
+        logger.info("document_kb_tables_ensured")
+
+    # Initialize tables on startup
+    try:
+        _ensure_doc_kb_tables()
+    except Exception as e:
+        logger.warning("document_kb_tables_init_failed", error=str(e))
+
+    # --- Create Knowledge Base ---
+    @app.post("/api/v1/documents/create-kb", tags=["Documents"])
+    async def create_knowledge_base(request: Request):
+        """Create a new knowledge base."""
+        from sqlalchemy import text as sql_text
+        body = await request.json()
+        name = body.get("name", "Untitled KB")
+        description = body.get("description", "")
+        workspace_id = body.get("workspace_id", "")
+        connection_id = body.get("connection_id", "")
+
+        engine = _get_doc_db_engine()
+        with engine.connect() as conn:
+            # Check if already exists for this connection
+            if connection_id:
+                row = conn.execute(
+                    sql_text("SELECT id FROM document_knowledge_bases WHERE connection_id = :cid"),
+                    {"cid": connection_id},
+                ).fetchone()
+                if row:
+                    return {"kb_id": str(row[0]), "name": name, "status": "exists"}
+
+            conn.execute(
+                sql_text("""
+                    INSERT INTO document_knowledge_bases (workspace_id, connection_id, name, description)
+                    VALUES (:ws, :cid, :name, :desc)
+                """),
+                {"ws": workspace_id, "cid": connection_id, "name": name, "desc": description},
+            )
+            conn.commit()
+            row = conn.execute(
+                sql_text("SELECT id FROM document_knowledge_bases WHERE connection_id = :cid ORDER BY id DESC LIMIT 1"),
+                {"cid": connection_id or f"auto-{uuid.uuid4()}"},
+            ).fetchone()
+            kb_id = str(row[0]) if row else "0"
+
+        return {"kb_id": kb_id, "name": name, "status": "created"}
+
+    # --- Upload Document ---
+    @app.post("/api/v1/documents/upload", tags=["Documents"])
+    async def upload_document(
+        file: UploadFile = File(...),
+        workspace_id: str = Form(""),
+        folder_path: str = Form(""),
+    ):
+        """
+        Upload a document file to the sandbox filesystem.
+        Preserves directory structure when folder_path is provided.
+
+        Files are stored at: /app/data/documents/{workspace_id}/{folder_path}/{filename}
+        No S3, no BYTEA — just local filesystem in the sandbox volume.
+        """
+        content = await file.read()
+        file_id = str(uuid.uuid4())
+        original_filename = file.filename or "unknown"
+        ext = Path(original_filename).suffix
+
+        # Build storage path preserving directory structure
+        base_dir = Path("/app/data/documents")
+        if workspace_id:
+            base_dir = base_dir / workspace_id
+        if folder_path:
+            # Sanitize folder_path to prevent path traversal
+            safe_folder = Path(folder_path.replace("..", "").strip("/"))
+            base_dir = base_dir / safe_folder
+
+        base_dir.mkdir(parents=True, exist_ok=True)
+
+        # Use file_id + original extension for uniqueness, but keep original name accessible
+        storage_filename = f"{file_id}{ext}"
+        file_path = base_dir / storage_filename
+        file_path.write_bytes(content)
+
+        # Full path relative to /app/data/documents for retrieval
+        relative_path = str(file_path.relative_to(Path("/app/data/documents")))
+
+        return {
+            "file_id": file_id,
+            "filename": original_filename,
+            "size": len(content),
+            "path": str(file_path),
+            "storage_path": relative_path,
+            "folder_path": folder_path,
+        }
+
+    # --- Process Document ---
+    @app.post("/api/v1/documents/process", tags=["Documents"])
+    async def process_document(request: Request):
+        """
+        Process a document using Unstructured (parsing) + OpenAI (embeddings).
+        Supports OCR strategies: "local" (Tesseract) or "google_vision".
+        """
+        from sqlalchemy import text as sql_text
+
+        body = await request.json()
+        file_id = body.get("file_id", "")
+        filename = body.get("filename", "unknown")
+        file_type = body.get("file_type", "txt")
+        kb_id = int(body.get("kb_id", 0))
+        workspace_id = body.get("workspace_id", "")
+        ocr_strategy = body.get("ocr_strategy", "local")  # "local" or "google_vision"
+        google_vision_credentials = body.get("google_vision_credentials")  # JSON string
+        source_path = body.get("source_path", "")  # e.g. "Google Drive:/Reports/Q3/financial.pdf"
+        source_type = body.get("source_type", "")  # e.g. "google_drive", "s3", "upload"
+        # Indexing job id — forwarded to backend vision callbacks so tokens
+        # are attributed to the user/workspace/org that triggered the job.
+        job_id = body.get("job_id", "") or ""
+
+        # Find the uploaded file — search recursively because files are stored
+        # at /app/data/documents/{workspace_id}/{folder_path}/{file_id}.ext
+        data_dir = Path("/app/data/documents")
+        file_path = None
+        for p in data_dir.rglob(f"{file_id}*"):
+            if p.is_file():
+                file_path = p
+                break
+
+        if not file_path or not file_path.exists():
+            raise HTTPException(status_code=404, detail=f"File {file_id} not found")
+
+        file_size = file_path.stat().st_size
+        # Compute storage_path relative to /app/data/documents
+        try:
+            storage_rel = str(file_path.relative_to(Path("/app/data/documents")))
+        except ValueError:
+            storage_rel = str(file_path)
+
+        engine = _get_doc_db_engine()
+        # Ensure file_id column + unique index exist (idempotent migration)
+        with engine.connect() as conn:
+            conn.execute(sql_text(
+                "ALTER TABLE document_kb_documents ADD COLUMN IF NOT EXISTS file_id varchar(500)"
+            ))
+            conn.execute(sql_text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_dkbd_kb_file "
+                "ON document_kb_documents (knowledge_base_id, file_id) WHERE file_id IS NOT NULL"
+            ))
+            conn.commit()
+
+        # UPSERT keyed by (kb_id, file_id) — reindexing the same file updates the
+        # existing row instead of creating duplicates (fixes the "124 rows for 21 files" bug).
+        with engine.connect() as conn:
+            conn.execute(
+                sql_text("""
+                    INSERT INTO document_kb_documents
+                        (knowledge_base_id, filename, file_type, file_size,
+                         storage_path, source_path, source_type, file_id,
+                         status, progress, error_message, chunk_count)
+                    VALUES (:kb_id, :fname, :ftype, :fsize,
+                            :spath_disk, :spath, :stype, :fid,
+                            'processing', 0, NULL, 0)
+                    ON CONFLICT (knowledge_base_id, file_id) WHERE file_id IS NOT NULL
+                    DO UPDATE SET
+                        filename = EXCLUDED.filename,
+                        file_type = EXCLUDED.file_type,
+                        file_size = EXCLUDED.file_size,
+                        storage_path = EXCLUDED.storage_path,
+                        source_path = EXCLUDED.source_path,
+                        source_type = EXCLUDED.source_type,
+                        status = 'processing',
+                        progress = 0,
+                        error_message = NULL,
+                        chunk_count = 0,
+                        updated_at = NOW()
+                """),
+                {"kb_id": kb_id, "fname": filename, "ftype": file_type, "fsize": file_size,
+                 "spath_disk": storage_rel, "spath": source_path or None,
+                 "stype": source_type or None, "fid": file_id},
+            )
+            conn.commit()
+            row = conn.execute(
+                sql_text(
+                    "SELECT id FROM document_kb_documents "
+                    "WHERE knowledge_base_id = :kb_id AND file_id = :fid"
+                ),
+                {"kb_id": kb_id, "fid": file_id},
+            ).fetchone()
+            doc_id = row[0]
+
+        # Run the pipeline synchronously in a thread pool so the HTTP request
+        # waits for actual completion. This way the backend knows when indexing
+        # is truly done and can mark the document as ready with accurate chunk counts.
+        import asyncio
+        try:
+            await asyncio.to_thread(
+                _run_unstructured_pipeline,
+                engine, doc_id, str(file_path), file_type, kb_id, filename,
+                ocr_strategy, google_vision_credentials, source_path,
+                file_id, job_id,
+            )
+        except Exception as e:
+            logger.error("document_processing_failed", doc_id=doc_id, error=str(e))
+            return {"doc_id": str(doc_id), "status": "failed", "error": str(e), "file_id": file_id}
+
+        # Check final status from sandbox DB
+        from sqlalchemy import text as sql_text_sync
+        with engine.connect() as c:
+            status_row = c.execute(
+                sql_text_sync("SELECT status, chunk_count, error_message FROM document_kb_documents WHERE id = :id"),
+                {"id": doc_id},
+            ).fetchone()
+
+        if status_row:
+            return {
+                "doc_id": str(doc_id),
+                "status": status_row[0],
+                "chunk_count": status_row[1] or 0,
+                "error": status_row[2],
+                "file_id": file_id,
+            }
+        return {"doc_id": str(doc_id), "status": "ready", "file_id": file_id}
+
+    def _vision_caption_image(
+        file_path: str,
+        filename: str,
+        job_id: str = "",
+    ) -> tuple[str, str]:
+        """
+        Request an image caption from the backend's internal vision endpoint.
+
+        The backend owns model selection (from Settings/Models UI), API keys,
+        and token accounting via LLMHelper → TokenAccumulator. Passing
+        `job_id` lets the backend attribute the tokens to the user/workspace/
+        organization that triggered the indexing job.
+
+        Returns (description, visible_text). Both empty strings on failure —
+        caller should fall back to a plain filename placeholder.
+        """
+        import base64
+        import httpx
+
+        backend_url = (
+            os.environ.get("MERIDYEN_BACKEND_URL")
+            or os.environ.get("BACKEND_URL")
+            or "http://backend_cloud_dev:8000"
+        )
+        internal_secret = (
+            os.environ.get("INTERNAL_BACKEND_SECRET")
+            or os.environ.get("SANDBOX_API_KEY")
+            or ""
+        )
+
+        try:
+            with open(file_path, "rb") as f:
+                img_bytes = f.read()
+        except Exception as e:
+            logger.warning("vision_caption_read_failed", filename=filename, error=str(e))
+            return "", ""
+
+        ext = Path(file_path).suffix.lower().lstrip(".")
+        mime_map = {
+            "jpg": "image/jpeg", "jpeg": "image/jpeg",
+            "png": "image/png", "gif": "image/gif",
+            "webp": "image/webp", "bmp": "image/bmp", "tiff": "image/tiff",
+        }
+        mime = mime_map.get(ext, "image/jpeg")
+        b64 = base64.b64encode(img_bytes).decode("ascii")
+
+        try:
+            with httpx.Client(timeout=90.0) as client:
+                resp = client.post(
+                    f"{backend_url.rstrip('/')}/api/internal/vision/caption",
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Internal-Secret": internal_secret,
+                    },
+                    json={
+                        "job_id": job_id or "",
+                        "filename": filename,
+                        "mime": mime,
+                        "image_base64": b64,
+                    },
+                )
+        except Exception as e:
+            logger.warning("vision_caption_request_failed", filename=filename, error=str(e))
+            return "", ""
+
+        if resp.status_code != 200:
+            logger.warning(
+                "vision_caption_http_error",
+                filename=filename,
+                status=resp.status_code,
+                body=resp.text[:200],
+            )
+            return "", ""
+
+        try:
+            data = resp.json()
+            description = (data.get("description") or "").strip()
+            visible_text = (data.get("visible_text") or "").strip()
+            logger.info(
+                "vision_caption_ok",
+                filename=filename,
+                desc_len=len(description),
+                text_len=len(visible_text),
+                model=data.get("model_name", ""),
+                total_tokens=data.get("total_tokens", 0),
+                job_id=job_id or "",
+            )
+            return description, visible_text
+        except Exception as e:
+            logger.warning("vision_caption_parse_failed", filename=filename, error=str(e))
+            return "", ""
+
+    def _run_unstructured_pipeline(
+        engine, doc_id: int, file_path: str, file_type: str,
+        kb_id: int, filename: str,
+        ocr_strategy: str = "local",
+        google_vision_credentials: str | None = None,
+        source_path: str = "",
+        file_id: str = "",
+        job_id: str = "",
+    ):
+        """
+        Document processing pipeline using Unstructured (parsing) + LlamaIndex (indexing).
+
+        - Unstructured: extracts structured elements (text, tables, headers, images/OCR)
+        - LlamaIndex: chunks with metadata, embeds with OpenAI, stores in PGVectorStore
+
+        OCR strategies for scanned/non-digital documents:
+          - "local": Tesseract OCR (free, on-premise)
+          - "google_vision": Google Cloud Vision OCR (best accuracy)
+
+        LlamaIndex automatically tracks file paths, page numbers, and element types
+        as metadata on each node, enabling path-based filtering during retrieval.
+        """
+        from sqlalchemy import text as sql_text
+        import json as _json
+
+        def _update_prog(prog):
+            with engine.connect() as c:
+                c.execute(sql_text("UPDATE document_kb_documents SET progress=:p, updated_at=NOW() WHERE id=:id"), {"p": prog, "id": doc_id})
+                c.commit()
+
+        AUDIO_TYPES = {"mp3", "wav", "m4a", "ogg", "flac", "wma"}
+        VIDEO_TYPES = {"mp4", "mkv", "avi", "mov", "webm"}
+
+        try:
+            _update_prog(5)
+
+            from llama_index.core.schema import Document as LIDocument
+            li_documents = []
+            extracted_text_parts = []
+            is_media = file_type.lower() in (AUDIO_TYPES | VIDEO_TYPES)
+
+            if is_media:
+                # ── Audio/Video: Transcribe with faster-whisper ──
+                logger.info("whisper_transcription_start", doc_id=doc_id, filename=filename, file_type=file_type)
+
+                audio_path = file_path
+
+                # If video, extract audio track to /tmp (not next to source — that breaks file lookups)
+                if file_type.lower() in VIDEO_TYPES:
+                    import subprocess
+                    import tempfile
+                    audio_fd, audio_path = tempfile.mkstemp(suffix=".wav", prefix=f"whisper_{doc_id}_")
+                    os.close(audio_fd)  # We only need the path
+                    subprocess.run(
+                        ["ffmpeg", "-i", file_path, "-vn", "-acodec", "pcm_s16le",
+                         "-ar", "16000", "-ac", "1", audio_path, "-y"],
+                        capture_output=True, check=True, timeout=600,
+                    )
+                    logger.info("video_audio_extracted", doc_id=doc_id, audio_path=audio_path)
+
+                _update_prog(10)
+
+                # Transcribe with faster-whisper (small model, CPU)
+                from faster_whisper import WhisperModel
+                # Use pre-downloaded model to avoid runtime download + lock contention
+                whisper_path = os.environ.get("WHISPER_MODEL_PATH", "")
+                model = WhisperModel(
+                    "small", device="cpu", compute_type="int8",
+                    download_root=whisper_path or None,
+                )
+                segments, info = model.transcribe(audio_path, beam_size=5)
+
+                logger.info("whisper_transcribing", doc_id=doc_id,
+                            language=info.language, duration=f"{info.duration:.1f}s")
+
+                _update_prog(15)
+
+                # Build timestamped transcript as LlamaIndex documents
+                segment_list = list(segments)
+                for i, seg in enumerate(segment_list):
+                    text = seg.text.strip()
+                    if not text:
+                        continue
+
+                    # Format timestamp
+                    start_m, start_s = divmod(int(seg.start), 60)
+                    start_h, start_m = divmod(start_m, 60)
+                    end_m, end_s = divmod(int(seg.end), 60)
+                    end_h, end_m = divmod(end_m, 60)
+                    timestamp = f"{start_h:02d}:{start_m:02d}:{start_s:02d} → {end_h:02d}:{end_m:02d}:{end_s:02d}"
+
+                    extracted_text_parts.append(f"[{timestamp}] {text}")
+
+                    metadata = {
+                        "file_id": file_id,
+                        "filename": filename,
+                        "file_type": file_type,
+                        "file_path": source_path or filename,
+                        "source_path": source_path,
+                        "element_type": "Transcript",
+                        "doc_id": doc_id,
+                        "kb_id": kb_id,
+                        "timestamp_start": round(seg.start, 2),
+                        "timestamp_end": round(seg.end, 2),
+                        "timestamp": timestamp,
+                        "language": info.language,
+                    }
+                    if source_path:
+                        parts = source_path.rsplit("/", 1)
+                        metadata["directory"] = parts[0] if len(parts) > 1 else ""
+
+                    li_documents.append(LIDocument(text=f"[{timestamp}] {text}", metadata=metadata))
+
+                    # Update progress proportionally
+                    if i % 20 == 0:
+                        pct = 15 + int((i / max(len(segment_list), 1)) * 5)
+                        _update_prog(min(pct, 20))
+
+                # Clean up the tmp audio file (extracted from video)
+                # audio_path is in /tmp/, file_path is the original in /app/data/documents/
+                if audio_path != file_path and os.path.exists(audio_path):
+                    try:
+                        os.remove(audio_path)
+                        logger.info("temp_audio_cleaned", doc_id=doc_id)
+                    except OSError:
+                        pass
+
+                logger.info("whisper_transcription_done", doc_id=doc_id,
+                            segments=len(li_documents), language=info.language)
+
+            else:
+                # ── Documents: Parse with Unstructured ──
+                logger.info("unstructured_parsing_start", doc_id=doc_id, filename=filename, ocr=ocr_strategy)
+
+                from unstructured.partition.auto import partition
+
+                # Use Unstructured's built-in chunker — it knows heading/table/list
+                # boundaries from the document's actual structure, which beats
+                # re-discovering them from plain text downstream. "by_title" starts
+                # a new chunk at each heading, merges short sections, and keeps
+                # tables intact.
+                partition_kwargs = {
+                    "filename": file_path,
+                    "strategy": "hi_res",
+                    "chunking_strategy": "by_title",
+                    "max_characters": 1000,              # hard cap per chunk (~250 tokens)
+                    "new_after_n_chars": 900,            # soft cap — try to break earlier
+                    "combine_text_under_n_chars": 500,   # merge tiny sections into neighbors
+                    "overlap": 100,                      # char overlap between consecutive chunks
+                }
+
+                if ocr_strategy == "google_vision" and google_vision_credentials:
+                    import tempfile
+                    creds_file = tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w")
+                    creds_file.write(google_vision_credentials)
+                    creds_file.close()
+                    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = creds_file.name
+                    os.environ["OCR_AGENT"] = "unstructured.partition.utils.ocr_models.google_vision_ocr.OCRAgentGoogleVision"
+                else:
+                    os.environ["OCR_AGENT"] = "unstructured.partition.utils.ocr_models.tesseract_ocr.OCRAgentTesseract"
+
+                elements = partition(**partition_kwargs)
+
+                if not elements:
+                    # Image with no OCR-extractable text — don't fail. Try a vision
+                    # LLM first (describes the image + reads any visible text), then
+                    # fall back to a filename-only placeholder if the vision call fails.
+                    IMAGE_TYPES_EARLY = {"jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff"}
+                    if file_type.lower() in IMAGE_TYPES_EARLY:
+                        description, visible_text = _vision_caption_image(file_path, filename, job_id=job_id)
+                        if description or visible_text:
+                            # Build a searchable chunk from the vision output. Include
+                            # both the description (for semantic queries like "dashboard")
+                            # and any literal visible text (for queries like "Cell Surge").
+                            chunk_text = f"[Image: {filename}]"
+                            if description:
+                                chunk_text += f"\n\n{description}"
+                            if visible_text:
+                                chunk_text += f"\n\nVisible text in image:\n{visible_text}"
+                            has_text = True
+                            modality = "image"
+                            log_event = "image_indexed_with_vision_llm"
+                        else:
+                            # Vision call failed — fall back to plain placeholder so
+                            # the file remains findable by filename at least.
+                            chunk_text = (
+                                f"[Image file: {filename}]\n"
+                                f"No text could be extracted by OCR and the vision fallback "
+                                f"failed. Likely a photo, illustration, or diagram."
+                            )
+                            has_text = False
+                            modality = "image"
+                            log_event = "image_indexed_as_placeholder_early"
+
+                        extracted_text_parts.append(chunk_text)
+                        synthetic_meta = {
+                            "file_id": file_id,
+                            "filename": filename,
+                            "file_type": file_type,
+                            "file_path": source_path or filename,
+                            "source_path": source_path,
+                            "source_type": "upload" if not source_path else (source_path.split(":")[0] if ":" in source_path else "upload"),
+                            "element_type": "Image",
+                            "doc_id": doc_id,
+                            "kb_id": kb_id,
+                            "chunk_index": 0,
+                            "modality": modality,
+                            "has_text": has_text,
+                        }
+                        if source_path:
+                            parts = source_path.rsplit("/", 1)
+                            synthetic_meta["directory"] = parts[0] if len(parts) > 1 else ""
+                        li_documents.append(LIDocument(text=chunk_text, metadata=synthetic_meta))
+                        logger.info(log_event, doc_id=doc_id, file_id=file_id, filename=filename)
+                        elements = []
+                    else:
+                        raise ValueError("Unstructured could not extract any content from the document")
+
+                # For PDFs: extract word-level bounding boxes using PyMuPDF
+                # Unstructured handles parsing/OCR, PyMuPDF provides precise word positions
+                pdf_page_words = {}  # page_num → list of {"text", "bbox", "page_width", "page_height"}
+                if file_type.lower() == "pdf":
+                    try:
+                        import fitz
+                        doc = fitz.open(file_path)
+                        for page_idx in range(len(doc)):
+                            page = doc[page_idx]
+                            page_num_1 = page_idx + 1
+                            words = []
+                            for w in page.get_text("words"):
+                                if w[4].strip():
+                                    words.append({
+                                        "text": w[4],
+                                        "bbox": [round(w[0], 1), round(w[1], 1), round(w[2], 1), round(w[3], 1)],
+                                    })
+                            pdf_page_words[page_num_1] = {
+                                "words": words,
+                                "page_width": round(page.rect.width, 1),
+                                "page_height": round(page.rect.height, 1),
+                            }
+                        doc.close()
+                        logger.info("pymupdf_words_extracted", doc_id=doc_id, pages=len(pdf_page_words))
+                    except Exception as e:
+                        logger.warning("pymupdf_extraction_failed", doc_id=doc_id, error=str(e))
+
+                # Track running character offset for highlight positioning
+                char_offset = 0
+                chunk_index = 0  # 0-based position of this chunk within the file
+
+                for el in elements:
+                    # Some Unstructured elements (e.g. Image elements from OCR with no
+                    # detected text) have a broken __str__ that returns None. Prefer
+                    # .text (a plain str attribute) and skip elements without usable text.
+                    raw = getattr(el, "text", None)
+                    if raw is None:
+                        try:
+                            raw = str(el)
+                        except Exception:
+                            raw = None
+                    text = (raw or "").strip() if isinstance(raw, str) else ""
+                    if not text:
+                        continue
+
+                    el_type = type(el).__name__
+
+                    # With chunking_strategy="by_title", elements are CompositeElements
+                    # that aggregate multiple atomic elements. Representative page/bbox
+                    # come from the first orig_element; char offsets in pdf_page_words
+                    # don't map cleanly across the composite, so we only stamp
+                    # page-level metadata and rely on text search for in-page highlighting.
+                    orig_elements = getattr(el.metadata, 'orig_elements', None) or []
+                    first_orig = orig_elements[0] if orig_elements else el
+
+                    page_num = None
+                    if hasattr(first_orig, 'metadata') and hasattr(first_orig.metadata, 'page_number'):
+                        page_num = first_orig.metadata.page_number
+                    elif hasattr(el.metadata, 'page_number'):
+                        page_num = el.metadata.page_number
+
+                    # PPTX: page_number = slide number; XLSX: page_name = sheet name
+                    page_name = getattr(el.metadata, 'page_name', None)
+                    if not page_name and hasattr(first_orig, 'metadata'):
+                        page_name = getattr(first_orig.metadata, 'page_name', None)
+
+                    # Bounding box from the first original element (approximate — the
+                    # composite may span several paragraphs). Viewer uses text search
+                    # for precise highlighting anyway.
+                    bbox = None
+                    page_width = None
+                    page_height = None
+                    coords = None
+                    if hasattr(first_orig, 'metadata'):
+                        coords = getattr(first_orig.metadata, 'coordinates', None)
+                    if coords and coords.points and coords.system:
+                        pts = coords.points
+                        x_vals = [p[0] for p in pts]
+                        y_vals = [p[1] for p in pts]
+                        bbox = [round(min(x_vals), 1), round(min(y_vals), 1),
+                                round(max(x_vals), 1), round(max(y_vals), 1)]
+                        page_width = round(coords.system.width, 1) if hasattr(coords.system, 'width') else None
+                        page_height = round(coords.system.height, 1) if hasattr(coords.system, 'height') else None
+
+                    # Track start/end char positions in the full extracted_text
+                    start_char = char_offset
+                    end_char = char_offset + len(text)
+                    char_offset = end_char + 2  # +2 for the "\n\n" separator
+
+                    extracted_text_parts.append(text)
+
+                    # Composite-chunk metadata. element_type is the first orig element's
+                    # type so we can still distinguish "starts with a table" vs "narrative".
+                    first_orig_type = type(first_orig).__name__ if first_orig is not el else el_type
+                    metadata = {
+                        "file_id": file_id,
+                        "filename": filename,
+                        "file_type": file_type,
+                        "file_path": source_path or filename,
+                        "source_path": source_path,
+                        "source_type": "upload" if not source_path else source_path.split(":")[0] if ":" in source_path else "upload",
+                        "element_type": first_orig_type,
+                        "doc_id": doc_id,
+                        "kb_id": kb_id,
+                        "chunk_index": chunk_index,  # 0-based position for neighbor-fetching
+                        "start_char": start_char,
+                        "end_char": end_char,
+                    }
+                    if page_num is not None:
+                        metadata["page_num"] = page_num
+                    if page_name:
+                        metadata["page_name"] = page_name
+                    if bbox:
+                        metadata["bbox"] = bbox
+                    if page_width:
+                        metadata["page_width"] = page_width
+                    if page_height:
+                        metadata["page_height"] = page_height
+
+                    # Extract directory path from source_path for folder-level filtering
+                    if source_path:
+                        parts = source_path.rsplit("/", 1)
+                        metadata["directory"] = parts[0] if len(parts) > 1 else ""
+
+                    li_documents.append(LIDocument(text=text, metadata=metadata))
+                    chunk_index += 1
+
+            extracted_text = "\n\n".join(extracted_text_parts)
+
+            if not extracted_text.strip():
+                # Images whose elements produced no text: try vision LLM before
+                # falling back to a filename-only placeholder. Matches the early
+                # `if not elements` branch behavior above.
+                IMAGE_TYPES = {"jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff"}
+                if file_type.lower() in IMAGE_TYPES:
+                    description, visible_text = _vision_caption_image(file_path, filename, job_id=job_id)
+                    if description or visible_text:
+                        chunk_text = f"[Image: {filename}]"
+                        if description:
+                            chunk_text += f"\n\n{description}"
+                        if visible_text:
+                            chunk_text += f"\n\nVisible text in image:\n{visible_text}"
+                        has_text = True
+                        log_event = "image_indexed_with_vision_llm"
+                    else:
+                        chunk_text = (
+                            f"[Image file: {filename}]\n"
+                            f"No text could be extracted by OCR and the vision fallback "
+                            f"failed. Likely a photo, illustration, or diagram."
+                        )
+                        has_text = False
+                        log_event = "image_indexed_as_placeholder"
+
+                    extracted_text_parts.append(chunk_text)
+                    extracted_text = chunk_text
+                    synthetic_meta = {
+                        "file_id": file_id,
+                        "filename": filename,
+                        "file_type": file_type,
+                        "file_path": source_path or filename,
+                        "source_path": source_path,
+                        "source_type": "upload" if not source_path else (source_path.split(":")[0] if ":" in source_path else "upload"),
+                        "element_type": "Image",
+                        "doc_id": doc_id,
+                        "kb_id": kb_id,
+                        "chunk_index": 0,
+                        "modality": "image",
+                        "has_text": has_text,
+                    }
+                    if source_path:
+                        parts = source_path.rsplit("/", 1)
+                        synthetic_meta["directory"] = parts[0] if len(parts) > 1 else ""
+                    li_documents.append(LIDocument(text=chunk_text, metadata=synthetic_meta))
+                    logger.info(log_event, doc_id=doc_id, file_id=file_id, filename=filename)
+                else:
+                    raise ValueError("No text content extracted from document")
+
+            # Save extracted text to DB
+            with engine.connect() as c:
+                c.execute(sql_text("UPDATE document_kb_documents SET extracted_text=:t, updated_at=NOW() WHERE id=:id"),
+                          {"t": extracted_text, "id": doc_id})
+                c.commit()
+
+            logger.info("parsing_done", doc_id=doc_id,
+                        li_docs=len(li_documents), chars=len(extracted_text),
+                        media=is_media)
+            _update_prog(30)
+
+            # ── Step 3: Build LlamaIndex VectorStoreIndex with PGVectorStore ──
+            from llama_index.core import VectorStoreIndex, Settings, StorageContext
+            from llama_index.core.node_parser import SentenceSplitter
+            from llama_index.embeddings.openai import OpenAIEmbedding
+            from llama_index.vector_stores.postgres import PGVectorStore
+
+            openai_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENAI_KEY", "")
+
+            # Configure LlamaIndex settings
+            Settings.embed_model = OpenAIEmbedding(
+                model="text-embedding-3-small",
+                dimensions=1536,
+                api_key=openai_key,
+            )
+            Settings.chunk_size = 1024
+            Settings.chunk_overlap = 128
+
+            # Connect LlamaIndex to sandbox postgres via PGVectorStore
+            db_host = os.environ.get("SANDBOX_UPLOAD_DB_HOST", "sandbox-postgres")
+            db_port = os.environ.get("SANDBOX_UPLOAD_DB_PORT", "5432")
+            db_name = os.environ.get("SANDBOX_UPLOAD_DB_NAME", "sandbox_uploads")
+            db_user = os.environ.get("SANDBOX_UPLOAD_DB_USER", "sandbox")
+            db_pass = os.environ.get("SANDBOX_UPLOAD_DB_PASSWORD", "sandbox_password")
+
+            # Each KB gets its own table for isolation
+            table_name = f"llamaindex_kb_{kb_id}"
+
+            vector_store = PGVectorStore.from_params(
+                host=db_host,
+                port=db_port,
+                database=db_name,
+                user=db_user,
+                password=db_pass,
+                table_name=table_name,
+                embed_dim=1536,
+            )
+
+            # Wrap in StorageContext — this is what actually makes VectorStoreIndex
+            # persist nodes to the vector store (without it, the index is in-memory only)
+            storage_context = StorageContext.from_defaults(vector_store=vector_store)
+
+            # Dedup on reindex: delete any existing vectors for this file_id in this KB.
+            # file_id is the stable identity of the file bytes on disk — unlike doc_id,
+            # it survives re-uploads and ties all chunks (document pages, video segments,
+            # image OCR regions) back to one physical file.
+            # PGVectorStore creates tables as data_<table_name>, e.g. data_llamaindex_kb_2.
+            # On first index of a fresh KB the table doesn't exist yet — catch and skip.
+            if file_id:
+                try:
+                    with engine.connect() as c:
+                        deleted = c.execute(
+                            sql_text(
+                                f"DELETE FROM data_{table_name} "
+                                f"WHERE metadata_->>'file_id' = :fid"
+                            ),
+                            {"fid": file_id},
+                        )
+                        c.commit()
+                        logger.info("vector_dedup_prereindex", doc_id=doc_id, file_id=file_id,
+                                    deleted=deleted.rowcount if hasattr(deleted, 'rowcount') else 0)
+                except Exception as e:
+                    # Table doesn't exist yet (first index of this KB) — safe to ignore
+                    logger.info("vector_dedup_skipped", doc_id=doc_id, reason=str(e)[:100])
+
+            _update_prog(40)
+
+            # ── Step 4: Index documents — LlamaIndex handles chunking + embedding + storage ──
+            # SentenceSplitter respects element boundaries better than character splitting.
+            # 1024 tokens (~700 words, ~1 page) with 128 overlap: each chunk is usually
+            # self-contained enough to answer a question without needing neighbors, while
+            # still fitting ~8x inside text-embedding-3-small's 8192 token budget.
+            node_parser = SentenceSplitter(chunk_size=1024, chunk_overlap=128)
+
+            logger.info("llamaindex_indexing_start", doc_id=doc_id, documents=len(li_documents))
+
+            index = VectorStoreIndex.from_documents(
+                li_documents,
+                storage_context=storage_context,
+                transformations=[node_parser],
+                show_progress=False,
+            )
+
+            # Count how many nodes (chunks) were actually created and persisted
+            # Query the vector store directly to confirm persistence
+            chunk_count = len(li_documents)  # Fallback estimate
+            try:
+                all_nodes = index.docstore.docs
+                if all_nodes:
+                    chunk_count = len(all_nodes)
+            except Exception:
+                pass
+
+            logger.info("llamaindex_indexing_done", doc_id=doc_id, chunks=chunk_count, table=table_name)
+            _update_prog(85)
+
+            # ── Step 5: Generate summary ──
+            import openai as _openai
+            client = _openai.OpenAI(api_key=openai_key)
+            summary = ""
+            try:
+                summary_resp = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {"role": "system", "content": "Summarize this document in 2-3 sentences."},
+                        {"role": "user", "content": extracted_text[:8000]},
+                    ],
+                    max_tokens=200,
+                )
+                summary = summary_resp.choices[0].message.content or ""
+            except Exception:
+                pass
+
+            # ── Finalize ──
+            with engine.connect() as c:
+                c.execute(
+                    sql_text("UPDATE document_kb_documents SET status='ready', chunk_count=:cc, summary=:s, progress=100, updated_at=NOW() WHERE id=:id"),
+                    {"cc": chunk_count, "s": summary, "id": doc_id},
+                )
+                c.commit()
+
+            logger.info("document_processed", doc_id=doc_id, filename=filename,
+                        chunks=chunk_count, ocr=ocr_strategy, source_path=source_path)
+
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            logger.error("document_processing_error", doc_id=doc_id, error=str(e), traceback=tb)
+            with engine.connect() as c:
+                c.execute(
+                    sql_text("UPDATE document_kb_documents SET status='failed', error_message=:err, updated_at=NOW() WHERE id=:id"),
+                    {"err": f"{str(e)}\n{tb[-500:]}", "id": doc_id},
+                )
+                c.commit()
+
+    def _json_parse_safe(val):
+        """Parse a JSON string, return None if invalid."""
+        if not val:
+            return None
+        if isinstance(val, dict):
+            return val
+        try:
+            import json
+            return json.loads(val)
+        except Exception:
+            return None
+
+    # --- Query KB Vectors ---
+    @app.post("/api/v1/documents/query", tags=["Documents"])
+    async def query_kb_vectors(request: Request):
+        """
+        Search for similar document chunks using LlamaIndex's VectorStoreIndex.
+        Supports path-based filtering (search within specific directories).
+        """
+        body = await request.json()
+        query_embedding = body.get("query_embedding", [])
+        kb_ids = body.get("kb_ids", [])
+        top_k = body.get("top_k", 10)
+        threshold = body.get("similarity_threshold", 0.3)
+        # Optional path filter — search only within a specific directory
+        path_filter = body.get("path_filter", "")  # e.g. "Google Drive:/Reports"
+
+        if not query_embedding or not kb_ids:
+            return {"chunks": []}
+
+        from llama_index.core import VectorStoreIndex, Settings
+        from llama_index.core.vector_stores.types import (
+            VectorStoreQuery,
+            VectorStoreQueryMode,
+            MetadataFilters,
+            MetadataFilter,
+            FilterOperator,
+        )
+        from llama_index.vector_stores.postgres import PGVectorStore
+        from llama_index.embeddings.openai import OpenAIEmbedding
+
+        openai_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENAI_KEY", "")
+        Settings.embed_model = OpenAIEmbedding(
+            model="text-embedding-3-small", dimensions=1536, api_key=openai_key,
+        )
+
+        db_host = os.environ.get("SANDBOX_UPLOAD_DB_HOST", "sandbox-postgres")
+        db_port = os.environ.get("SANDBOX_UPLOAD_DB_PORT", "5432")
+        db_name = os.environ.get("SANDBOX_UPLOAD_DB_NAME", "sandbox_uploads")
+        db_user = os.environ.get("SANDBOX_UPLOAD_DB_USER", "sandbox")
+        db_pass = os.environ.get("SANDBOX_UPLOAD_DB_PASSWORD", "sandbox_password")
+
+        all_chunks = []
+
+        for kb_id in kb_ids:
+            table_name = f"llamaindex_kb_{kb_id}"
+
+            try:
+                vector_store = PGVectorStore.from_params(
+                    host=db_host, port=db_port, database=db_name,
+                    user=db_user, password=db_pass,
+                    table_name=table_name, embed_dim=1536,
+                )
+
+                # Build metadata filters
+                filters = []
+                if path_filter:
+                    filters.append(MetadataFilter(
+                        key="source_path", value=path_filter, operator=FilterOperator.CONTAINS,
+                    ))
+
+                # Query using LlamaIndex's vector store directly
+                query = VectorStoreQuery(
+                    query_embedding=query_embedding,
+                    similarity_top_k=top_k,
+                    mode=VectorStoreQueryMode.DEFAULT,
+                    filters=MetadataFilters(filters=filters) if filters else None,
+                )
+
+                result = vector_store.query(query)
+
+                for node, similarity in zip(result.nodes or [], result.similarities or []):
+                    if similarity < threshold:
+                        continue
+                    meta = node.metadata or {}
+                    all_chunks.append({
+                        "chunk_id": node.node_id,
+                        "document_id": str(meta.get("doc_id", "")),
+                        "kb_id": str(kb_id),
+                        "content": node.get_content(),
+                        "similarity": float(similarity),
+                        "page_num": meta.get("page_num"),
+                        "word_positions": _json_parse_safe(meta.get("word_positions_json")),
+                        "filename": meta.get("filename", ""),
+                        "source_path": meta.get("source_path", ""),
+                        "source_type": meta.get("source_type", ""),
+                        "directory": meta.get("directory", ""),
+                        "element_type": meta.get("element_type", ""),
+                        # Text highlight offsets — from LlamaIndex node or element metadata
+                        "start_char": node.start_char_idx if node.start_char_idx is not None else meta.get("start_char"),
+                        "end_char": node.end_char_idx if node.end_char_idx is not None else meta.get("end_char"),
+                        # PDF bounding box [x0, y0, x1, y1] in page coordinates
+                        "bbox": meta.get("bbox"),
+                        "page_width": meta.get("page_width"),
+                        "page_height": meta.get("page_height"),
+                        # Sheet name (XLSX) or slide label (PPTX)
+                        "page_name": meta.get("page_name"),
+                        # Audio/video timestamp offsets
+                        "timestamp_start": meta.get("timestamp_start"),
+                        "timestamp_end": meta.get("timestamp_end"),
+                        "timestamp": meta.get("timestamp"),
+                        "file_type": meta.get("file_type", ""),
+                        # Stable file identity — the sandbox storage UUID, used by
+                        # the backend to serve the raw file via /files/{file_id}.
+                        "file_id": meta.get("file_id", ""),
+                        # Position of this chunk within its file — lets the agent
+                        # request surrounding context via /chunks/neighbors.
+                        "chunk_index": meta.get("chunk_index"),
+                    })
+
+            except Exception as e:
+                logger.warning("kb_query_failed", kb_id=kb_id, error=str(e))
+
+        # Sort by similarity descending, take top_k
+        all_chunks.sort(key=lambda c: c["similarity"], reverse=True)
+        all_chunks = all_chunks[:top_k]
+
+        return {"chunks": all_chunks}
+
+    # --- Fetch Neighboring Chunks ---
+    # Returns chunks immediately before/after a given chunk within the same file.
+    # Lets the agent request surrounding context on demand ("small-to-big" retrieval).
+    @app.post("/api/v1/documents/chunks/neighbors", tags=["Documents"])
+    async def get_chunk_neighbors(request: Request):
+        """
+        Fetch chunks surrounding a target chunk by (kb_id, file_id, chunk_index).
+        Body: {"kb_id": 2, "file_id": "abc-...", "chunk_index": 12, "window": 2}
+        Returns up to 2*window neighbors, ordered by chunk_index.
+        """
+        from sqlalchemy import text as sql_text
+
+        body = await request.json()
+        kb_id = int(body.get("kb_id", 0))
+        file_id = body.get("file_id", "")
+        chunk_index = int(body.get("chunk_index", 0))
+        window = int(body.get("window", 2))
+        # Clamp window to avoid huge range queries
+        window = max(1, min(window, 10))
+
+        if not kb_id or not file_id:
+            return {"chunks": []}
+
+        table_name = f"llamaindex_kb_{kb_id}"
+        engine = _get_doc_db_engine()
+        try:
+            with engine.connect() as c:
+                # Query vectors where file_id matches and chunk_index is in the window.
+                # chunk_index is stored as a JSON number in metadata_ so we cast to int.
+                result = c.execute(
+                    sql_text(
+                        f"""
+                        SELECT text, metadata_
+                        FROM data_{table_name}
+                        WHERE metadata_->>'file_id' = :fid
+                          AND (metadata_->>'chunk_index')::int BETWEEN :lo AND :hi
+                          AND (metadata_->>'chunk_index')::int != :current
+                        ORDER BY (metadata_->>'chunk_index')::int ASC
+                        """
+                    ),
+                    {
+                        "fid": file_id,
+                        "lo": chunk_index - window,
+                        "hi": chunk_index + window,
+                        "current": chunk_index,
+                    },
+                )
+                rows = result.fetchall()
+        except Exception as e:
+            import traceback
+            logger.warning(
+                "chunk_neighbors_query_failed",
+                error=str(e),
+                file_id=file_id,
+                traceback=traceback.format_exc()[:500],
+            )
+            return {"chunks": []}
+
+        chunks = []
+        for row in rows:
+            text = row[0]
+            meta = row[1] if isinstance(row[1], dict) else {}
+            chunks.append({
+                "content": text,
+                "chunk_index": int(meta.get("chunk_index", -1)) if meta.get("chunk_index") is not None else None,
+                "file_id": meta.get("file_id", ""),
+                "filename": meta.get("filename", ""),
+                "file_type": meta.get("file_type", ""),
+                "page_num": meta.get("page_num"),
+                "element_type": meta.get("element_type", ""),
+            })
+        return {"chunks": chunks, "file_id": file_id, "target_index": chunk_index, "window": window}
+
+    # --- KB Status ---
+    @app.get("/api/v1/documents/kb-status", tags=["Documents"])
+    async def get_kb_status(kb_id: str, workspace_id: str = ""):
+        """Get knowledge base processing status."""
+        from sqlalchemy import text as sql_text
+
+        engine = _get_doc_db_engine()
+        with engine.connect() as conn:
+            result = conn.execute(
+                sql_text("""
+                    SELECT
+                        COUNT(*) as total,
+                        COUNT(*) FILTER (WHERE status = 'ready') as ready,
+                        COUNT(*) FILTER (WHERE status = 'processing') as processing,
+                        COUNT(*) FILTER (WHERE status = 'failed') as failed,
+                        COUNT(*) FILTER (WHERE status = 'pending') as pending,
+                        COALESCE(SUM(chunk_count), 0) as total_chunks
+                    FROM document_kb_documents
+                    WHERE knowledge_base_id = :kb_id
+                """),
+                {"kb_id": int(kb_id)},
+            )
+            row = result.fetchone()
+            if not row:
+                return {"total": 0, "ready": 0, "processing": 0, "failed": 0, "pending": 0, "total_chunks": 0}
+
+            return {
+                "total": row[0], "ready": row[1], "processing": row[2],
+                "failed": row[3], "pending": row[4], "total_chunks": row[5],
+            }
+
+    # --- List KB Documents ---
+    @app.get("/api/v1/documents/list", tags=["Documents"])
+    async def list_kb_documents(kb_id: str, workspace_id: str = ""):
+        """List all documents in a knowledge base."""
+        from sqlalchemy import text as sql_text
+
+        engine = _get_doc_db_engine()
+        with engine.connect() as conn:
+            result = conn.execute(
+                sql_text("""
+                    SELECT id, filename, file_type, file_size, status, error_message,
+                           chunk_count, progress, created_at, updated_at,
+                           source_path, source_type, storage_path
+                    FROM document_kb_documents
+                    WHERE knowledge_base_id = :kb_id
+                    ORDER BY created_at DESC
+                """),
+                {"kb_id": int(kb_id)},
+            )
+            docs = []
+            for row in result.fetchall():
+                docs.append({
+                    "id": row[0], "filename": row[1], "file_type": row[2],
+                    "file_size": row[3], "status": row[4], "error_message": row[5],
+                    "chunk_count": row[6], "progress": row[7] or 0,
+                    "created_at": row[8].isoformat() if row[8] else None,
+                    "updated_at": row[9].isoformat() if row[9] else None,
+                    "source_path": row[10], "source_type": row[11],
+                    "storage_path": row[12],
+                })
+
+        return {"documents": docs}
+
+    # Cache of transcoded videos so repeat views are instant
+    _transcoded_video_cache: dict = {}
+
+    def _get_video_codec(file_path: str) -> tuple:
+        """Return (video_codec, audio_codec) using ffprobe. Empty strings on failure."""
+        import subprocess
+        try:
+            result = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=codec_name",
+                 "-of", "default=nokey=1:noprint_wrappers=1", str(file_path)],
+                capture_output=True, text=True, timeout=10,
+            )
+            vcodec = result.stdout.strip()
+            result = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "a:0",
+                 "-show_entries", "stream=codec_name",
+                 "-of", "default=nokey=1:noprint_wrappers=1", str(file_path)],
+                capture_output=True, text=True, timeout=10,
+            )
+            acodec = result.stdout.strip()
+            return vcodec, acodec
+        except Exception:
+            return "", ""
+
+    def _transcode_video_to_h264(source_path: str) -> Path:
+        """
+        Transcode a video to H.264 + AAC for browser compatibility.
+        Results are cached so repeat requests don't re-transcode.
+        """
+        import hashlib
+        import subprocess
+        src = Path(source_path)
+        # Cache key based on source file path + mtime
+        mtime = src.stat().st_mtime
+        cache_key = hashlib.md5(f"{src}:{mtime}".encode()).hexdigest()
+        if cache_key in _transcoded_video_cache:
+            cached = _transcoded_video_cache[cache_key]
+            if Path(cached).exists():
+                return Path(cached)
+
+        cache_dir = Path("/tmp/sandbox_video_cache")
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        out_path = cache_dir / f"{cache_key}.mp4"
+
+        logger.info("transcoding_video", source=str(src), target=str(out_path))
+        try:
+            # -c:v libx264: H.264 video (universal browser support)
+            # -c:a aac: AAC audio (universal)
+            # -preset ultrafast: fastest encode, slightly larger file
+            # -movflags +faststart: put metadata at start for streaming
+            # -y: overwrite output
+            subprocess.run(
+                ["ffmpeg", "-i", str(src),
+                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                 "-c:a", "aac", "-b:a", "128k",
+                 "-movflags", "+faststart",
+                 "-y", str(out_path)],
+                capture_output=True, check=True, timeout=600,
+            )
+            _transcoded_video_cache[cache_key] = str(out_path)
+            return out_path
+        except subprocess.TimeoutExpired:
+            logger.error("video_transcode_timeout", source=str(src))
+            return src
+        except subprocess.CalledProcessError as e:
+            logger.error("video_transcode_failed", error=str(e.stderr[:500]) if e.stderr else "unknown")
+            return src
+
+    def _serve_file_with_viewer_conversion(file_path, original_filename: str = ""):
+        """
+        Serve a file, converting DOCX/XLSX to browser-viewable HTML.
+        For videos, transcode to H.264 if the codec isn't browser-compatible.
+        """
+        ext = file_path.suffix.lower() if hasattr(file_path, 'suffix') else Path(file_path).suffix.lower()
+
+        # Video: transcode to H.264 if needed
+        if ext in (".mp4", ".mkv", ".avi", ".mov", ".webm"):
+            vcodec, acodec = _get_video_codec(str(file_path))
+            # H.264 and VP8/VP9 are browser-safe; others need transcoding
+            browser_safe_video = vcodec in ("h264", "vp8", "vp9", "av1")
+            browser_safe_audio = acodec in ("aac", "mp3", "opus", "vorbis", "")
+            if not (browser_safe_video and browser_safe_audio):
+                logger.info("video_needs_transcoding", vcodec=vcodec, acodec=acodec)
+                file_path = _transcode_video_to_h264(str(file_path))
+                ext = ".mp4"
+
+        # DOCX → HTML conversion (browsers can't render .docx inline)
+        if ext == ".docx":
+            try:
+                import docx as _docx
+                doc = _docx.Document(str(file_path))
+                paragraphs = []
+                for para in doc.paragraphs:
+                    text = para.text.strip()
+                    if not text:
+                        paragraphs.append("<br>")
+                        continue
+                    # Map Word heading styles to HTML
+                    style = (para.style.name or "").lower() if para.style else ""
+                    if "heading 1" in style:
+                        paragraphs.append(f"<h1>{text}</h1>")
+                    elif "heading 2" in style:
+                        paragraphs.append(f"<h2>{text}</h2>")
+                    elif "heading 3" in style:
+                        paragraphs.append(f"<h3>{text}</h3>")
+                    elif "title" in style:
+                        paragraphs.append(f"<h1 class='title'>{text}</h1>")
+                    else:
+                        paragraphs.append(f"<p>{text}</p>")
+
+                # Extract tables too
+                for table in doc.tables:
+                    rows_html = []
+                    for row in table.rows:
+                        cells = "".join(f"<td>{cell.text.strip()}</td>" for cell in row.cells)
+                        rows_html.append(f"<tr>{cells}</tr>")
+                    if rows_html:
+                        paragraphs.append(f"<table>{''.join(rows_html)}</table>")
+
+                html = (
+                    "<!DOCTYPE html><html><head>"
+                    '<meta charset="utf-8">'
+                    f'<title>{original_filename or file_path.name}</title>'
+                    "<style>"
+                    "body{font-family:system-ui,-apple-system,sans-serif;max-width:900px;margin:40px auto;padding:0 24px;line-height:1.7;color:#1e293b;background:#fff}"
+                    "@media(prefers-color-scheme:dark){body{color:#e2e8f0;background:#1a1a2e}}"
+                    "h1,h2,h3{color:inherit;margin-top:1.5em;margin-bottom:0.5em}"
+                    "h1.title{font-size:2em;text-align:center;margin-top:0.5em}"
+                    "p{margin:0.8em 0;text-align:justify}"
+                    "table{border-collapse:collapse;margin:1em 0;width:100%}"
+                    "td,th{border:1px solid #cbd5e1;padding:8px 12px;text-align:left}"
+                    "@media(prefers-color-scheme:dark){td,th{border-color:#475569}}"
+                    "</style></head><body>"
+                    + "\n".join(paragraphs) + "</body></html>"
+                )
+                return Response(
+                    content=html,
+                    media_type="text/html; charset=utf-8",
+                    headers={"Content-Disposition": "inline"},
+                )
+            except Exception as e:
+                logger.warning("docx_conversion_failed", error=str(e))
+                # Fall through to raw download
+
+        # Default: serve with correct MIME
+        ct_map = {
+            ".pdf": "application/pdf",
+            ".txt": "text/plain; charset=utf-8",
+            ".md": "text/plain; charset=utf-8",
+            ".csv": "text/csv; charset=utf-8",
+            ".html": "text/html; charset=utf-8",
+            ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".gif": "image/gif",
+            ".webp": "image/webp",
+            ".svg": "image/svg+xml",
+            ".mp3": "audio/mpeg",
+            ".wav": "audio/wav",
+            ".m4a": "audio/mp4",
+            ".ogg": "audio/ogg",
+            ".flac": "audio/flac",
+            ".mp4": "video/mp4",
+            ".webm": "video/webm",
+            ".mkv": "video/x-matroska",
+            ".mov": "video/quicktime",
+        }
+        media_type = ct_map.get(ext, "application/octet-stream")
+
+        # For media files (video/audio) and large files, use FileResponse which
+        # supports HTTP range requests natively — browsers need this to seek
+        # inside a 100+ MB video without downloading the entire file first.
+        # Reading the whole file into memory would block and break playback.
+        media_exts = {
+            ".mp4", ".webm", ".mkv", ".mov", ".avi",
+            ".mp3", ".wav", ".m4a", ".ogg", ".flac",
+        }
+        if ext in media_exts or Path(file_path).stat().st_size > 5 * 1024 * 1024:
+            return FileResponse(
+                path=str(file_path),
+                media_type=media_type,
+                headers={"Content-Disposition": "inline"},
+            )
+
+        return Response(
+            content=Path(file_path).read_bytes(),
+            media_type=media_type,
+            headers={"Content-Disposition": "inline"},
+        )
+
+    # --- Serve Document File ---
+    @app.get("/api/v1/documents/file/{file_id}", tags=["Documents"])
+    async def get_document_file(file_id: str, workspace_id: str = ""):
+        """Serve a document file from sandbox storage."""
+        # Find the file by matching the stem (filename without extensions)
+        # Use strict matching: filename must START with file_id and have ONE extension after
+        # This prevents matching side-files like "{uuid}.mp4.wav" when looking for "{uuid}.mp4"
+        data_dir = Path("/app/data/documents")
+        best_match = None
+        for p in data_dir.rglob(f"{file_id}*"):
+            if not p.is_file():
+                continue
+            # Strict: filename is exactly "{file_id}.{ext}" (no extra extensions like .mp4.wav)
+            name_after_id = p.name[len(file_id):]
+            if name_after_id.count(".") == 1:  # exactly one dot → single extension
+                best_match = p
+                break
+            # Keep as fallback if nothing better found
+            if best_match is None:
+                best_match = p
+
+        if best_match:
+            return _serve_file_with_viewer_conversion(best_match)
+
+        # Fall back to DB storage_path lookup (for files stored via storage_path column)
+        from sqlalchemy import text as sql_text
+        engine = _get_doc_db_engine()
+        with engine.connect() as conn:
+            result = conn.execute(
+                sql_text("SELECT storage_path, filename, file_type FROM document_kb_documents WHERE id = :id"),
+                {"id": int(file_id) if file_id.isdigit() else 0},
+            ).fetchone()
+            if result and result[0]:
+                stored_file = Path("/app/data/documents") / result[0]
+                if stored_file.exists():
+                    return _serve_file_with_viewer_conversion(stored_file, original_filename=result[1])
+
+        raise HTTPException(status_code=404, detail="File not found")
+
+    # --- Delete Document ---
+    @app.delete("/api/v1/documents/{doc_id}", tags=["Documents"])
+    async def delete_kb_document(doc_id: str, kb_id: str = "", workspace_id: str = ""):
+        """Delete a document and its chunks from the knowledge base."""
+        from sqlalchemy import text as sql_text
+
+        engine = _get_doc_db_engine()
+        with engine.connect() as conn:
+            conn.execute(sql_text("DELETE FROM document_kb_chunks WHERE document_id = :id"), {"id": int(doc_id)})
+            conn.execute(sql_text("DELETE FROM document_kb_documents WHERE id = :id"), {"id": int(doc_id)})
+            conn.commit()
+
+        return {"status": "deleted", "doc_id": doc_id}
+
+    # ==========================================================================
     # Metrics
     # ==========================================================================
 
