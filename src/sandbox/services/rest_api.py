@@ -1202,7 +1202,7 @@ def register_routes(app: FastAPI) -> None:
     # ==========================================================================
 
     FILE_UPLOAD_DIR = Path("/app/data/uploads")
-    ALLOWED_FILE_EXTENSIONS = {".csv", ".xlsx", ".xls"}
+    ALLOWED_FILE_EXTENSIONS = {".csv", ".xlsx", ".xls", ".xlsb"}
 
     @app.post("/api/v1/upload-file", tags=["File Upload"])
     async def upload_file(
@@ -1239,7 +1239,7 @@ def register_routes(app: FastAPI) -> None:
                 detail=f"Unsupported file type '{file_ext}'. Allowed: CSV, XLSX, XLS",
             )
 
-        is_excel = file_ext in (".xlsx", ".xls")
+        is_excel = file_ext in (".xlsx", ".xls", ".xlsb")
 
         FILE_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
         unique_id = str(uuid.uuid4())[:8]
@@ -1265,7 +1265,7 @@ def register_routes(app: FastAPI) -> None:
         try:
 
             if is_excel:
-                excel_engine = "openpyxl" if file_ext == ".xlsx" else "xlrd"
+                excel_engine = "openpyxl" if file_ext == ".xlsx" else ("pyxlsb" if file_ext == ".xlsb" else "xlrd")
                 excel_file = pd.ExcelFile(file_path, engine=excel_engine)
                 all_sheets = excel_file.sheet_names
 
@@ -1477,7 +1477,7 @@ def register_routes(app: FastAPI) -> None:
             with open(temp_path, "wb") as f:
                 f.write(content)
 
-            engine = "openpyxl" if file_ext == ".xlsx" else "xlrd"
+            engine = "openpyxl" if file_ext == ".xlsx" else ("pyxlsb" if file_ext == ".xlsb" else "xlrd")
             excel_file = pd.ExcelFile(temp_path, engine=engine)
             sheets = []
             for sheet_name in excel_file.sheet_names:
@@ -1630,7 +1630,7 @@ def register_routes(app: FastAPI) -> None:
 
                     if ext in (".xlsx", ".xls"):
                         # Reuse existing Excel loader
-                        excel_engine_name = "openpyxl" if ext == ".xlsx" else "xlrd"
+                        excel_engine_name = "openpyxl" if ext == ".xlsx" else ("pyxlsb" if ext == ".xlsb" else "xlrd")
                         excel_file = pd.ExcelFile(temp_path, engine=excel_engine_name)
                         sheets_to_import = excel_file.sheet_names
 
@@ -2684,6 +2684,286 @@ def register_routes(app: FastAPI) -> None:
             "folder_path": folder_path,
         }
 
+    # --- Load Spreadsheet (Excel/CSV) into PostgreSQL ---
+    @app.post("/api/v1/documents/load-spreadsheet", tags=["Documents"])
+    async def load_spreadsheet(request: Request):
+        """
+        Load an uploaded Excel/CSV file into PostgreSQL tables.
+
+        For Excel files: each sheet becomes one or more tables.
+        Uses openpyxl to detect formal Excel tables and data regions,
+        handling merged cells, title rows, and multi-table sheets.
+
+        Table naming: {filename}__{sheetname}__{table_index}
+        For CSV: {filename}__data__0
+
+        Returns connection_id + list of created tables with metadata.
+        """
+        import pandas as pd
+        from sandbox.services.file_loader import (
+            create_upload_database, load_dataframe_to_postgres,
+            sanitize_table_name,
+        )
+        from pydantic import SecretStr
+
+        body = await request.json()
+        file_id = body.get("file_id", "")
+        filename = body.get("filename", "unknown")
+        connection_name = body.get("connection_name", filename)
+        workspace_id = body.get("workspace_id", "")
+
+        # Find the uploaded file on disk
+        data_dir = Path("/app/data/documents")
+        file_path = None
+        for p in data_dir.rglob(f"{file_id}*"):
+            if p.is_file():
+                file_path = p
+                break
+
+        if not file_path or not file_path.exists():
+            raise HTTPException(status_code=404, detail=f"File {file_id} not found")
+
+        file_ext = file_path.suffix.lower()
+        if file_ext not in (".xlsx", ".xls", ".csv", ".xlsb"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported file type '{file_ext}'. Only .xlsx, .xls, .csv, .xlsb are supported.",
+            )
+
+        # Create a dedicated PostgreSQL database for this file connection
+        sql_engine, db_config = create_upload_database(connection_name)
+
+        # Strip extension for base table name
+        base_name = sanitize_table_name(
+            os.path.splitext(filename)[0]
+        )
+
+        table_results = []
+
+        try:
+            if file_ext == ".csv":
+                # CSV: single table
+                df = pd.read_csv(str(file_path))
+                if df.empty:
+                    raise HTTPException(status_code=400, detail="CSV file is empty")
+
+                # Clean column names
+                df.columns = [sanitize_table_name(str(c)) for c in df.columns]
+
+                tbl_name = f"{base_name}__data__0"
+                result = load_dataframe_to_postgres(
+                    df, tbl_name, has_header=True, engine=sql_engine,
+                )
+                table_results.append({
+                    "table_name": result["table_name"],
+                    "source_file": filename,
+                    "sheet_name": None,
+                    "table_index": 0,
+                    "row_count": result["row_count"],
+                    "column_count": result["column_count"],
+                    "columns": [{"name": c, "type": str(df[c].dtype)} for c in df.columns],
+                })
+
+            elif file_ext == ".xlsb":
+                # XLSB: binary Excel format — use pandas with pyxlsb engine
+                # Simple approach: one table per sheet, let pandas handle headers
+                excel_file = pd.ExcelFile(str(file_path), engine="pyxlsb")
+
+                for sheet_name in excel_file.sheet_names:
+                    safe_sheet = sanitize_table_name(sheet_name)
+
+                    try:
+                        df = pd.read_excel(
+                            excel_file, sheet_name=sheet_name, header=0,
+                        )
+                    except Exception as e:
+                        logger.warning("xlsb_sheet_read_failed", sheet=sheet_name, error=str(e))
+                        continue
+
+                    if df.empty:
+                        continue
+
+                    # Drop fully empty rows and columns
+                    df = df.dropna(how="all").dropna(axis=1, how="all")
+                    if df.empty or len(df) < 1:
+                        continue
+
+                    # Clean column names
+                    df.columns = [sanitize_table_name(str(c)) for c in df.columns]
+                    df = df.reset_index(drop=True)
+
+                    tbl_name = f"{base_name}__{safe_sheet}__0"
+                    result = load_dataframe_to_postgres(
+                        df, tbl_name, has_header=True, engine=sql_engine,
+                    )
+                    table_results.append({
+                        "table_name": result["table_name"],
+                        "source_file": filename,
+                        "sheet_name": sheet_name,
+                        "table_index": 0,
+                        "row_count": result["row_count"],
+                        "column_count": result["column_count"],
+                        "columns": [{"name": c, "type": str(df[c].dtype)} for c in df.columns],
+                    })
+
+                excel_file.close()
+
+            else:
+                # Excel (xlsx/xls): process each sheet with openpyxl
+                import openpyxl
+
+                wb = openpyxl.load_workbook(str(file_path), data_only=True, read_only=False)
+
+                for sheet_name in wb.sheetnames:
+                    ws = wb[sheet_name]
+                    safe_sheet = sanitize_table_name(sheet_name)
+
+                    # ── Step 1: Check for formal Excel tables (ListObjects) ──
+                    formal_tables = list(ws.tables.values()) if hasattr(ws, 'tables') else []
+
+                    if formal_tables:
+                        for t_idx, tbl in enumerate(formal_tables):
+                            try:
+                                # Parse table range (e.g., "A1:D50")
+                                min_col, min_row, max_col, max_row = openpyxl.utils.range_boundaries(tbl.ref)
+
+                                rows_data = []
+                                headers = []
+                                for r_idx, row in enumerate(
+                                    ws.iter_rows(min_row=min_row, max_row=max_row,
+                                                 min_col=min_col, max_col=max_col,
+                                                 values_only=True)
+                                ):
+                                    if r_idx == 0:
+                                        headers = [str(c) if c is not None else f"col_{i}"
+                                                   for i, c in enumerate(row)]
+                                    else:
+                                        rows_data.append(row)
+
+                                if not rows_data:
+                                    continue
+
+                                df = pd.DataFrame(rows_data, columns=headers)
+                                df.columns = [sanitize_table_name(c) for c in df.columns]
+
+                                tbl_name = f"{base_name}__{safe_sheet}__{t_idx}"
+                                result = load_dataframe_to_postgres(
+                                    df, tbl_name, has_header=True, engine=sql_engine,
+                                )
+                                table_results.append({
+                                    "table_name": result["table_name"],
+                                    "source_file": filename,
+                                    "sheet_name": sheet_name,
+                                    "table_index": t_idx,
+                                    "row_count": result["row_count"],
+                                    "column_count": result["column_count"],
+                                    "columns": [{"name": c, "type": str(df[c].dtype)} for c in df.columns],
+                                    "formal_table": tbl.displayName,
+                                })
+                            except Exception as e:
+                                logger.warning("formal_table_load_failed",
+                                               sheet=sheet_name, table=tbl.displayName, error=str(e))
+                                continue
+                    else:
+                        # ── Step 2: Fast loading with pandas (no formal tables) ──
+                        # Use pd.read_excel which is much faster than cell-by-cell openpyxl
+                        # Loads one table per sheet — simple, fast, reliable
+                        try:
+                            df = pd.read_excel(
+                                str(file_path),
+                                sheet_name=sheet_name,
+                                header=0,
+                                engine="openpyxl" if file_ext == ".xlsx" else "xlrd",
+                            )
+                        except Exception as e:
+                            logger.warning("sheet_read_failed", sheet=sheet_name, error=str(e))
+                            continue
+
+                        if df.empty:
+                            continue
+
+                        # Drop fully empty rows and columns
+                        df = df.dropna(how="all").dropna(axis=1, how="all")
+                        if df.empty or len(df) < 1:
+                            continue
+
+                        # Clean column names
+                        df.columns = [sanitize_table_name(str(c)) for c in df.columns]
+                        df = df.reset_index(drop=True)
+
+                        t_idx = 0
+                        tbl_name = f"{base_name}__{safe_sheet}__{t_idx}"
+                        result = load_dataframe_to_postgres(
+                            df, tbl_name, has_header=True, engine=sql_engine,
+                        )
+                        table_results.append({
+                            "table_name": result["table_name"],
+                            "source_file": filename,
+                            "sheet_name": sheet_name,
+                            "table_index": t_idx,
+                            "row_count": result["row_count"],
+                            "column_count": result["column_count"],
+                            "columns": [{"name": c, "type": str(df[c].dtype)} for c in df.columns],
+                        })
+
+                wb.close()
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error("spreadsheet_load_failed", filename=filename, error=str(e))
+            raise HTTPException(status_code=500, detail=f"Failed to load spreadsheet: {str(e)}")
+
+        if not table_results:
+            raise HTTPException(status_code=400, detail="No tables found in the file")
+
+        # Register a single connection for this upload database
+        from sandbox.core.config import DatabaseConnectionConfig, DatabaseType
+        from sandbox.core.connection_store import create_connection as db_create_connection
+
+        conn_id = str(uuid.uuid4())
+        db_create_connection({
+            "id": conn_id,
+            "name": connection_name,
+            "db_type": "postgresql",
+            "host": db_config["host"],
+            "port": db_config["port"],
+            "database": db_config["database"],
+            "username": db_config["username"],
+            "password": db_config["password"],
+            "ssl_enabled": False,
+        })
+        new_conn = DatabaseConnectionConfig(
+            id=conn_id,
+            name=connection_name,
+            db_type=DatabaseType.POSTGRESQL,
+            host=db_config["host"],
+            port=db_config["port"],
+            database=db_config["database"],
+            username=db_config["username"],
+            password=SecretStr(db_config["password"]),
+            ssl_enabled=False,
+            created_at=datetime.now(timezone.utc).isoformat(),
+            updated_at=datetime.now(timezone.utc).isoformat(),
+        )
+        config = get_config()
+        config.database_connections.append(new_conn)
+
+        logger.info("spreadsheet_loaded",
+                     filename=filename, tables=len(table_results),
+                     total_rows=sum(t["row_count"] for t in table_results))
+
+        return JSONResponse(
+            status_code=201,
+            content={
+                "connection_id": conn_id,
+                "database": db_config["database"],
+                "tables": table_results,
+                "total_tables": len(table_results),
+                "total_rows": sum(t["row_count"] for t in table_results),
+            },
+        )
+
     # --- Process Document ---
     @app.post("/api/v1/documents/process", tags=["Documents"])
     async def process_document(request: Request):
@@ -3688,7 +3968,7 @@ def register_routes(app: FastAPI) -> None:
                 sql_text("""
                     SELECT id, filename, file_type, file_size, status, error_message,
                            chunk_count, progress, created_at, updated_at,
-                           source_path, source_type, storage_path
+                           source_path, source_type, storage_path, summary
                     FROM document_kb_documents
                     WHERE knowledge_base_id = :kb_id
                     ORDER BY created_at DESC
@@ -3704,7 +3984,7 @@ def register_routes(app: FastAPI) -> None:
                     "created_at": row[8].isoformat() if row[8] else None,
                     "updated_at": row[9].isoformat() if row[9] else None,
                     "source_path": row[10], "source_type": row[11],
-                    "storage_path": row[12],
+                    "storage_path": row[12], "summary": row[13],
                 })
 
         return {"documents": docs}
@@ -3862,6 +4142,8 @@ def register_routes(app: FastAPI) -> None:
             ".csv": "text/csv; charset=utf-8",
             ".html": "text/html; charset=utf-8",
             ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ".xlsb": "application/vnd.ms-excel.sheet.binary.macroEnabled.12",
+            ".xls": "application/vnd.ms-excel",
             ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
             ".png": "image/png",
             ".jpg": "image/jpeg",
@@ -3940,6 +4222,58 @@ def register_routes(app: FastAPI) -> None:
                     return _serve_file_with_viewer_conversion(stored_file, original_filename=result[1])
 
         raise HTTPException(status_code=404, detail="File not found")
+
+    # --- Serve Spreadsheet as JSON ---
+    @app.get("/api/v1/documents/file/{file_id}/sheets", tags=["Documents"])
+    async def get_spreadsheet_sheets(file_id: str, workspace_id: str = ""):
+        """Parse a spreadsheet file server-side and return all sheets as JSON.
+
+        Much faster than client-side parsing for large files.
+        Returns: {"sheets": [{"name": "Sheet1", "headers": [...], "rows": [[...], ...]}, ...]}
+        """
+        import pandas as pd
+
+        data_dir = Path("/app/data/documents")
+        file_path = None
+        for p in data_dir.rglob(f"{file_id}*"):
+            if p.is_file():
+                ext = p.suffix.lower()
+                if ext in (".xlsx", ".xls", ".xlsb", ".csv"):
+                    file_path = p
+                    break
+
+        if not file_path:
+            raise HTTPException(status_code=404, detail="Spreadsheet file not found")
+
+        ext = file_path.suffix.lower()
+        MAX_ROWS_PER_SHEET = 500  # Limit for viewer preview
+
+        try:
+            sheets = []
+            if ext == ".csv":
+                df = pd.read_csv(str(file_path), nrows=MAX_ROWS_PER_SHEET)
+                headers = [str(c) for c in df.columns]
+                rows = df.fillna("").astype(str).values.tolist()
+                sheets.append({"name": "data", "headers": headers, "rows": rows, "total_rows": len(rows)})
+            else:
+                engine = "openpyxl" if ext == ".xlsx" else ("pyxlsb" if ext == ".xlsb" else "xlrd")
+                excel_file = pd.ExcelFile(str(file_path), engine=engine)
+                for sheet_name in excel_file.sheet_names:
+                    try:
+                        df = pd.read_excel(excel_file, sheet_name=sheet_name, header=0, nrows=MAX_ROWS_PER_SHEET)
+                        df = df.dropna(how="all").dropna(axis=1, how="all")
+                        if df.empty:
+                            continue
+                        headers = [str(c) for c in df.columns]
+                        rows = df.fillna("").astype(str).values.tolist()
+                        sheets.append({"name": sheet_name, "headers": headers, "rows": rows, "total_rows": len(rows)})
+                    except Exception:
+                        continue
+                excel_file.close()
+
+            return {"sheets": sheets, "total_sheets": len(sheets)}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to parse spreadsheet: {str(e)}")
 
     # --- Delete Document ---
     @app.delete("/api/v1/documents/{doc_id}", tags=["Documents"])
