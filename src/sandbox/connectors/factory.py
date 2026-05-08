@@ -137,6 +137,19 @@ def _load_connector(db_type: DatabaseType) -> Type[BaseConnector] | None:
                 )
                 return None
 
+        elif db_type == DatabaseType.SAPHANA:
+            # SAP HANA connector
+            try:
+                from sandbox.connectors.saphana import SAPHANAConnector
+                register_connector(db_type, SAPHANAConnector)
+                return SAPHANAConnector
+            except ImportError:
+                logger.warning(
+                    "saphana_connector_not_available",
+                    message="Install hdbcli to use SAP HANA",
+                )
+                return None
+
         else:
             logger.warning(
                 "connector_not_implemented",

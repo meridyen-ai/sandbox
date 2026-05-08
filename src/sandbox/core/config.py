@@ -47,6 +47,7 @@ class DatabaseType(str, Enum):
     ORACLE = "oracle"
     REDSHIFT = "redshift"
     CLICKHOUSE = "clickhouse"
+    SAPHANA = "saphana"
 
 
 class LogLevel(str, Enum):
