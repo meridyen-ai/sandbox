@@ -132,6 +132,7 @@ export const ConnectionForm: React.FC<ConnectionFormProps> = ({
 
     setLoading(true)
     setError(null)
+    setTestResult(null)
 
     try {
       const connArgs = buildConnectionArgs()
@@ -171,6 +172,14 @@ export const ConnectionForm: React.FC<ConnectionFormProps> = ({
         schema_name:
           (connArgs.schema as string) || (connArgs.schema_name as string),
         ssl_enabled: (connArgs.ssl_enabled as boolean) ?? true,
+      }
+
+      // Test the connection before creating it
+      const testRes = await api.connections.test(connectionConfig)
+      if (!testRes.success) {
+        setTestResult({ success: false, message: testRes.message })
+        setLoading(false)
+        return
       }
 
       const result = await api.connections.create(connectionConfig)

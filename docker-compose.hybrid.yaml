@@ -15,7 +15,7 @@ services:
   # Sandbox PostgreSQL - Dedicated database for uploaded file data
   # ---------------------------------------------------------------------------
   sandbox-postgres:
-    image: postgres:16-alpine
+    image: pgvector/pgvector:pg16
     container_name: meridyen-sandbox-postgres
     restart: unless-stopped
 
@@ -56,6 +56,12 @@ services:
       dockerfile: Dockerfile
     container_name: meridyen-sandbox
     restart: unless-stopped
+
+    # Tag this container so the `autoheal` sidecar will restart it when
+    # Docker marks it unhealthy (the healthcheck below catches FreeTDS
+    # worker crashes that --reload alone can't recover from).
+    labels:
+      - "autoheal=true"
 
     depends_on:
       sandbox-postgres:
@@ -127,11 +133,29 @@ services:
           memory: "512M"
 
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      # Fail if the uvicorn worker is dead/defunct or /health doesn't answer fast.
+      # /health alone is not enough: the --reload parent keeps the port open
+      # and answers even after the worker process abort()s (e.g. FreeTDS crash).
+      # The pattern is built at runtime so it doesn't appear in this script's
+      # own cmdline and produce a self-match.
+      test:
+        - CMD-SHELL
+        - |
+          set -e
+          pat="$$(printf 'spawn_%s(tracker_fd' main)"
+          live=0
+          for d in /proc/[0-9]*; do
+            [ -r "$$d/status" ] || continue
+            grep -q '^State:.[RSDT]' "$$d/status" 2>/dev/null || continue
+            tr '\0' ' ' < "$$d/cmdline" 2>/dev/null \
+              | grep -qF "$$pat" && { live=1; break; }
+          done
+          [ "$$live" = 1 ]
+          curl -fsS --max-time 5 http://localhost:8080/health > /dev/null
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 10s
+      start_period: 30s
 
     logging:
       driver: "json-file"
@@ -139,13 +163,32 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  # ---------------------------------------------------------------------------
+  # Autoheal sidecar - restarts containers that Docker marks unhealthy.
+  # Restart policy on its own only restarts on container exit, not on an
+  # unhealthy state, so we need this to actually act on the healthcheck above.
+  # Only acts on containers labeled `autoheal=true`.
+  # ---------------------------------------------------------------------------
+  autoheal:
+    image: willfarrell/autoheal:latest
+    container_name: meridyen-sandbox-autoheal
+    restart: unless-stopped
+    environment:
+      - AUTOHEAL_CONTAINER_LABEL=autoheal
+      - AUTOHEAL_INTERVAL=10
+      - AUTOHEAL_START_PERIOD=60
+      - CURL_TIMEOUT=30
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
 volumes:
   sandbox_data:
     driver: local
   sandbox_logs:
     driver: local
   sandbox_postgres_data:
-    driver: local
+    external: true
+    name: meridyen_sandbox_postgres_data
 
 networks:
   sandbox-network:

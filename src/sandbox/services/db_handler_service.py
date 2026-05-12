@@ -1080,6 +1080,8 @@ class SAPHANAHandler(BaseDBHandler):
                 conn_params["currentSchema"] = connection_data["schema"]
             if connection_data.get("encrypt") is not None:
                 conn_params["encrypt"] = connection_data["encrypt"]
+                if connection_data["encrypt"]:
+                    conn_params["sslValidateCertificate"] = False
 
             conn = dbapi.connect(**conn_params)
             cursor = conn.cursor()
