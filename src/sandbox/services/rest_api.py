@@ -247,6 +247,21 @@ def _verify_user_token(token: str) -> dict[str, Any] | None:
 _api_key_engine = None
 
 
+def _resolve_cookie_secure(request: Request) -> bool:
+    """Decide cookie Secure flag.
+
+    SECURE_COOKIES: "auto" (default) detects from scheme so one image serves
+    HTTPS cloud and HTTP airgap. "true"/"false" force the flag for proxies
+    that don't forward X-Forwarded-Proto.
+    """
+    mode = os.environ.get("SECURE_COOKIES", "auto").strip().lower()
+    if mode == "true":
+        return True
+    if mode == "false":
+        return False
+    return request.url.scheme == "https"
+
+
 def _get_api_key_engine():
     """Get or create SQLAlchemy engine for the API keys database."""
     global _api_key_engine
@@ -572,7 +587,7 @@ def register_routes(app: FastAPI) -> None:
     # ==========================================================================
 
     @app.post("/api/v1/auth/login", tags=["Auth"])
-    async def auth_login(payload: LoginRequest, response: Response) -> JSONResponse:
+    async def auth_login(payload: LoginRequest, request: Request, response: Response) -> JSONResponse:
         """Authenticate with username and password defined in .env."""
         expected_username = os.environ.get("SANDBOX_AUTH_USERNAME", "admin")
         expected_password = os.environ.get("SANDBOX_AUTH_PASSWORD", "admin123")
@@ -592,7 +607,7 @@ def register_routes(app: FastAPI) -> None:
                 key="sandbox_token",
                 value=token,
                 httponly=True,
-                secure=os.environ.get("SANDBOX_ENVIRONMENT", "") in ("production", "preprod"),
+                secure=_resolve_cookie_secure(request),
                 samesite="lax",
                 max_age=86400 * 7,  # 7 days
                 path="/",
@@ -618,13 +633,13 @@ def register_routes(app: FastAPI) -> None:
         })
 
     @app.post("/api/v1/auth/logout", tags=["Auth"])
-    async def auth_logout(response: Response) -> JSONResponse:
+    async def auth_logout(request: Request, response: Response) -> JSONResponse:
         """Clear user session cookie."""
         response = JSONResponse(content={"message": "Logged out"})
         response.delete_cookie(
             key="sandbox_token",
             httponly=True,
-            secure=os.environ.get("SANDBOX_ENVIRONMENT", "") in ("production", "preprod"),
+            secure=_resolve_cookie_secure(request),
             samesite="lax",
             path="/",
         )
