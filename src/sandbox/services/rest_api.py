@@ -487,6 +487,31 @@ def create_rest_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    # Environment-aware, user-facing apology for production (TR + EN). In development we
+    # return full technical detail to the frontend so problems are easy to debug; in
+    # production we never leak internals — we show a bilingual "we are sorry" message.
+    PROD_ERROR_MESSAGE = (
+        "Üzgünüz, talebiniz şu anda işlenemedi. Lütfen birazdan tekrar deneyin. "
+        "/ Sorry, we couldn't process your request right now. Please try again shortly."
+    )
+
+    def _is_production() -> bool:
+        try:
+            return get_config().is_production()
+        except Exception:
+            # Fail safe: if we can't tell, hide internals.
+            return True
+
+    def _user_facing_error(exc: SandboxError) -> dict[str, Any]:
+        """Detailed payload in development; generic bilingual apology in production."""
+        if _is_production():
+            return {
+                "error": "execution_error",
+                "message": PROD_ERROR_MESSAGE,
+                "details": {},
+            }
+        return exc.to_dict()
+
     # Exception handlers
     @app.exception_handler(SandboxError)
     async def sandbox_error_handler(request, exc: SandboxError) -> JSONResponse:
@@ -496,10 +521,28 @@ def create_rest_app() -> FastAPI:
         elif isinstance(exc, AuthorizationError):
             status_code = status.HTTP_403_FORBIDDEN
 
-        return JSONResponse(
-            status_code=status_code,
-            content=exc.to_dict(),
-        )
+        # Auth errors keep their (non-sensitive, actionable) message in all environments;
+        # execution/validation errors are genericised in production.
+        if isinstance(exc, (AuthenticationError, AuthorizationError)):
+            content = exc.to_dict()
+        else:
+            content = _user_facing_error(exc)
+
+        return JSONResponse(status_code=status_code, content=content)
+
+    @app.exception_handler(Exception)
+    async def unhandled_error_handler(request, exc: Exception) -> JSONResponse:
+        """Catch-all so unexpected errors never leak internals in production."""
+        logger.error("unhandled_exception", error=str(exc), error_type=type(exc).__name__)
+        if _is_production():
+            content = {"error": "internal_error", "message": PROD_ERROR_MESSAGE, "details": {}}
+        else:
+            content = {
+                "error": "internal_error",
+                "message": f"{type(exc).__name__}: {exc}",
+                "details": {},
+            }
+        return JSONResponse(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, content=content)
 
     # Routes
     register_routes(app)
