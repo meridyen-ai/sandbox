@@ -167,22 +167,43 @@ class MSSQLConnector(BaseConnector[Any]):
             )
 
     async def get_tables(self, conn: Any, schema: str | None = None) -> list[str]:
-        """Get list of tables in the database, defaulting schema to 'dbo'."""
-        schema = schema or self.config.schema_name or "dbo"
+        """Get list of tables and views in the database.
+
+        When a schema is configured (explicitly or via the connection config),
+        only that schema is listed and bare table names are returned (legacy
+        behavior). When no schema is configured, ALL user schemas are listed
+        and names are returned schema-qualified ("schema.table") so callers can
+        tell them apart — otherwise everything would silently collapse to 'dbo'
+        and views in other schemas (e.g. 'meridyen') would be hidden.
+        """
+        schema = schema or self.config.schema_name
 
         def _get_tables() -> list[str]:
             cursor = conn.cursor()
+            if schema:
+                cursor.execute(
+                    """
+                    SELECT TABLE_NAME
+                    FROM INFORMATION_SCHEMA.TABLES
+                    WHERE TABLE_SCHEMA = %s
+                      AND TABLE_TYPE IN ('BASE TABLE', 'VIEW')
+                    ORDER BY TABLE_NAME
+                    """,
+                    (schema,),
+                )
+                return [row[0] for row in cursor.fetchall()]
+
+            # No schema configured: enumerate every user schema, qualified.
             cursor.execute(
                 """
-                SELECT TABLE_NAME
+                SELECT TABLE_SCHEMA, TABLE_NAME
                 FROM INFORMATION_SCHEMA.TABLES
-                WHERE TABLE_SCHEMA = %s
-                  AND TABLE_TYPE IN ('BASE TABLE', 'VIEW')
-                ORDER BY TABLE_NAME
-                """,
-                (schema,),
+                WHERE TABLE_TYPE IN ('BASE TABLE', 'VIEW')
+                  AND TABLE_SCHEMA NOT IN ('sys', 'INFORMATION_SCHEMA')
+                ORDER BY TABLE_SCHEMA, TABLE_NAME
+                """
             )
-            return [row[0] for row in cursor.fetchall()]
+            return [f"{row[0]}.{row[1]}" for row in cursor.fetchall()]
 
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(_executor, _get_tables)
@@ -190,8 +211,16 @@ class MSSQLConnector(BaseConnector[Any]):
     async def get_columns(
         self, conn: Any, table: str, schema: str | None = None
     ) -> list[dict[str, Any]]:
-        """Get column information for a table."""
-        schema = schema or self.config.schema_name or "dbo"
+        """Get column information for a table.
+
+        `table` may be schema-qualified ("schema.table"), as returned by
+        get_tables() when no single schema is configured; in that case the
+        embedded schema takes precedence over the `schema` argument.
+        """
+        if "." in table:
+            schema, table = table.split(".", 1)
+        else:
+            schema = schema or self.config.schema_name or "dbo"
 
         def _get_columns() -> list[dict[str, Any]]:
             cursor = conn.cursor()

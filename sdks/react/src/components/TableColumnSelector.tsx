@@ -47,20 +47,25 @@ interface DatabaseGroup {
 type TabType = 'all' | 'selected'
 
 function schemaDataToTableWithColumns(data: SchemaData): TableWithColumns[] {
-  const schemaName = data.schema || 'public'
-  return data.tables.map((table) => ({
-    schema_name: schemaName,
-    table_name: table.name,
-    table_type: 'table',
-    full_name: `${schemaName}.${table.name}`,
-    columns: table.columns.map((col) => ({
-      name: col.name,
-      data_type: col.type,
-      nullable: col.nullable ?? true,
-      default_value: null,
-      sample_data: null,
-    })),
-  }))
+  const defaultSchema = data.schema || 'public'
+  return data.tables.map((table) => {
+    // Prefer the table's own schema so multi-schema connections group
+    // correctly; fall back to the connection-level schema.
+    const schemaName = table.schema || defaultSchema
+    return {
+      schema_name: schemaName,
+      table_name: table.name,
+      table_type: 'table',
+      full_name: `${schemaName}.${table.name}`,
+      columns: table.columns.map((col) => ({
+        name: col.name,
+        data_type: col.type,
+        nullable: col.nullable ?? true,
+        default_value: null,
+        sample_data: null,
+      })),
+    }
+  })
 }
 
 /** Ensure every entry's `columns` is a string[] (backend may store as a dict). */
@@ -380,7 +385,7 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
         <AlertCircle className="w-10 h-10 text-red-500 mb-4" />
         <p className="text-red-600 dark:text-red-400 mb-4">{error}</p>
         <button
-          onClick={loadSchema}
+          onClick={() => loadSchema()}
           className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-medium"
         >
           <RefreshCw className="w-4 h-4" />

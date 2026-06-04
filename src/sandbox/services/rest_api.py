@@ -1864,7 +1864,12 @@ def register_routes(app: FastAPI) -> None:
                 tables_to_process = []
                 for table_name in tables:
                     if selected_tables_config:
-                        full_name = f"{schema_prefix}.{table_name}"
+                        # table_name may already be schema-qualified ("schema.table")
+                        # when the connection spans multiple schemas.
+                        full_name = (
+                            table_name if "." in table_name
+                            else f"{schema_prefix}.{table_name}"
+                        )
                         table_selection = selected_tables_config.get(full_name)
                         if not table_selection or not table_selection.get("selected"):
                             continue
@@ -1905,10 +1910,18 @@ def register_routes(app: FastAPI) -> None:
                             top_clause = f"TOP {sample_limit} " if is_mssql else ""
                             limit_clause = "" if is_mssql else f" LIMIT {sample_limit}"
 
-                            if conn_config.schema_name:
-                                sample_query = f'SELECT {top_clause}{col_list} FROM "{conn_config.schema_name}"."{table_name}"{limit_clause}'
+                            # Resolve the effective schema for this table: a
+                            # schema-qualified name takes precedence over the
+                            # connection-level schema.
+                            if "." in table_name:
+                                eff_schema, bare_table = table_name.split(".", 1)
                             else:
-                                sample_query = f'SELECT {top_clause}{col_list} FROM "{table_name}"{limit_clause}'
+                                eff_schema, bare_table = conn_config.schema_name, table_name
+
+                            if eff_schema:
+                                sample_query = f'SELECT {top_clause}{col_list} FROM "{eff_schema}"."{bare_table}"{limit_clause}'
+                            else:
+                                sample_query = f'SELECT {top_clause}{col_list} FROM "{bare_table}"{limit_clause}'
 
                             result = await connector.execute(conn, sample_query)
 
@@ -1975,6 +1988,13 @@ def register_routes(app: FastAPI) -> None:
                     try:
                         is_mssql = conn_config.db_type == DatabaseType.MSSQL
 
+                        # A schema-qualified name takes precedence over the
+                        # connection-level schema.
+                        if "." in table_name:
+                            eff_schema, bare_table = table_name.split(".", 1)
+                        else:
+                            eff_schema, bare_table = conn_config.schema_name, table_name
+
                         if is_mssql:
                             # T-SQL uses [schema].[table], not PostgreSQL-style double quotes.
                             def _mssql_esc(n: str) -> str:
@@ -1987,13 +2007,13 @@ def register_routes(app: FastAPI) -> None:
                             else:
                                 col_list = "*"
                             top_clause = f"TOP {sample_limit} "
-                            if conn_config.schema_name:
+                            if eff_schema:
                                 from_part = (
-                                    f"[{_mssql_esc(conn_config.schema_name)}]"
-                                    f".[{_mssql_esc(table_name)}]"
+                                    f"[{_mssql_esc(eff_schema)}]"
+                                    f".[{_mssql_esc(bare_table)}]"
                                 )
                             else:
-                                from_part = f"[{_mssql_esc(table_name)}]"
+                                from_part = f"[{_mssql_esc(bare_table)}]"
                             sample_query = f"SELECT {top_clause}{col_list} FROM {from_part}"
                         else:
                             if selected_columns:
@@ -2002,15 +2022,15 @@ def register_routes(app: FastAPI) -> None:
                                 col_list = "*"
                             top_clause = ""
                             limit_clause = f" LIMIT {sample_limit}"
-                            if conn_config.schema_name:
+                            if eff_schema:
                                 sample_query = (
                                     f'SELECT {top_clause}{col_list} FROM '
-                                    f'"{conn_config.schema_name}"."{table_name}"{limit_clause}'
+                                    f'"{eff_schema}"."{bare_table}"{limit_clause}'
                                 )
                             else:
                                 sample_query = (
                                     f'SELECT {top_clause}{col_list} FROM '
-                                    f'"{table_name}"{limit_clause}'
+                                    f'"{bare_table}"{limit_clause}'
                                 )
 
                         result = await connector.execute(conn, sample_query)
@@ -2068,7 +2088,12 @@ def register_routes(app: FastAPI) -> None:
                 tables_to_sync = []
                 for table_name in tables:
                     if selected_tables_config:
-                        full_name = f"{schema_prefix}.{table_name}"
+                        # table_name may already be schema-qualified ("schema.table")
+                        # when the connection spans multiple schemas.
+                        full_name = (
+                            table_name if "." in table_name
+                            else f"{schema_prefix}.{table_name}"
+                        )
                         table_selection = selected_tables_config.get(full_name)
                         if not table_selection or not table_selection.get("selected"):
                             continue
@@ -2115,6 +2140,13 @@ def register_routes(app: FastAPI) -> None:
                                     def _mssql_esc2(n: str) -> str:
                                         return str(n).replace("]", "]]")
 
+                                    # A schema-qualified name takes precedence
+                                    # over the connection-level schema.
+                                    if "." in tname:
+                                        eff_schema, bare_table = tname.split(".", 1)
+                                    else:
+                                        eff_schema, bare_table = conn_config.schema_name, tname
+
                                     if is_mssql:
                                         if sel_cols:
                                             col_list = ", ".join(
@@ -2123,13 +2155,13 @@ def register_routes(app: FastAPI) -> None:
                                         else:
                                             col_list = "*"
                                         top_clause = f"TOP {sample_limit} "
-                                        if conn_config.schema_name:
+                                        if eff_schema:
                                             from_part = (
-                                                f"[{_mssql_esc2(conn_config.schema_name)}]"
-                                                f".[{_mssql_esc2(tname)}]"
+                                                f"[{_mssql_esc2(eff_schema)}]"
+                                                f".[{_mssql_esc2(bare_table)}]"
                                             )
                                         else:
-                                            from_part = f"[{_mssql_esc2(tname)}]"
+                                            from_part = f"[{_mssql_esc2(bare_table)}]"
                                         sample_query = (
                                             f"SELECT {top_clause}{col_list} FROM {from_part}"
                                         )
@@ -2140,15 +2172,15 @@ def register_routes(app: FastAPI) -> None:
                                             col_list = "*"
                                         top_clause = ""
                                         limit_clause = f" LIMIT {sample_limit}"
-                                        if conn_config.schema_name:
+                                        if eff_schema:
                                             sample_query = (
                                                 f'SELECT {top_clause}{col_list} FROM '
-                                                f'"{conn_config.schema_name}"."{tname}"{limit_clause}'
+                                                f'"{eff_schema}"."{bare_table}"{limit_clause}'
                                             )
                                         else:
                                             sample_query = (
                                                 f'SELECT {top_clause}{col_list} FROM '
-                                                f'"{tname}"{limit_clause}'
+                                                f'"{bare_table}"{limit_clause}'
                                             )
                                     async with connector.get_connection() as sconn:
                                         result = await connector.execute(sconn, sample_query)

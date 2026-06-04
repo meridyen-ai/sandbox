@@ -46,6 +46,12 @@ export interface TableSampleData {
 
 export interface Table {
   name: string
+  /**
+   * Schema this table belongs to. Optional for backward compatibility; when
+   * present it lets a connection expose tables from multiple schemas in one
+   * SchemaData (otherwise the single top-level `SchemaData.schema` is used).
+   */
+  schema?: string
   columns: TableColumn[]
   sample_data?: TableSampleData | null
 }
