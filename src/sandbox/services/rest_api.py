@@ -155,8 +155,8 @@ class ConnectionConfig(BaseModel):
     @property
     def normalized_db_type(self) -> str:
         """Normalize common db_type aliases to canonical enum values."""
-        aliases = {"postgres": "postgresql", "pg": "postgresql", "mssql_server": "mssql", "sqlserver": "mssql", "sap_hana": "saphana", "hana": "saphana"}
-        return aliases.get(self.db_type.lower(), self.db_type.lower())
+        from sandbox.core.config import normalize_db_type
+        return normalize_db_type(self.db_type)
 
 
 class AIGenerateQueryRequest(BaseModel):
