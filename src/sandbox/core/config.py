@@ -89,7 +89,7 @@ class DatabaseConnectionConfig(BaseModel):
     username: str = Field(..., description="Database username")
     password: SecretStr = Field(..., description="Database password")
     schema_name: str | None = Field(None, description="Default schema")
-    ssl_enabled: bool = Field(True, description="Enable SSL/TLS")
+    ssl_enabled: bool = Field(False, description="Enable SSL/TLS (opt-in; internal Docker Postgres runs ssl=off and rejects upgrades)")
     ssl_ca_cert: str | None = Field(None, description="SSL CA certificate path")
     connection_timeout: int = Field(30, description="Connection timeout in seconds")
     query_timeout: int = Field(300, description="Query timeout in seconds")

@@ -150,7 +150,11 @@ class ConnectionConfig(BaseModel):
     username: str
     password: str
     schema_name: str | None = None
-    ssl_enabled: bool = True
+    # SSL must be opt-in: internal Docker-network Postgres (postgres, os-postgres,
+    # sandbox-postgres, shared-postgres) run with ssl=off and reject the upgrade.
+    # Defaulting True caused "rejected SSL upgrade" on every query for sources
+    # saved without an explicit ssl flag. Callers that need SSL set it explicitly.
+    ssl_enabled: bool = False
 
     @property
     def normalized_db_type(self) -> str:
