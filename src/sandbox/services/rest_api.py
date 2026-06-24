@@ -1096,8 +1096,21 @@ def register_routes(app: FastAPI) -> None:
         connection_id: str,
         token_data: dict = Depends(verify_sandbox_token),
     ) -> JSONResponse:
-        """Delete a database connection."""
-        from sandbox.core.connection_store import delete_connection as db_delete_connection
+        """Delete a database connection.
+
+        For file-based sources (CSV/Excel), each upload was loaded into its own
+        dedicated PostgreSQL database. Removing only the connection record would
+        orphan that database, so we drop it too once the record is gone.
+        """
+        from sandbox.core.connection_store import (
+            delete_connection as db_delete_connection,
+            get_connection as db_get_connection,
+        )
+        from sandbox.services.file_loader import drop_upload_database_by_name
+
+        # Capture the upload database name before the record is removed.
+        existing = db_get_connection(connection_id)
+        upload_db_name = (existing or {}).get("database")
 
         deleted = db_delete_connection(connection_id)
         if not deleted:
@@ -1106,6 +1119,20 @@ def register_routes(app: FastAPI) -> None:
         # Remove from in-memory config
         config = get_config()
         config.database_connections = [c for c in config.database_connections if c.id != connection_id]
+
+        # Reclaim the per-upload database. Best-effort: the connection record is
+        # already gone, so a failure here must not fail the request — the guard
+        # inside drop_upload_database_by_name ensures only upload_* databases are
+        # ever touched (external/managed connections are left untouched).
+        if upload_db_name:
+            try:
+                drop_upload_database_by_name(upload_db_name)
+            except Exception:
+                logger.exception(
+                    "upload_database_drop_failed",
+                    connection_id=connection_id,
+                    database=upload_db_name,
+                )
 
         return JSONResponse(content={
             "message": "Connection deleted successfully"
