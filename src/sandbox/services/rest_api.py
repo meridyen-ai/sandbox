@@ -1955,6 +1955,7 @@ def register_routes(app: FastAPI) -> None:
     async def full_sync_schema(
         include_samples: bool = True,
         sample_limit: int = 10,
+        connection_ids: str | None = None,
         token_data: dict = Depends(verify_sandbox_token),
     ) -> JSONResponse:
         """
@@ -1962,6 +1963,12 @@ def register_routes(app: FastAPI) -> None:
 
         Pulls all connection metadata in one call.
         No credentials are included in the response.
+
+        connection_ids: optional comma-separated list of connection ids. When
+        provided, only those connections are introspected. Callers syncing a
+        single connection should always pass this — otherwise every connection
+        in the (space-agnostic) store is introspected on each sync, which can
+        take minutes and time out when the store holds many or large databases.
         """
         from sandbox.connectors.factory import get_connector
         from sandbox.core.config import DatabaseType, get_config
@@ -2216,26 +2223,48 @@ def register_routes(app: FastAPI) -> None:
 
             return connection_data
 
-        # Sync all connections in parallel
+        # Scope to the requested connections when a filter is provided. Without
+        # this, a single-connection sync introspects the entire (space-agnostic)
+        # store — every other database, however large or unreachable.
+        conns_to_sync = config.database_connections
+        if connection_ids:
+            wanted = {c.strip() for c in connection_ids.split(",") if c.strip()}
+            conns_to_sync = [c for c in conns_to_sync if str(c.id) in wanted]
+
+        # Guard each connection with a hard timeout so one slow/unreachable
+        # database can't stall the whole sync past the caller's deadline.
+        per_connection_timeout = 90.0
+
+        async def _sync_connection_guarded(cc):
+            return await asyncio.wait_for(
+                _sync_connection(cc), timeout=per_connection_timeout
+            )
+
+        # Sync the selected connections in parallel
         results = await asyncio.gather(
-            *[_sync_connection(cc) for cc in config.database_connections],
+            *[_sync_connection_guarded(cc) for cc in conns_to_sync],
             return_exceptions=True,
         )
         synced_connections = []
         for i, result in enumerate(results):
             if isinstance(result, Exception):
-                cc = config.database_connections[i]
+                cc = conns_to_sync[i]
+                err = (
+                    "introspection timed out"
+                    if isinstance(result, asyncio.TimeoutError)
+                    else str(result)
+                )
                 logger.warning(
                     "full_sync_connection_error",
                     connection=cc.id,
-                    error=str(result),
+                    error=err,
                 )
                 synced_connections.append({
                     "id": cc.id,
                     "name": cc.name,
                     "db_type": cc.db_type.value,
                     "tables": [],
-                    "error": str(result),
+                    "error": err,
                 })
             else:
                 synced_connections.append(result)
