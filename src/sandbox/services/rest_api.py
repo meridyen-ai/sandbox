@@ -2659,6 +2659,180 @@ def register_routes(app: FastAPI) -> None:
     except Exception as e:
         logger.warning("document_kb_tables_init_failed", error=str(e))
 
+    # --- Load Spreadsheet into PostgreSQL tables ---
+    @app.post("/api/v1/documents/load-spreadsheet", tags=["Documents"])
+    async def load_spreadsheet_document(request: Request):
+        """
+        Load an already-uploaded Excel/CSV document into PostgreSQL tables.
+
+        Unlike RAG/vector indexing (``/documents/process``), this materializes
+        every sheet/table in the file as a real PostgreSQL table so the data can
+        be queried with SQL. The source file must have been uploaded earlier via
+        ``/api/v1/documents/upload`` and is located here by its ``file_id``.
+
+        Request JSON: ``{file_id, filename, connection_name, space_id}``
+        Returns: ``{status, connection_id, database, host, port, tables,
+                    total_tables, total_rows}`` — the contract the data-analyst
+        backend's sandbox client expects (services/sandbox_client/client.py
+        ``load_spreadsheet``).
+        """
+        import os
+        import pandas as pd
+        from sandbox.core.config import (
+            DatabaseConnectionConfig, DatabaseType, get_config,
+        )
+        from sandbox.core.connection_store import create_connection as db_create_connection
+        from sandbox.services.file_loader import (
+            create_upload_database, sanitize_table_name,
+            load_csv_to_postgres, load_excel_sheet_to_postgres,
+        )
+        from pydantic import SecretStr
+
+        body = await request.json()
+        file_id = (body.get("file_id") or "").strip()
+        filename = body.get("filename") or "spreadsheet"
+        connection_name = (body.get("connection_name") or filename or "spreadsheet").strip()
+
+        if not file_id:
+            raise HTTPException(status_code=400, detail="file_id is required")
+
+        file_ext = os.path.splitext(filename)[1].lower()
+        if file_ext not in {".csv", ".xlsx", ".xls"}:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported spreadsheet type '{file_ext}'. Allowed: CSV, XLSX, XLS",
+            )
+
+        # Locate the uploaded file by file_id — documents are stored at
+        # /app/data/documents/{workspace_id}/{folder_path}/{file_id}.ext, so we
+        # search recursively (same strategy as /documents/process).
+        data_dir = Path("/app/data/documents")
+        file_path = None
+        for p in data_dir.rglob(f"{file_id}*"):
+            if p.is_file():
+                file_path = str(p)
+                break
+        if not file_path or not os.path.exists(file_path):
+            raise HTTPException(status_code=404, detail=f"File {file_id} not found in sandbox storage")
+
+        config = get_config()
+        now = datetime.now(timezone.utc).isoformat()
+
+        # Dedicated upload database for this spreadsheet's tables.
+        sql_engine, db_config = create_upload_database(connection_name)
+
+        try:
+            is_excel = file_ext in (".xlsx", ".xls")
+            base_table = sanitize_table_name(connection_name)
+            table_stats: list[dict] = []
+            total_rows = 0
+
+            if is_excel:
+                excel_engine = "openpyxl" if file_ext == ".xlsx" else "xlrd"
+                excel_file = pd.ExcelFile(file_path, engine=excel_engine)
+                all_sheets = excel_file.sheet_names
+                if not all_sheets:
+                    raise HTTPException(status_code=400, detail="Excel file contains no sheets")
+
+                for sheet_name in all_sheets:
+                    table_name = (
+                        f"{base_table}_{sanitize_table_name(sheet_name)}"
+                        if len(all_sheets) > 1
+                        else base_table
+                    )
+                    result = load_excel_sheet_to_postgres(
+                        file_path, sheet_name, table_name,
+                        has_header=True, engine=sql_engine,
+                    )
+                    if result["row_count"] == 0:
+                        continue
+                    total_rows += result["row_count"]
+                    table_stats.append({
+                        "table_name": result["table_name"],
+                        "sheet_name": sheet_name,
+                        "row_count": result["row_count"],
+                        "column_count": result["column_count"],
+                    })
+
+                if not table_stats:
+                    raise HTTPException(status_code=400, detail="All sheets are empty")
+            else:
+                result = load_csv_to_postgres(
+                    file_path, base_table,
+                    delimiter=",", has_header=True, engine=sql_engine,
+                )
+                if result["row_count"] == 0:
+                    raise HTTPException(status_code=400, detail="CSV file is empty")
+                total_rows += result["row_count"]
+                table_stats.append({
+                    "table_name": result["table_name"],
+                    "sheet_name": None,
+                    "row_count": result["row_count"],
+                    "column_count": result["column_count"],
+                })
+
+            # Register ONE sandbox connection pointing at the upload database, so
+            # query-time code can run SQL against the materialized tables.
+            conn_id = str(uuid.uuid4())
+            db_create_connection({
+                "id": conn_id,
+                "name": connection_name,
+                "db_type": "postgresql",
+                "host": db_config["host"],
+                "port": db_config["port"],
+                "database": db_config["database"],
+                "username": db_config["username"],
+                "password": db_config["password"],
+                "ssl_enabled": False,
+            })
+            new_conn = DatabaseConnectionConfig(
+                id=conn_id,
+                name=connection_name,
+                db_type=DatabaseType.POSTGRESQL,
+                host=db_config["host"],
+                port=db_config["port"],
+                database=db_config["database"],
+                username=db_config["username"],
+                password=SecretStr(db_config["password"]),
+                ssl_enabled=False,
+                created_at=now,
+                updated_at=now,
+            )
+            config.database_connections.append(new_conn)
+
+            logger.info(
+                "spreadsheet_loaded",
+                file_id=file_id,
+                filename=filename,
+                connection_id=conn_id,
+                tables=len(table_stats),
+                rows=total_rows,
+            )
+
+            return JSONResponse(
+                status_code=201,
+                content={
+                    "status": "ready",
+                    "success": True,
+                    "connection_id": conn_id,
+                    "name": connection_name,
+                    "host": db_config["host"],
+                    "port": db_config["port"],
+                    "database": db_config["database"],
+                    "tables": table_stats,
+                    "total_tables": len(table_stats),
+                    "total_rows": total_rows,
+                },
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error("spreadsheet_load_failed", file_id=file_id, filename=filename, error=str(e))
+            return JSONResponse(
+                status_code=200,
+                content={"status": "failed", "error": str(e)},
+            )
+
     # --- Create Knowledge Base ---
     @app.post("/api/v1/documents/create-kb", tags=["Documents"])
     async def create_knowledge_base(request: Request):
