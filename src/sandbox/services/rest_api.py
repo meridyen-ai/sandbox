@@ -1975,9 +1975,18 @@ def register_routes(app: FastAPI) -> None:
 
         config = get_config()
 
+        # Bound the total number of physical DB connections opened concurrently
+        # across the whole full-sync. Without this, gathering every connection in
+        # parallel and every table within each connection in parallel (each table's
+        # sample fetch opens its own connection) fans out to hundreds of simultaneous
+        # connections and exhausts the target Postgres `max_connections`
+        # ("sorry, too many clients already"), leaving the schema partial/empty.
+        max_concurrent = max(1, config.resource_limits.max_concurrent_queries)
+        conn_semaphore = asyncio.Semaphore(max_concurrent)
+
         async def _sync_table(connector, conn_config, table_name, selected_columns, include_samples, sample_limit):
             """Fetch columns and sample data for a single table."""
-            async with connector.get_connection() as conn:
+            async with conn_semaphore, connector.get_connection() as conn:
                 columns_info = await connector.get_columns(
                     conn, table_name, schema=conn_config.schema_name
                 )
@@ -2079,7 +2088,7 @@ def register_routes(app: FastAPI) -> None:
             try:
                 connector = get_connector(conn_config.db_type, conn_config)
 
-                async with connector.get_connection() as conn:
+                async with conn_semaphore, connector.get_connection() as conn:
                     tables = await connector.get_tables(
                         conn, schema=conn_config.schema_name
                     )
@@ -2104,7 +2113,7 @@ def register_routes(app: FastAPI) -> None:
                 all_columns_batch = None
                 if tables_to_sync and hasattr(connector, 'get_all_columns'):
                     try:
-                        async with connector.get_connection() as conn:
+                        async with conn_semaphore, connector.get_connection() as conn:
                             all_columns_batch = await connector.get_all_columns(
                                 conn, schema=conn_config.schema_name
                             )
@@ -2173,7 +2182,7 @@ def register_routes(app: FastAPI) -> None:
                                                 f'SELECT {top_clause}{col_list} FROM '
                                                 f'"{tname}"{limit_clause}'
                                             )
-                                    async with connector.get_connection() as sconn:
+                                    async with conn_semaphore, connector.get_connection() as sconn:
                                         result = await connector.execute(sconn, sample_query)
                                     table_data["sample_data"] = {
                                         "columns": result.columns,
