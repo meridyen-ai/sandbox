@@ -120,9 +120,21 @@ class SQLValidator:
                 statement_type=query_upper.split()[0] if query_upper else "EMPTY",
             )
 
-        # Check banned patterns
+        # Check banned patterns.
+        # DML/DDL keywords (DELETE, DROP, UPDATE, CREATE, ...) are matched on WORD
+        # BOUNDARIES so the ban still catches the real statement/keyword but not the
+        # same letters appearing inside a legitimate identifier — e.g. the audit
+        # columns deleted_at / created_at / updated_at that every soft-delete table
+        # carries. A plain substring test flagged "deleted_at" as "DELETE" and blocked
+        # every WHERE deleted_at IS NULL filter. Symbol patterns ("--", "/*", "xp_",
+        # "sp_", ...) keep substring matching, since \b is meaningless around them.
         for pattern in self.security.banned_sql_patterns:
-            if pattern.upper() in query_upper:
+            pu = pattern.upper()
+            if pu and pu[0].isalpha() and pu[-1].isalnum():
+                hit = re.search(rf"\b{re.escape(pu)}\b", query_upper) is not None
+            else:
+                hit = pu in query_upper
+            if hit:
                 errors.append(f"Query contains banned pattern: {pattern}")
                 log_security_event(
                     "blocked_sql_pattern",
