@@ -72,6 +72,20 @@ def get_upload_db_config() -> dict[str, Any]:
     }
 
 
+def deduplicate_columns(columns: list[str]) -> list[str]:
+    """Ensure all column names are unique by appending _2, _3, etc. to duplicates."""
+    seen: dict[str, int] = {}
+    result = []
+    for col in columns:
+        if col in seen:
+            seen[col] += 1
+            result.append(f"{col}_{seen[col]}")
+        else:
+            seen[col] = 1
+            result.append(col)
+    return result
+
+
 def sanitize_table_name(name: str) -> str:
     """Convert a user-provided name into a safe SQL table identifier.
 
@@ -250,11 +264,11 @@ def load_csv_to_postgres(
     first_chunk = True
 
     for chunk in reader:
-        # Sanitize column names for PostgreSQL
-        chunk.columns = [
+        # Sanitize and deduplicate column names for PostgreSQL
+        chunk.columns = deduplicate_columns([
             sanitize_table_name(str(c)) if has_header else f"col_{i}"
             for i, c in enumerate(chunk.columns)
-        ]
+        ])
         column_count = len(chunk.columns)
 
         chunk.to_sql(
@@ -308,7 +322,7 @@ def load_excel_sheet_to_postgres(
 
     safe_table = sanitize_table_name(table_name)
     file_ext = Path(file_path).suffix.lower()
-    excel_engine = "openpyxl" if file_ext == ".xlsx" else "xlrd"
+    excel_engine = "openpyxl" if file_ext == ".xlsx" else ("pyxlsb" if file_ext == ".xlsb" else "xlrd")
 
     df = pd.read_excel(
         file_path,
@@ -320,11 +334,11 @@ def load_excel_sheet_to_postgres(
     if df.empty:
         return {"table_name": safe_table, "row_count": 0, "column_count": 0}
 
-    # Sanitize column names
-    df.columns = [
+    # Sanitize and deduplicate column names
+    df.columns = deduplicate_columns([
         sanitize_table_name(str(c)) if has_header else f"col_{i}"
         for i, c in enumerate(df.columns)
-    ]
+    ])
 
     # Load in chunks for large sheets
     total_rows = len(df)
@@ -395,11 +409,11 @@ def load_dataframe_to_postgres(
     if df.empty:
         return {"table_name": safe_table, "row_count": 0, "column_count": 0}
 
-    # Sanitize column names
-    df.columns = [
+    # Sanitize and deduplicate column names
+    df.columns = deduplicate_columns([
         sanitize_table_name(str(c)) if has_header else f"col_{i}"
         for i, c in enumerate(df.columns)
-    ]
+    ])
 
     total_rows = len(df)
     column_count = len(df.columns)
