@@ -50,6 +50,24 @@ class DatabaseType(str, Enum):
     SAPHANA = "saphana"
 
 
+# Aliases for db_type strings that arrive from other services / older persisted rows.
+# File and sheet uploads (csv/excel/google sheets) are materialized into the sandbox
+# Postgres, so they connect as plain postgresql.
+_DB_TYPE_ALIASES = {
+    "postgres": "postgresql", "pg": "postgresql",
+    "mssql_server": "mssql", "sqlserver": "mssql",
+    "sap_hana": "saphana", "hana": "saphana",
+    "csv": "postgresql", "excel": "postgresql", "xlsx": "postgresql", "xls": "postgresql",
+    "sheet": "postgresql", "google_sheet": "postgresql", "gsheet": "postgresql",
+}
+
+
+def normalize_db_type(db_type: str) -> str:
+    """Normalize a raw db_type string to a canonical DatabaseType value."""
+    key = (db_type or "").lower()
+    return _DB_TYPE_ALIASES.get(key, key)
+
+
 class LogLevel(str, Enum):
     """Log levels."""
     DEBUG = "DEBUG"
@@ -71,7 +89,7 @@ class DatabaseConnectionConfig(BaseModel):
     username: str = Field(..., description="Database username")
     password: SecretStr = Field(..., description="Database password")
     schema_name: str | None = Field(None, description="Default schema")
-    ssl_enabled: bool = Field(True, description="Enable SSL/TLS")
+    ssl_enabled: bool = Field(False, description="Enable SSL/TLS (opt-in; internal Docker Postgres runs ssl=off and rejects upgrades)")
     ssl_ca_cert: str | None = Field(None, description="SSL CA certificate path")
     connection_timeout: int = Field(30, description="Connection timeout in seconds")
     query_timeout: int = Field(300, description="Query timeout in seconds")
@@ -379,7 +397,7 @@ def get_config() -> SandboxConfig:
         for row in list_connections():
             conn_data = dict(row)
             conn_data["password"] = _SecretStr(conn_data.get("password", ""))
-            conn_data["db_type"] = DatabaseType(conn_data["db_type"])
+            conn_data["db_type"] = DatabaseType(normalize_db_type(conn_data["db_type"]))
             conn = DatabaseConnectionConfig(**conn_data)
             if not any(c.id == conn.id for c in config.database_connections):
                 config.database_connections.append(conn)
@@ -406,7 +424,7 @@ def load_persisted_connections(config: SandboxConfig) -> None:
             # Convert password string back to SecretStr
             conn_data["password"] = SecretStr(conn_data.get("password", ""))
             # Convert db_type string to enum
-            conn_data["db_type"] = DatabaseType(conn_data["db_type"])
+            conn_data["db_type"] = DatabaseType(normalize_db_type(conn_data["db_type"]))
             conn = DatabaseConnectionConfig(**conn_data)
             # Avoid duplicates (by id)
             if not any(c.id == conn.id for c in config.database_connections):

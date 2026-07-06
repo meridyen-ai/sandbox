@@ -31,6 +31,11 @@ _UPLOAD_DB_PASSWORD = os.environ.get("SANDBOX_UPLOAD_DB_PASSWORD", "sandbox_pass
 
 UPLOADS_SCHEMA = "uploads"
 
+# Every per-upload database name is prefixed with this (see sanitize_db_name).
+# Used as a safety guard so cleanup only ever drops databases we created for
+# uploads, never an externally-configured or system database.
+UPLOAD_DB_PREFIX = "upload_"
+
 # Chunk size for loading large files (rows per batch)
 LOAD_CHUNK_SIZE = 50_000
 
@@ -107,7 +112,7 @@ def sanitize_db_name(name: str) -> str:
     clean = re.sub(r"_+", "_", clean).strip("_")
     if not clean:
         clean = "uploaded_data"
-    db_name = f"upload_{clean}"
+    db_name = f"{UPLOAD_DB_PREFIX}{clean}"
     return db_name[:63]
 
 
@@ -162,8 +167,25 @@ def create_upload_database(upload_name: str) -> tuple[Engine, dict[str, Any]]:
 
 
 def drop_upload_database(upload_name: str) -> None:
-    """Drop an upload database by name."""
-    db_name = sanitize_db_name(upload_name)
+    """Drop an upload database, deriving its name from the upload name."""
+    drop_upload_database_by_name(sanitize_db_name(upload_name))
+
+
+def drop_upload_database_by_name(db_name: str) -> bool:
+    """Drop a per-upload database by its exact name.
+
+    Used when a file-based data source is deleted, so the dedicated PostgreSQL
+    database created for the upload is reclaimed instead of being orphaned.
+
+    Only databases carrying the upload prefix are ever dropped — this guards
+    against accidentally dropping an externally-configured or system database
+    if a connection's stored ``database`` field points at one. Returns True if
+    a drop was issued, False if the name was rejected by the safety guard.
+    """
+    if not db_name or not db_name.startswith(UPLOAD_DB_PREFIX):
+        # Not a database we created for an upload — never touch it.
+        logger.warning("upload_database_drop_skipped_non_upload", database=db_name)
+        return False
 
     # Dispose cached engine if any
     if db_name in _db_engines:
@@ -191,6 +213,7 @@ def drop_upload_database(upload_name: str) -> None:
             logger.info("upload_database_dropped", database=db_name)
     finally:
         admin_engine.dispose()
+    return True
 
 
 def ensure_uploads_schema(engine: Engine) -> None:

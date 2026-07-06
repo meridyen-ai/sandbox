@@ -150,13 +150,17 @@ class ConnectionConfig(BaseModel):
     username: str
     password: str
     schema_name: str | None = None
-    ssl_enabled: bool = True
+    # SSL must be opt-in: internal Docker-network Postgres (postgres, os-postgres,
+    # sandbox-postgres, shared-postgres) run with ssl=off and reject the upgrade.
+    # Defaulting True caused "rejected SSL upgrade" on every query for sources
+    # saved without an explicit ssl flag. Callers that need SSL set it explicitly.
+    ssl_enabled: bool = False
 
     @property
     def normalized_db_type(self) -> str:
         """Normalize common db_type aliases to canonical enum values."""
-        aliases = {"postgres": "postgresql", "pg": "postgresql", "mssql_server": "mssql", "sqlserver": "mssql", "sap_hana": "saphana", "hana": "saphana"}
-        return aliases.get(self.db_type.lower(), self.db_type.lower())
+        from sandbox.core.config import normalize_db_type
+        return normalize_db_type(self.db_type)
 
 
 class AIGenerateQueryRequest(BaseModel):
@@ -1092,8 +1096,21 @@ def register_routes(app: FastAPI) -> None:
         connection_id: str,
         token_data: dict = Depends(verify_sandbox_token),
     ) -> JSONResponse:
-        """Delete a database connection."""
-        from sandbox.core.connection_store import delete_connection as db_delete_connection
+        """Delete a database connection.
+
+        For file-based sources (CSV/Excel), each upload was loaded into its own
+        dedicated PostgreSQL database. Removing only the connection record would
+        orphan that database, so we drop it too once the record is gone.
+        """
+        from sandbox.core.connection_store import (
+            delete_connection as db_delete_connection,
+            get_connection as db_get_connection,
+        )
+        from sandbox.services.file_loader import drop_upload_database_by_name
+
+        # Capture the upload database name before the record is removed.
+        existing = db_get_connection(connection_id)
+        upload_db_name = (existing or {}).get("database")
 
         deleted = db_delete_connection(connection_id)
         if not deleted:
@@ -1102,6 +1119,20 @@ def register_routes(app: FastAPI) -> None:
         # Remove from in-memory config
         config = get_config()
         config.database_connections = [c for c in config.database_connections if c.id != connection_id]
+
+        # Reclaim the per-upload database. Best-effort: the connection record is
+        # already gone, so a failure here must not fail the request — the guard
+        # inside drop_upload_database_by_name ensures only upload_* databases are
+        # ever touched (external/managed connections are left untouched).
+        if upload_db_name:
+            try:
+                drop_upload_database_by_name(upload_db_name)
+            except Exception:
+                logger.exception(
+                    "upload_database_drop_failed",
+                    connection_id=connection_id,
+                    database=upload_db_name,
+                )
 
         return JSONResponse(content={
             "message": "Connection deleted successfully"
@@ -1924,6 +1955,7 @@ def register_routes(app: FastAPI) -> None:
     async def full_sync_schema(
         include_samples: bool = True,
         sample_limit: int = 10,
+        connection_ids: str | None = None,
         token_data: dict = Depends(verify_sandbox_token),
     ) -> JSONResponse:
         """
@@ -1931,15 +1963,30 @@ def register_routes(app: FastAPI) -> None:
 
         Pulls all connection metadata in one call.
         No credentials are included in the response.
+
+        connection_ids: optional comma-separated list of connection ids. When
+        provided, only those connections are introspected. Callers syncing a
+        single connection should always pass this — otherwise every connection
+        in the (space-agnostic) store is introspected on each sync, which can
+        take minutes and time out when the store holds many or large databases.
         """
         from sandbox.connectors.factory import get_connector
         from sandbox.core.config import DatabaseType, get_config
 
         config = get_config()
 
+        # Bound the total number of physical DB connections opened concurrently
+        # across the whole full-sync. Without this, gathering every connection in
+        # parallel and every table within each connection in parallel (each table's
+        # sample fetch opens its own connection) fans out to hundreds of simultaneous
+        # connections and exhausts the target Postgres `max_connections`
+        # ("sorry, too many clients already"), leaving the schema partial/empty.
+        max_concurrent = max(1, config.resource_limits.max_concurrent_queries)
+        conn_semaphore = asyncio.Semaphore(max_concurrent)
+
         async def _sync_table(connector, conn_config, table_name, selected_columns, include_samples, sample_limit):
             """Fetch columns and sample data for a single table."""
-            async with connector.get_connection() as conn:
+            async with conn_semaphore, connector.get_connection() as conn:
                 columns_info = await connector.get_columns(
                     conn, table_name, schema=conn_config.schema_name
                 )
@@ -2041,7 +2088,7 @@ def register_routes(app: FastAPI) -> None:
             try:
                 connector = get_connector(conn_config.db_type, conn_config)
 
-                async with connector.get_connection() as conn:
+                async with conn_semaphore, connector.get_connection() as conn:
                     tables = await connector.get_tables(
                         conn, schema=conn_config.schema_name
                     )
@@ -2066,7 +2113,7 @@ def register_routes(app: FastAPI) -> None:
                 all_columns_batch = None
                 if tables_to_sync and hasattr(connector, 'get_all_columns'):
                     try:
-                        async with connector.get_connection() as conn:
+                        async with conn_semaphore, connector.get_connection() as conn:
                             all_columns_batch = await connector.get_all_columns(
                                 conn, schema=conn_config.schema_name
                             )
@@ -2135,7 +2182,7 @@ def register_routes(app: FastAPI) -> None:
                                                 f'SELECT {top_clause}{col_list} FROM '
                                                 f'"{tname}"{limit_clause}'
                                             )
-                                    async with connector.get_connection() as sconn:
+                                    async with conn_semaphore, connector.get_connection() as sconn:
                                         result = await connector.execute(sconn, sample_query)
                                     table_data["sample_data"] = {
                                         "columns": result.columns,
@@ -2185,26 +2232,48 @@ def register_routes(app: FastAPI) -> None:
 
             return connection_data
 
-        # Sync all connections in parallel
+        # Scope to the requested connections when a filter is provided. Without
+        # this, a single-connection sync introspects the entire (space-agnostic)
+        # store — every other database, however large or unreachable.
+        conns_to_sync = config.database_connections
+        if connection_ids:
+            wanted = {c.strip() for c in connection_ids.split(",") if c.strip()}
+            conns_to_sync = [c for c in conns_to_sync if str(c.id) in wanted]
+
+        # Guard each connection with a hard timeout so one slow/unreachable
+        # database can't stall the whole sync past the caller's deadline.
+        per_connection_timeout = 90.0
+
+        async def _sync_connection_guarded(cc):
+            return await asyncio.wait_for(
+                _sync_connection(cc), timeout=per_connection_timeout
+            )
+
+        # Sync the selected connections in parallel
         results = await asyncio.gather(
-            *[_sync_connection(cc) for cc in config.database_connections],
+            *[_sync_connection_guarded(cc) for cc in conns_to_sync],
             return_exceptions=True,
         )
         synced_connections = []
         for i, result in enumerate(results):
             if isinstance(result, Exception):
-                cc = config.database_connections[i]
+                cc = conns_to_sync[i]
+                err = (
+                    "introspection timed out"
+                    if isinstance(result, asyncio.TimeoutError)
+                    else str(result)
+                )
                 logger.warning(
                     "full_sync_connection_error",
                     connection=cc.id,
-                    error=str(result),
+                    error=err,
                 )
                 synced_connections.append({
                     "id": cc.id,
                     "name": cc.name,
                     "db_type": cc.db_type.value,
                     "tables": [],
-                    "error": str(result),
+                    "error": err,
                 })
             else:
                 synced_connections.append(result)
@@ -2598,6 +2667,180 @@ def register_routes(app: FastAPI) -> None:
         _ensure_doc_kb_tables()
     except Exception as e:
         logger.warning("document_kb_tables_init_failed", error=str(e))
+
+    # --- Load Spreadsheet into PostgreSQL tables ---
+    @app.post("/api/v1/documents/load-spreadsheet", tags=["Documents"])
+    async def load_spreadsheet_document(request: Request):
+        """
+        Load an already-uploaded Excel/CSV document into PostgreSQL tables.
+
+        Unlike RAG/vector indexing (``/documents/process``), this materializes
+        every sheet/table in the file as a real PostgreSQL table so the data can
+        be queried with SQL. The source file must have been uploaded earlier via
+        ``/api/v1/documents/upload`` and is located here by its ``file_id``.
+
+        Request JSON: ``{file_id, filename, connection_name, space_id}``
+        Returns: ``{status, connection_id, database, host, port, tables,
+                    total_tables, total_rows}`` — the contract the data-analyst
+        backend's sandbox client expects (services/sandbox_client/client.py
+        ``load_spreadsheet``).
+        """
+        import os
+        import pandas as pd
+        from sandbox.core.config import (
+            DatabaseConnectionConfig, DatabaseType, get_config,
+        )
+        from sandbox.core.connection_store import create_connection as db_create_connection
+        from sandbox.services.file_loader import (
+            create_upload_database, sanitize_table_name,
+            load_csv_to_postgres, load_excel_sheet_to_postgres,
+        )
+        from pydantic import SecretStr
+
+        body = await request.json()
+        file_id = (body.get("file_id") or "").strip()
+        filename = body.get("filename") or "spreadsheet"
+        connection_name = (body.get("connection_name") or filename or "spreadsheet").strip()
+
+        if not file_id:
+            raise HTTPException(status_code=400, detail="file_id is required")
+
+        file_ext = os.path.splitext(filename)[1].lower()
+        if file_ext not in {".csv", ".xlsx", ".xls"}:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported spreadsheet type '{file_ext}'. Allowed: CSV, XLSX, XLS",
+            )
+
+        # Locate the uploaded file by file_id — documents are stored at
+        # /app/data/documents/{workspace_id}/{folder_path}/{file_id}.ext, so we
+        # search recursively (same strategy as /documents/process).
+        data_dir = Path("/app/data/documents")
+        file_path = None
+        for p in data_dir.rglob(f"{file_id}*"):
+            if p.is_file():
+                file_path = str(p)
+                break
+        if not file_path or not os.path.exists(file_path):
+            raise HTTPException(status_code=404, detail=f"File {file_id} not found in sandbox storage")
+
+        config = get_config()
+        now = datetime.now(timezone.utc).isoformat()
+
+        # Dedicated upload database for this spreadsheet's tables.
+        sql_engine, db_config = create_upload_database(connection_name)
+
+        try:
+            is_excel = file_ext in (".xlsx", ".xls")
+            base_table = sanitize_table_name(connection_name)
+            table_stats: list[dict] = []
+            total_rows = 0
+
+            if is_excel:
+                excel_engine = "openpyxl" if file_ext == ".xlsx" else "xlrd"
+                excel_file = pd.ExcelFile(file_path, engine=excel_engine)
+                all_sheets = excel_file.sheet_names
+                if not all_sheets:
+                    raise HTTPException(status_code=400, detail="Excel file contains no sheets")
+
+                for sheet_name in all_sheets:
+                    table_name = (
+                        f"{base_table}_{sanitize_table_name(sheet_name)}"
+                        if len(all_sheets) > 1
+                        else base_table
+                    )
+                    result = load_excel_sheet_to_postgres(
+                        file_path, sheet_name, table_name,
+                        has_header=True, engine=sql_engine,
+                    )
+                    if result["row_count"] == 0:
+                        continue
+                    total_rows += result["row_count"]
+                    table_stats.append({
+                        "table_name": result["table_name"],
+                        "sheet_name": sheet_name,
+                        "row_count": result["row_count"],
+                        "column_count": result["column_count"],
+                    })
+
+                if not table_stats:
+                    raise HTTPException(status_code=400, detail="All sheets are empty")
+            else:
+                result = load_csv_to_postgres(
+                    file_path, base_table,
+                    delimiter=",", has_header=True, engine=sql_engine,
+                )
+                if result["row_count"] == 0:
+                    raise HTTPException(status_code=400, detail="CSV file is empty")
+                total_rows += result["row_count"]
+                table_stats.append({
+                    "table_name": result["table_name"],
+                    "sheet_name": None,
+                    "row_count": result["row_count"],
+                    "column_count": result["column_count"],
+                })
+
+            # Register ONE sandbox connection pointing at the upload database, so
+            # query-time code can run SQL against the materialized tables.
+            conn_id = str(uuid.uuid4())
+            db_create_connection({
+                "id": conn_id,
+                "name": connection_name,
+                "db_type": "postgresql",
+                "host": db_config["host"],
+                "port": db_config["port"],
+                "database": db_config["database"],
+                "username": db_config["username"],
+                "password": db_config["password"],
+                "ssl_enabled": False,
+            })
+            new_conn = DatabaseConnectionConfig(
+                id=conn_id,
+                name=connection_name,
+                db_type=DatabaseType.POSTGRESQL,
+                host=db_config["host"],
+                port=db_config["port"],
+                database=db_config["database"],
+                username=db_config["username"],
+                password=SecretStr(db_config["password"]),
+                ssl_enabled=False,
+                created_at=now,
+                updated_at=now,
+            )
+            config.database_connections.append(new_conn)
+
+            logger.info(
+                "spreadsheet_loaded",
+                file_id=file_id,
+                filename=filename,
+                connection_id=conn_id,
+                tables=len(table_stats),
+                rows=total_rows,
+            )
+
+            return JSONResponse(
+                status_code=201,
+                content={
+                    "status": "ready",
+                    "success": True,
+                    "connection_id": conn_id,
+                    "name": connection_name,
+                    "host": db_config["host"],
+                    "port": db_config["port"],
+                    "database": db_config["database"],
+                    "tables": table_stats,
+                    "total_tables": len(table_stats),
+                    "total_rows": total_rows,
+                },
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error("spreadsheet_load_failed", file_id=file_id, filename=filename, error=str(e))
+            return JSONResponse(
+                status_code=200,
+                content={"status": "failed", "error": str(e)},
+            )
 
     # --- Create Knowledge Base ---
     @app.post("/api/v1/documents/create-kb", tags=["Documents"])
