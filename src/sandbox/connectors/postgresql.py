@@ -58,6 +58,18 @@ class PostgreSQLConnector(BaseConnector[Connection]):
                 command_timeout=cfg.query_timeout,
             )
 
+            # Enable TCP keepalives on the underlying socket. asyncpg's
+            # command_timeout is enforced by sending a cancel request over the
+            # SAME socket, so when a remote peer (e.g. a cross-internet ERP
+            # behind NAT/a firewall) silently drops an idle pooled connection,
+            # both the query AND its cancel block forever on a dead socket and
+            # the connection wedges indefinitely. Keepalives let the kernel
+            # detect the dead peer within ~seconds and error the socket, and
+            # TCP_USER_TIMEOUT bounds how long an unacked send (the cancel
+            # included) waits before the socket fails. Best-effort: skip
+            # silently on platforms/sockets that don't support an option.
+            self._enable_tcp_keepalive(conn)
+
             # Set search path if schema specified
             if cfg.schema_name:
                 await conn.execute(f"SET search_path TO {cfg.schema_name}, public")
@@ -90,6 +102,41 @@ class PostgreSQLConnector(BaseConnector[Connection]):
                 db_type=self.db_type,
                 cause=e,
             )
+
+    # TCP keepalive tuning (seconds). Detect a dead peer in ~15s+3*5s=30s
+    # rather than never; TCP_USER_TIMEOUT caps an unacked send at 30s.
+    _KEEPALIVE_IDLE_S = 15
+    _KEEPALIVE_INTERVAL_S = 5
+    _KEEPALIVE_COUNT = 3
+    _TCP_USER_TIMEOUT_MS = 30_000
+
+    def _enable_tcp_keepalive(self, conn: Connection) -> None:
+        """Turn on TCP keepalives for a connection's socket (best-effort)."""
+        import socket
+
+        try:
+            transport = conn._transport  # asyncpg exposes the asyncio transport
+            sock = transport.get_extra_info("socket") if transport else None
+        except Exception:
+            sock = None
+        if sock is None:
+            return
+
+        def _set(level: int, optname: str, value: int) -> None:
+            opt = getattr(socket, optname, None)
+            if opt is None:  # option not defined on this platform
+                return
+            try:
+                sock.setsockopt(level, opt, value)
+            except (OSError, PermissionError):
+                pass  # unsupported for this socket family; keep the others
+
+        _set(socket.SOL_SOCKET, "SO_KEEPALIVE", 1)
+        _set(socket.IPPROTO_TCP, "TCP_KEEPIDLE", self._KEEPALIVE_IDLE_S)
+        _set(socket.IPPROTO_TCP, "TCP_KEEPINTVL", self._KEEPALIVE_INTERVAL_S)
+        _set(socket.IPPROTO_TCP, "TCP_KEEPCNT", self._KEEPALIVE_COUNT)
+        # Linux-only: bound total time an unacked segment may stay in-flight.
+        _set(socket.IPPROTO_TCP, "TCP_USER_TIMEOUT", self._TCP_USER_TIMEOUT_MS)
 
     async def close_connection(self, conn: Connection) -> None:
         """Close a PostgreSQL connection."""
