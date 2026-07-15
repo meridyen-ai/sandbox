@@ -58,6 +58,18 @@ class PostgreSQLConnector(BaseConnector[Connection]):
                 command_timeout=cfg.query_timeout,
             )
 
+            # Enable TCP keepalives on the underlying socket. asyncpg's
+            # command_timeout is enforced by sending a cancel request over the
+            # SAME socket, so when a remote peer (e.g. a cross-internet ERP
+            # behind NAT/a firewall) silently drops an idle pooled connection,
+            # both the query AND its cancel block forever on a dead socket and
+            # the connection wedges indefinitely. Keepalives let the kernel
+            # detect the dead peer within ~seconds and error the socket, and
+            # TCP_USER_TIMEOUT bounds how long an unacked send (the cancel
+            # included) waits before the socket fails. Best-effort: skip
+            # silently on platforms/sockets that don't support an option.
+            self._enable_tcp_keepalive(conn)
+
             # Set search path if schema specified
             if cfg.schema_name:
                 await conn.execute(f"SET search_path TO {cfg.schema_name}, public")
@@ -90,6 +102,41 @@ class PostgreSQLConnector(BaseConnector[Connection]):
                 db_type=self.db_type,
                 cause=e,
             )
+
+    # TCP keepalive tuning (seconds). Detect a dead peer in ~15s+3*5s=30s
+    # rather than never; TCP_USER_TIMEOUT caps an unacked send at 30s.
+    _KEEPALIVE_IDLE_S = 15
+    _KEEPALIVE_INTERVAL_S = 5
+    _KEEPALIVE_COUNT = 3
+    _TCP_USER_TIMEOUT_MS = 30_000
+
+    def _enable_tcp_keepalive(self, conn: Connection) -> None:
+        """Turn on TCP keepalives for a connection's socket (best-effort)."""
+        import socket
+
+        try:
+            transport = conn._transport  # asyncpg exposes the asyncio transport
+            sock = transport.get_extra_info("socket") if transport else None
+        except Exception:
+            sock = None
+        if sock is None:
+            return
+
+        def _set(level: int, optname: str, value: int) -> None:
+            opt = getattr(socket, optname, None)
+            if opt is None:  # option not defined on this platform
+                return
+            try:
+                sock.setsockopt(level, opt, value)
+            except (OSError, PermissionError):
+                pass  # unsupported for this socket family; keep the others
+
+        _set(socket.SOL_SOCKET, "SO_KEEPALIVE", 1)
+        _set(socket.IPPROTO_TCP, "TCP_KEEPIDLE", self._KEEPALIVE_IDLE_S)
+        _set(socket.IPPROTO_TCP, "TCP_KEEPINTVL", self._KEEPALIVE_INTERVAL_S)
+        _set(socket.IPPROTO_TCP, "TCP_KEEPCNT", self._KEEPALIVE_COUNT)
+        # Linux-only: bound total time an unacked segment may stay in-flight.
+        _set(socket.IPPROTO_TCP, "TCP_USER_TIMEOUT", self._TCP_USER_TIMEOUT_MS)
 
     async def close_connection(self, conn: Connection) -> None:
         """Close a PostgreSQL connection."""
@@ -305,6 +352,12 @@ class PostgreSQLConnector(BaseConnector[Connection]):
         """
         schema = schema or self.config.schema_name or "public"
 
+        # Constraint flags come from pg_catalog, NOT the information_schema
+        # constraint views: constraint_column_usage / key_column_usage are
+        # per-row-privilege-checked UNION views that take 80-90+ seconds on a
+        # database with a few hundred constraints (observed on meridyen_os),
+        # which is what made schema full-sync time out. The pg_catalog rewrite
+        # returns byte-identical rows in ~30ms.
         query = """
             SELECT
                 c.table_name,
@@ -316,52 +369,56 @@ class PostgreSQLConnector(BaseConnector[Connection]):
                 c.numeric_precision,
                 c.numeric_scale,
                 c.ordinal_position,
-                CASE WHEN pk.column_name IS NOT NULL THEN true ELSE false END AS is_primary_key,
-                CASE WHEN uq.column_name IS NOT NULL THEN true ELSE false END AS is_unique,
-                CASE WHEN fk.column_name IS NOT NULL THEN true ELSE false END AS is_foreign_key,
+                (pk.column_name IS NOT NULL) AS is_primary_key,
+                (uq.column_name IS NOT NULL) AS is_unique,
+                (fk.column_name IS NOT NULL) AS is_foreign_key,
                 fk.foreign_table_schema,
                 fk.foreign_table_name,
                 fk.foreign_column_name
             FROM information_schema.columns c
             LEFT JOIN (
-                SELECT tc.table_name, kcu.column_name
-                FROM information_schema.table_constraints tc
-                JOIN information_schema.key_column_usage kcu
-                    ON tc.constraint_name = kcu.constraint_name
-                    AND tc.table_schema = kcu.table_schema
-                WHERE tc.table_schema = $1
-                    AND tc.constraint_type = 'PRIMARY KEY'
+                SELECT t.relname AS table_name, a.attname AS column_name
+                FROM pg_constraint con
+                JOIN pg_class t ON t.oid = con.conrelid
+                JOIN pg_namespace n ON n.oid = t.relnamespace
+                CROSS JOIN LATERAL unnest(con.conkey) AS ck(attnum)
+                JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ck.attnum
+                WHERE con.contype = 'p' AND n.nspname = $1
             ) pk ON pk.table_name = c.table_name AND pk.column_name = c.column_name
             LEFT JOIN (
-                SELECT DISTINCT tc.table_name, kcu.column_name
-                FROM information_schema.table_constraints tc
-                JOIN information_schema.key_column_usage kcu
-                    ON tc.constraint_name = kcu.constraint_name
-                    AND tc.table_schema = kcu.table_schema
-                WHERE tc.table_schema = $1
-                    AND tc.constraint_type = 'UNIQUE'
+                SELECT DISTINCT t.relname AS table_name, a.attname AS column_name
+                FROM pg_constraint con
+                JOIN pg_class t ON t.oid = con.conrelid
+                JOIN pg_namespace n ON n.oid = t.relnamespace
+                CROSS JOIN LATERAL unnest(con.conkey) AS ck(attnum)
+                JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ck.attnum
+                WHERE con.contype = 'u' AND n.nspname = $1
             ) uq ON uq.table_name = c.table_name AND uq.column_name = c.column_name
             LEFT JOIN (
-                SELECT
-                    tc.table_name,
-                    kcu.column_name,
-                    ccu.table_schema AS foreign_table_schema,
-                    ccu.table_name AS foreign_table_name,
-                    ccu.column_name AS foreign_column_name
-                FROM information_schema.table_constraints tc
-                JOIN information_schema.key_column_usage kcu
-                    ON tc.constraint_name = kcu.constraint_name
-                    AND tc.table_schema = kcu.table_schema
-                JOIN information_schema.constraint_column_usage ccu
-                    ON tc.constraint_name = ccu.constraint_name
-                    AND tc.table_schema = ccu.table_schema
-                WHERE tc.table_schema = $1
-                    AND tc.constraint_type = 'FOREIGN KEY'
+                SELECT DISTINCT ON (t.relname, a.attname)
+                    t.relname AS table_name,
+                    a.attname AS column_name,
+                    fn.nspname AS foreign_table_schema,
+                    ft.relname AS foreign_table_name,
+                    fa.attname AS foreign_column_name
+                FROM pg_constraint con
+                JOIN pg_class t ON t.oid = con.conrelid
+                JOIN pg_namespace n ON n.oid = t.relnamespace
+                JOIN pg_class ft ON ft.oid = con.confrelid
+                JOIN pg_namespace fn ON fn.oid = ft.relnamespace
+                CROSS JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS ck(attnum, ord)
+                JOIN LATERAL unnest(con.confkey) WITH ORDINALITY AS cfk(attnum, ord)
+                    ON cfk.ord = ck.ord
+                JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ck.attnum
+                JOIN pg_attribute fa ON fa.attrelid = ft.oid AND fa.attnum = cfk.attnum
+                WHERE con.contype = 'f' AND n.nspname = $1
             ) fk ON fk.table_name = c.table_name AND fk.column_name = c.column_name
             WHERE c.table_schema = $1
               AND c.table_name IN (
-                  SELECT table_name FROM information_schema.tables
-                  WHERE table_schema = $1 AND table_type = 'BASE TABLE'
+                  SELECT tc.relname
+                  FROM pg_class tc
+                  JOIN pg_namespace tn ON tn.oid = tc.relnamespace
+                  WHERE tn.nspname = $1 AND tc.relkind = 'r'
               )
             ORDER BY c.table_name, c.ordinal_position
         """

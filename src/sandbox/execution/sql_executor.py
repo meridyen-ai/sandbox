@@ -305,13 +305,27 @@ class SQLExecutor(BaseExecutor[SQLExecutionResult]):
                 self._connection_locks[conn_id] = asyncio.Lock()
             lock = self._connection_locks[conn_id]
 
-            async with lock:
+            # Bound how long we wait for the per-connection lock. A single
+            # wedged query (e.g. one stuck on a silently-dropped remote socket)
+            # holds this lock; without a ceiling every following query for the
+            # same connection would queue behind it forever. Waiting up to the
+            # query timeout plus a small margin lets the holder's own timeout
+            # fire and release the lock first; only a genuinely stuck holder
+            # trips this and returns a clear error instead of hanging.
+            timeout = context.get_timeout(self.config)
+            max_rows = context.get_max_rows(self.config)
+            try:
+                await asyncio.wait_for(lock.acquire(), timeout=timeout + 15)
+            except asyncio.TimeoutError:
+                raise TimeoutError(
+                    "Timed out waiting for a busy connection to free up; "
+                    "another query on this connection is not releasing it",
+                    timeout_seconds=timeout + 15,
+                    execution_type="sql",
+                )
+            try:
                 # Get connector and connection (database-agnostic)
                 connector, connection = await self._get_connection(context.connection_id)
-
-                # Execute with timeout
-                timeout = context.get_timeout(self.config)
-                max_rows = context.get_max_rows(self.config)
 
                 try:
                     rows, columns = await asyncio.wait_for(
@@ -324,6 +338,8 @@ class SQLExecutor(BaseExecutor[SQLExecutionResult]):
                         timeout_seconds=timeout,
                         execution_type="sql",
                     )
+            finally:
+                lock.release()
 
             # Process results
             masked_rows, masked_cols = self.masker.mask_rows(
