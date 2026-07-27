@@ -4105,8 +4105,15 @@ def register_routes(app: FastAPI) -> None:
         threshold = body.get("similarity_threshold", 0.3)
         # Optional path filter — search only within a specific directory
         path_filter = body.get("path_filter", "")  # e.g. "Google Drive:/Reports"
+        # Optional file allow-list — the caller's per-user source selection.
+        # Absent/None means unrestricted; an explicitly empty list means the
+        # caller selected no files at all, so nothing can match.
+        file_ids = body.get("file_ids")
 
         if not query_embedding or not kb_ids:
+            return {"chunks": []}
+
+        if file_ids is not None and not file_ids:
             return {"chunks": []}
 
         from llama_index.core import VectorStoreIndex, Settings
@@ -4153,6 +4160,13 @@ def register_routes(app: FastAPI) -> None:
                 if path_filter:
                     filters.append(MetadataFilter(
                         key="source_path", value=path_filter, operator=FilterOperator.CONTAINS,
+                    ))
+                if file_ids:
+                    # Applied inside the vector query rather than after it, so
+                    # similarity_top_k is spent only on files the caller can see.
+                    # Backed by the metadata_->>'file_id' index created with the table.
+                    filters.append(MetadataFilter(
+                        key="file_id", value=list(file_ids), operator=FilterOperator.IN,
                     ))
 
                 # Query using LlamaIndex's vector store directly
@@ -4329,7 +4343,7 @@ def register_routes(app: FastAPI) -> None:
                 sql_text("""
                     SELECT id, filename, file_type, file_size, status, error_message,
                            chunk_count, progress, created_at, updated_at,
-                           source_path, source_type, storage_path, summary
+                           source_path, source_type, storage_path, summary, file_id
                     FROM document_kb_documents
                     WHERE knowledge_base_id = :kb_id
                     ORDER BY created_at DESC
@@ -4346,6 +4360,9 @@ def register_routes(app: FastAPI) -> None:
                     "updated_at": row[9].isoformat() if row[9] else None,
                     "source_path": row[10], "source_type": row[11],
                     "storage_path": row[12], "summary": row[13],
+                    # Same identity the chunks carry, so a caller filtering
+                    # retrieval by file can filter this listing the same way.
+                    "file_id": row[14],
                 })
 
         return {"documents": docs}
