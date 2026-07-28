@@ -2811,9 +2811,75 @@ def register_routes(app: FastAPI) -> None:
     # sandbox's own PostgreSQL (with pgvector). This keeps user data on their
     # infrastructure for security.
 
+    def _env_int(name: str, default: int, *, lo: int, hi: int) -> int:
+        """Read an int from the environment, clamped to a sane range."""
+        try:
+            return max(lo, min(hi, int(os.environ.get(name, default))))
+        except (TypeError, ValueError):
+            return default
+
+    # ── Vector indexing tunables ───────────────────────────────────────────
+    # HNSW parameters for the per-KB LlamaIndex tables. Passing these to
+    # PGVectorStore is what makes it create an ANN index; without them pgvector
+    # has no index to use and every search is a full scan.
+    HNSW_KWARGS = {
+        "hnsw_m": _env_int("VECTOR_HNSW_M", 16, lo=4, hi=64),
+        "hnsw_ef_construction": _env_int("VECTOR_HNSW_EF_CONSTRUCTION", 64, lo=16, hi=512),
+        "hnsw_ef_search": _env_int("VECTOR_HNSW_EF_SEARCH", 40, lo=10, hi=512),
+        "hnsw_dist_method": "vector_cosine_ops",
+    }
+    # 128 chunks/request keeps each embedding call well under the API's 300k
+    # token cap while cutting round trips ~13x versus the library default of 10.
+    EMBED_BATCH_SIZE = _env_int("VECTOR_EMBED_BATCH_SIZE", 128, lo=1, hi=1024)
+    EMBED_NUM_WORKERS = _env_int("VECTOR_EMBED_WORKERS", 8, lo=1, hi=32)
+
     def _get_doc_db_engine():
         """Reuse the sandbox's upload DB engine for document KB storage."""
         return _get_api_key_engine()
+
+    def _ensure_vector_indexes() -> int:
+        """Create the HNSW index on any KB table that predates it.
+
+        Tables written before hnsw_kwargs was passed have no vector index, and
+        PGVectorStore only builds one at table-creation time — so existing KBs
+        would stay on sequential scans forever. Returns how many were fixed.
+        """
+        from sqlalchemy import text as sql_text
+
+        built = 0
+        try:
+            engine = _get_doc_db_engine()
+            with engine.connect() as conn:
+                tables = [
+                    r[0] for r in conn.execute(sql_text(
+                        "SELECT tablename FROM pg_tables "
+                        "WHERE schemaname='public' AND tablename LIKE 'data_llamaindex_kb_%'"
+                    )).fetchall()
+                ]
+                for table in tables:
+                    has_ann = conn.execute(sql_text(
+                        "SELECT COUNT(*) FROM pg_indexes "
+                        "WHERE tablename = :t AND indexdef ILIKE '%USING hnsw%'"
+                    ), {"t": table}).scalar()
+                    if has_ann:
+                        continue
+                    m = HNSW_KWARGS["hnsw_m"]
+                    efc = HNSW_KWARGS["hnsw_ef_construction"]
+                    conn.execute(sql_text(
+                        f"CREATE INDEX IF NOT EXISTS {table}_hnsw_idx ON {table} "
+                        f"USING hnsw (embedding vector_cosine_ops) "
+                        f"WITH (m = {m}, ef_construction = {efc})"
+                    ))
+                    conn.execute(sql_text(
+                        f"CREATE INDEX IF NOT EXISTS {table}_file_id_idx ON {table} "
+                        f"((metadata_->>'file_id'))"
+                    ))
+                    conn.commit()
+                    built += 1
+                    logger.info("vector_index_backfilled", table=table)
+        except Exception as e:
+            logger.warning("vector_index_backfill_failed", error=str(e)[:200])
+        return built
 
     def _ensure_doc_kb_tables():
         """Create document KB tables with pgvector in sandbox postgres. Idempotent."""
@@ -2922,6 +2988,9 @@ def register_routes(app: FastAPI) -> None:
     # Initialize tables on startup
     try:
         _ensure_doc_kb_tables()
+        # Backfill the ANN index onto KB tables created before hnsw_kwargs was
+        # passed — otherwise those KBs keep sequentially scanning forever.
+        _ensure_vector_indexes()
     except Exception as e:
         logger.warning("document_kb_tables_init_failed", error=str(e))
 
@@ -4379,11 +4448,19 @@ def register_routes(app: FastAPI) -> None:
 
             openai_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENAI_KEY", "")
 
-            # Configure LlamaIndex settings
+            # Configure LlamaIndex settings.
+            #
+            # embed_batch_size defaults to 10, which meant one HTTP round trip
+            # per 10 chunks — ~500 serial requests for a 5k-chunk document set.
+            # 128 chunks x ~1024 tokens is ~131k tokens per request, comfortably
+            # under the embeddings API's 300k-token request cap, and num_workers
+            # lets batches overlap instead of running strictly one after another.
             Settings.embed_model = OpenAIEmbedding(
                 model="text-embedding-3-small",
                 dimensions=1536,
                 api_key=openai_key,
+                embed_batch_size=EMBED_BATCH_SIZE,
+                num_workers=EMBED_NUM_WORKERS,
             )
             Settings.chunk_size = 1024
             Settings.chunk_overlap = 128
@@ -4398,6 +4475,14 @@ def register_routes(app: FastAPI) -> None:
             # Each KB gets its own table for isolation
             table_name = f"llamaindex_kb_{kb_id}"
 
+            # hnsw_kwargs is what creates the ANN index. Omitting it (the
+            # default) leaves the table with no vector index at all, so every
+            # similarity search degrades to a sequential scan computing exact
+            # cosine distance over every chunk in the KB.
+            #
+            # m=16 / ef_construction=64 are pgvector's defaults — good recall at
+            # modest build cost. ef_search=40 trades a little query latency for
+            # recall at search time.
             vector_store = PGVectorStore.from_params(
                 host=db_host,
                 port=db_port,
@@ -4406,6 +4491,7 @@ def register_routes(app: FastAPI) -> None:
                 password=db_pass,
                 table_name=table_name,
                 embed_dim=1536,
+                hnsw_kwargs=HNSW_KWARGS,
             )
 
             # Wrap in StorageContext — this is what actually makes VectorStoreIndex
@@ -4421,6 +4507,14 @@ def register_routes(app: FastAPI) -> None:
             if file_id:
                 try:
                     with engine.connect() as c:
+                        # Without this expression index the dedup DELETE scans
+                        # the whole KB on every single re-index.
+                        c.execute(
+                            sql_text(
+                                f"CREATE INDEX IF NOT EXISTS idx_{table_name}_file_id "
+                                f"ON data_{table_name} ((metadata_->>'file_id'))"
+                            )
+                        )
                         deleted = c.execute(
                             sql_text(
                                 f"DELETE FROM data_{table_name} "
@@ -4446,22 +4540,41 @@ def register_routes(app: FastAPI) -> None:
 
             logger.info("llamaindex_indexing_start", doc_id=doc_id, documents=len(li_documents))
 
+            # use_async overlaps embedding batches instead of awaiting each in
+            # turn. asyncio_run() underneath handles being called from this
+            # worker thread (no running loop) as well as from a live loop.
             index = VectorStoreIndex.from_documents(
                 li_documents,
                 storage_context=storage_context,
                 transformations=[node_parser],
                 show_progress=False,
+                use_async=True,
             )
 
-            # Count how many nodes (chunks) were actually created and persisted
-            # Query the vector store directly to confirm persistence
-            chunk_count = len(li_documents)  # Fallback estimate
+            # Count the rows that actually landed in the vector table for this
+            # file. The previous implementation read index.docstore.docs, which
+            # is empty when a vector store is attached — so it silently fell
+            # back to len(li_documents), reporting the *document* count as the
+            # chunk count (1 for most files).
+            chunk_count = len(li_documents)  # Fallback if the count query fails
             try:
-                all_nodes = index.docstore.docs
-                if all_nodes:
-                    chunk_count = len(all_nodes)
-            except Exception:
-                pass
+                with engine.connect() as c:
+                    if file_id:
+                        persisted = c.execute(
+                            sql_text(
+                                f"SELECT COUNT(*) FROM data_{table_name} "
+                                f"WHERE metadata_->>'file_id' = :fid"
+                            ),
+                            {"fid": file_id},
+                        ).scalar()
+                    else:
+                        persisted = c.execute(
+                            sql_text(f"SELECT COUNT(*) FROM data_{table_name}")
+                        ).scalar()
+                if persisted:
+                    chunk_count = int(persisted)
+            except Exception as e:
+                logger.info("chunk_count_query_failed", doc_id=doc_id, reason=str(e)[:120])
 
             logger.info("llamaindex_indexing_done", doc_id=doc_id, chunks=chunk_count, table=table_name)
             _update_prog(85)
@@ -4531,8 +4644,15 @@ def register_routes(app: FastAPI) -> None:
         threshold = body.get("similarity_threshold", 0.3)
         # Optional path filter — search only within a specific directory
         path_filter = body.get("path_filter", "")  # e.g. "Google Drive:/Reports"
+        # Optional file allow-list — the caller's per-user source selection.
+        # Absent/None means unrestricted; an explicitly empty list means the
+        # caller selected no files at all, so nothing can match.
+        file_ids = body.get("file_ids")
 
         if not query_embedding or not kb_ids:
+            return {"chunks": []}
+
+        if file_ids is not None and not file_ids:
             return {"chunks": []}
 
         from llama_index.core import VectorStoreIndex, Settings
@@ -4563,10 +4683,15 @@ def register_routes(app: FastAPI) -> None:
             table_name = f"llamaindex_kb_{kb_id}"
 
             try:
+                # Same hnsw_kwargs as the write path: this is what applies
+                # `hnsw.ef_search` to the session, which governs recall when the
+                # ANN index is used. Without it a query against an HNSW-indexed
+                # table falls back to the server default.
                 vector_store = PGVectorStore.from_params(
                     host=db_host, port=db_port, database=db_name,
                     user=db_user, password=db_pass,
                     table_name=table_name, embed_dim=1536,
+                    hnsw_kwargs=HNSW_KWARGS,
                 )
 
                 # Build metadata filters
@@ -4574,6 +4699,13 @@ def register_routes(app: FastAPI) -> None:
                 if path_filter:
                     filters.append(MetadataFilter(
                         key="source_path", value=path_filter, operator=FilterOperator.CONTAINS,
+                    ))
+                if file_ids:
+                    # Applied inside the vector query rather than after it, so
+                    # similarity_top_k is spent only on files the caller can see.
+                    # Backed by the metadata_->>'file_id' index created with the table.
+                    filters.append(MetadataFilter(
+                        key="file_id", value=list(file_ids), operator=FilterOperator.IN,
                     ))
 
                 # Query using LlamaIndex's vector store directly
@@ -4750,7 +4882,7 @@ def register_routes(app: FastAPI) -> None:
                 sql_text("""
                     SELECT id, filename, file_type, file_size, status, error_message,
                            chunk_count, progress, created_at, updated_at,
-                           source_path, source_type, storage_path, summary
+                           source_path, source_type, storage_path, summary, file_id
                     FROM document_kb_documents
                     WHERE knowledge_base_id = :kb_id
                     ORDER BY created_at DESC
@@ -4767,6 +4899,9 @@ def register_routes(app: FastAPI) -> None:
                     "updated_at": row[9].isoformat() if row[9] else None,
                     "source_path": row[10], "source_type": row[11],
                     "storage_path": row[12], "summary": row[13],
+                    # Same identity the chunks carry, so a caller filtering
+                    # retrieval by file can filter this listing the same way.
+                    "file_id": row[14],
                 })
 
         return {"documents": docs}
