@@ -39,6 +39,10 @@ dependencies = [
     # Data processing
     "pandas>=2.1.0",
     "numpy>=1.26.0",
+    # Unstructured leaves numba unconstrained and can resolve to 0.53/llvmlite 0.36,
+    # which cannot install on this image's Python 3.12. Keep the resolver on a
+    # Python-3.12-compatible numba/llvmlite pair for reproducible full builds.
+    "numba>=0.59.0",
     "pyarrow>=14.0.0",
 
     # Visualization
@@ -69,6 +73,20 @@ dependencies = [
     # Document processing — Unstructured for parsing, LlamaIndex for RAG
     "openai>=1.0.0",
     "unstructured[pdf,docx,md,pptx,xlsx,image]>=0.15.0",
+    # Digital-PDF → Markdown rendition (Tier-1 of the document→Markdown pipeline).
+    # Pin to the PyMuPDF (fitz) series already resolved here to avoid clobbering it.
+    "pymupdf4llm>=0.0.17",
+    # PyMuPDF is declared EXPLICITLY, not left as a transitive dep of pymupdf4llm.
+    # `fitz` is imported directly by the document pipeline for word-level bounding
+    # boxes and for reading the text layer of digital PDFs (Unstructured mangles
+    # right-to-left text). Installing pymupdf4llm without pinning this has
+    # previously pulled pymupdf_layout, which overwrites the pymupdf package
+    # directory and deletes `fitz` — breaking PDF indexing while the container
+    # still reports healthy.
+    "pymupdf==1.28.0",
+    # Required by pymupdf4llm at import time; absent from the image it raises
+    # ModuleNotFoundError before any PDF is parsed.
+    "tabulate>=0.9.0",
     "llama-index-core>=0.12.0",
     "llama-index-vector-stores-postgres>=0.4.0",
     "llama-index-embeddings-openai>=0.3.0",

@@ -78,6 +78,23 @@ RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
         --extra-index-url https://download.pytorch.org/whl/cpu \
         ".[${DEPS_EXTRA}]"
 
+# Remove pymupdf_layout, which uv pulls in as a pymupdf4llm dependency.
+# It is OPTIONAL (it only offers "improved page layout analysis") and actively
+# harmful here on two counts:
+#   1. Its files install INSIDE the pymupdf package dir (pymupdf/layout, _tgif.so,
+#      _features.so) and can overwrite it, deleting `fitz` — PDF indexing then
+#      fails with ModuleNotFoundError while the container still reports healthy.
+#   2. It hijacks pymupdf4llm.to_markdown into rasterise+Tesseract OCR mode even
+#      for PDFs that HAVE a text layer. With the eng-only traineddata in this
+#      image that turns Arabic documents into Latin mojibake, replacing a
+#      perfectly good text layer with garbage.
+# Keep this immediately after the dependency install so it can never ship.
+RUN SP="$(python -c 'import site; print(site.getsitepackages()[0])')" && \
+    rm -rf "$SP/pymupdf_layout" "$SP"/pymupdf_layout-*.dist-info \
+           "$SP/pymupdf/layout" "$SP/pymupdf/tgif.py" \
+           "$SP/pymupdf/_tgif.so" "$SP/pymupdf/_features.so" && \
+    python -c "import fitz, pymupdf4llm; print('pymupdf OK', fitz.version[0])"
+
 # Pre-download spaCy English model (required by Unstructured for hi_res PDF parsing)
 # Installs at build time so sandbox user doesn't need write access at runtime
 RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \

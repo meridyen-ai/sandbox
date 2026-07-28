@@ -44,6 +44,259 @@ from sandbox.visualization.generator import VisualizationGenerator, ChartType
 logger = get_logger(__name__)
 
 
+# Arabic Presentation Forms: U+FB50–U+FDFF (A) and U+FE70–U+FEFF (B). Many
+# Arabic PDFs store these pre-shaped glyph codepoints in the text layer instead
+# of standard Arabic letters (U+0600–U+06FF), so extracted text comes out as
+# unsearchable look-alikes ("ﻋﻤﺮﻭ" instead of "عمرو") and embeddings are built
+# over characters no query will ever match.
+def _is_arabic_presentation_form(ch: str) -> bool:
+    cp = ord(ch)
+    return 0xFB50 <= cp <= 0xFDFF or 0xFE70 <= cp <= 0xFEFF
+
+
+def _normalize_arabic_presentation_forms(text: str) -> str:
+    """Fold Arabic presentation-form codepoints back to standard Arabic letters.
+
+    Deliberately scoped instead of a blanket unicodedata.normalize("NFKC", text):
+    NFKC is compatibility folding, so it would ALSO rewrite superscripts and
+    subscripts ("x²"→"x2", "H₂O"→"H2O") and Latin ligatures ("ﬁle"→"file"),
+    silently corrupting scientific and technical documents. Only codepoints in
+    the Arabic presentation blocks are touched; everything else is returned
+    byte-identical.
+    """
+    if not text:
+        return text
+    # PyMuPDF emits NUL for glyphs it cannot map to a character. Postgres rejects
+    # NUL in text values ("A string literal cannot contain NUL (0x00)
+    # characters"), which aborts the whole document UPDATE — so strip them here,
+    # before any value derived from this text reaches the database.
+    if "\x00" in text:
+        text = text.replace("\x00", "")
+    # Fast path: most documents contain no presentation forms at all, so scan
+    # once and return the original string untouched rather than rebuilding it.
+    if not any(_is_arabic_presentation_form(c) for c in text):
+        return text
+
+    import unicodedata
+
+    return "".join(
+        unicodedata.normalize("NFKC", c) if _is_arabic_presentation_form(c) else c
+        for c in text
+    )
+
+
+def _pymupdf_text_blocks(file_path: str) -> list[dict] | None:
+    """Extract per-block text from a digital PDF using PyMuPDF, or None.
+
+    Why this exists: Unstructured drives PDF parsing everywhere else, but on
+    right-to-left documents it mangles the text layer — Arabic CVs come back
+    with the Arabic dropped entirely and Latin fragments left behind ("2 saal",
+    "Slaledsl olyostl"), which then get embedded and served as the document's
+    text. PyMuPDF reads the same text layer in correct logical order.
+
+    Returns None when PyMuPDF is unavailable or the PDF has no meaningful text
+    layer (i.e. it is scanned) — in both cases the caller keeps the Unstructured
+    path, which handles OCR and non-PDF formats. Unstructured remains the better
+    parser for Latin documents: it detects real section headings and produces
+    heading-aware chunks, which this block-level split does not attempt.
+    """
+    try:
+        import fitz
+    except Exception:
+        return None
+
+    try:
+        doc = fitz.open(file_path)
+    except Exception as e:
+        logger.warning("pymupdf_open_failed", path=str(file_path), error=str(e))
+        return None
+
+    try:
+        blocks: list[dict] = []
+        total_chars = 0
+        page_count = len(doc)
+        for page_idx in range(page_count):
+            page = doc[page_idx]
+            for b in page.get_text("blocks"):
+                # get_text("blocks") → (x0, y0, x1, y1, text, block_no, block_type)
+                # block_type 1 is an image block; it carries no text.
+                if len(b) > 6 and b[6] != 0:
+                    continue
+                btext = _normalize_arabic_presentation_forms((b[4] or "").strip())
+                if not btext:
+                    continue
+                total_chars += len(btext)
+                blocks.append({
+                    "text": btext,
+                    "page_num": page_idx + 1,
+                    "bbox": [round(b[0], 1), round(b[1], 1), round(b[2], 1), round(b[3], 1)],
+                    "page_width": round(page.rect.width, 1),
+                    "page_height": round(page.rect.height, 1),
+                })
+    except Exception as e:
+        logger.warning("pymupdf_blocks_failed", path=str(file_path), error=str(e))
+        return None
+    finally:
+        try:
+            doc.close()
+        except Exception:
+            pass
+
+    # Scanned PDFs have a near-empty text layer. Use the same threshold as the
+    # Tier-3 markdown OCR trigger so the two stay consistent.
+    if not blocks or total_chars < max(40 * max(page_count, 1), 120):
+        return None
+    return blocks
+
+
+class _PseudoCoordSystem:
+    def __init__(self, width: float, height: float):
+        self.width = width
+        self.height = height
+
+
+class _PseudoCoordinates:
+    def __init__(self, bbox: list[float], width: float, height: float):
+        x0, y0, x1, y1 = bbox
+        self.points = ((x0, y0), (x0, y1), (x1, y1), (x1, y0))
+        self.system = _PseudoCoordSystem(width, height)
+
+
+class _PseudoMetadata:
+    def __init__(self, page_number: int, bbox: list[float], width: float, height: float):
+        self.page_number = page_number
+        self.page_name = None
+        self.coordinates = _PseudoCoordinates(bbox, width, height)
+        self.orig_elements = None
+
+
+class _PseudoElement:
+    """Minimal stand-in for an Unstructured element.
+
+    Exposes only what the element loop reads (.text and .metadata), so PyMuPDF
+    blocks can flow through the same downstream code path — char offsets, page
+    and bbox metadata, chunk indexing and Tier-2 Markdown — without duplicating
+    it. Named "NarrativeText" because type(...).__name__ becomes element_type,
+    and this path carries no heading detection to justify a richer claim.
+    """
+
+    def __init__(self, text: str, page_number: int, bbox: list[float],
+                 width: float, height: float):
+        self.text = text
+        self.metadata = _PseudoMetadata(page_number, bbox, width, height)
+
+    def __str__(self) -> str:
+        return self.text
+
+
+def _blocks_to_pseudo_elements(blocks: list[dict], max_characters: int = 1000) -> list:
+    """Group PyMuPDF text blocks into chunk-sized pseudo-elements.
+
+    Blocks are merged in reading order until the next one would exceed
+    max_characters, and never across a page boundary so page/bbox metadata stays
+    truthful. The bbox of a merged chunk is the union of its blocks' boxes.
+    """
+    out: list[_PseudoElement] = []
+    cur: list[dict] = []
+
+    def flush() -> None:
+        if not cur:
+            return
+        text = "\n".join(b["text"] for b in cur)
+        x0 = min(b["bbox"][0] for b in cur)
+        y0 = min(b["bbox"][1] for b in cur)
+        x1 = max(b["bbox"][2] for b in cur)
+        y1 = max(b["bbox"][3] for b in cur)
+        out.append(_PseudoElement(
+            text, cur[0]["page_num"], [x0, y0, x1, y1],
+            cur[0]["page_width"], cur[0]["page_height"],
+        ))
+        cur.clear()
+
+    for b in blocks:
+        pending = sum(len(x["text"]) + 1 for x in cur)
+        if cur and (cur[0]["page_num"] != b["page_num"]
+                    or pending + len(b["text"]) > max_characters):
+            flush()
+        cur.append(b)
+    flush()
+    return out
+
+
+def _markdown_to_plain_text(md: str) -> str:
+    """Strip Markdown syntax to plain text for the extracted_text rendition."""
+    import re
+
+    text = md
+    text = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)      # fenced code
+    text = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", text)             # images
+    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)          # links → label
+    text = re.sub(r"</?[A-Za-z][^>]*>", "", text)                 # inline HTML (<u>…)
+    text = re.sub(r"^\s{0,3}#{1,6}\s*", "", text, flags=re.MULTILINE)   # headings
+    text = re.sub(r"^\s{0,3}>\s?", "", text, flags=re.MULTILINE)        # quotes
+    text = re.sub(r"^\s*[-*+]\s+", "", text, flags=re.MULTILINE)        # bullets
+    text = re.sub(r"^\s*\|", "", text, flags=re.MULTILINE)              # table pipes
+    text = re.sub(r"^\s*[-: |]{3,}\s*$", "", text, flags=re.MULTILINE)  # table rules
+    text = re.sub(r"(\*\*|__|\*|_|`)", "", text)                        # emphasis
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _rebuild_li_documents_from_text(text: str, prior: list, *, filename: str,
+                                    file_id: str, file_type: str,
+                                    source_path: str, doc_id: Any, kb_id: Any) -> list:
+    """Re-chunk `text` into LlamaIndex documents, reusing the prior metadata shape.
+
+    Used when a better transcription (VLM OCR) supersedes the text the original
+    chunks were built from — the vector store must be populated from the same
+    text the document now claims to contain, or search silently disagrees with
+    what the user reads.
+    """
+    from llama_index.core import Document as LIDocument
+
+    base_meta: dict = {}
+    if prior:
+        try:
+            base_meta = dict(getattr(prior[0], "metadata", {}) or {})
+        except Exception:
+            base_meta = {}
+    for key in ("start_char", "end_char", "chunk_index", "bbox",
+                "page_width", "page_height", "element_type"):
+        base_meta.pop(key, None)
+    base_meta.update({
+        "file_id": file_id, "filename": filename, "file_type": file_type,
+        "file_path": source_path or filename, "source_path": source_path,
+        "doc_id": doc_id, "kb_id": kb_id, "element_type": "NarrativeText",
+    })
+    if source_path:
+        parts = source_path.rsplit("/", 1)
+        base_meta["directory"] = parts[0] if len(parts) > 1 else ""
+
+    # Paragraph-ish blocks, packed to roughly the size the Unstructured path targets.
+    blocks = [b.strip() for b in text.split("\n\n") if b.strip()]
+    chunks: list[str] = []
+    cur = ""
+    for b in blocks:
+        if cur and len(cur) + len(b) + 2 > 1000:
+            chunks.append(cur)
+            cur = b
+        else:
+            cur = f"{cur}\n\n{b}" if cur else b
+    if cur:
+        chunks.append(cur)
+
+    out = []
+    offset = 0
+    for i, c in enumerate(chunks):
+        meta = dict(base_meta)
+        meta["chunk_index"] = i
+        meta["start_char"] = offset
+        meta["end_char"] = offset + len(c)
+        offset += len(c) + 2
+        out.append(LIDocument(text=c, metadata=meta))
+    return out
+
+
 def _make_json_safe(value: Any) -> Any:
     """Convert any database value to a JSON-serializable type.
 
@@ -2620,6 +2873,10 @@ def register_routes(app: FastAPI) -> None:
             for col_sql in [
                 "ALTER TABLE document_kb_documents ADD COLUMN IF NOT EXISTS source_path TEXT",
                 "ALTER TABLE document_kb_documents ADD COLUMN IF NOT EXISTS source_type VARCHAR(50)",
+                # Full-document Markdown rendition (headings/bullets/tables preserved),
+                # stored alongside the plain extracted_text. TEXT is TOAST-stored so
+                # large docs don't bloat the row. Backfilled lazily for old docs.
+                "ALTER TABLE document_kb_documents ADD COLUMN IF NOT EXISTS extracted_markdown TEXT",
             ]:
                 try:
                     conn.execute(sql_text(col_sql))
@@ -2732,7 +2989,14 @@ def register_routes(app: FastAPI) -> None:
 
         try:
             is_excel = file_ext in (".xlsx", ".xls")
-            base_table = sanitize_table_name(connection_name)
+            # Name the table after the FILE, not the connection. All spreadsheets
+            # in one connection previously shared a single connection-named table
+            # and load_csv_to_postgres uses if_exists="replace" — so uploading a
+            # second CSV silently DROPPED the first one's data, leaving whichever
+            # file was written last as the only survivor.
+            base_table = sanitize_table_name(
+                os.path.splitext(os.path.basename(filename or connection_name))[0]
+            ) or sanitize_table_name(connection_name)
             table_stats: list[dict] = []
             total_rows = 0
 
@@ -3316,11 +3580,13 @@ def register_routes(app: FastAPI) -> None:
             logger.error("document_processing_failed", doc_id=doc_id, error=str(e))
             return {"doc_id": str(doc_id), "status": "failed", "error": str(e), "file_id": file_id}
 
-        # Check final status from sandbox DB
+        # Check final status from sandbox DB. Also return the full extracted_text
+        # (for media files this is the complete joined transcript) so the backend
+        # can persist it in its own document_kb_documents.extracted_text column.
         from sqlalchemy import text as sql_text_sync
         with engine.connect() as c:
             status_row = c.execute(
-                sql_text_sync("SELECT status, chunk_count, error_message FROM document_kb_documents WHERE id = :id"),
+                sql_text_sync("SELECT status, chunk_count, error_message, extracted_text FROM document_kb_documents WHERE id = :id"),
                 {"id": doc_id},
             ).fetchone()
 
@@ -3330,6 +3596,7 @@ def register_routes(app: FastAPI) -> None:
                 "status": status_row[0],
                 "chunk_count": status_row[1] or 0,
                 "error": status_row[2],
+                "extracted_text": status_row[3],
                 "file_id": file_id,
             }
         return {"doc_id": str(doc_id), "status": "ready", "file_id": file_id}
@@ -3425,6 +3692,131 @@ def register_routes(app: FastAPI) -> None:
         except Exception as e:
             logger.warning("vision_caption_parse_failed", filename=filename, error=str(e))
             return "", ""
+
+    def _ocr_pdf_to_markdown(file_path: str, filename: str, job_id: str = "",
+                             max_pages: int = 30) -> str:
+        """Tier-3 fallback: OCR a scanned PDF (no usable text layer) into Markdown
+        by rendering each page to a PNG and sending it to the backend's
+        /internal/vision/ocr_markdown endpoint (a vision LLM, by default a cheap
+        OpenRouter VLM). The backend owns model selection, keys and token
+        accounting. Returns joined Markdown, or "" on any failure (caller falls
+        back to plainer renditions). Capped at max_pages to bound cost/latency."""
+        import base64
+        import httpx
+
+        backend_url = (
+            os.environ.get("MERIDYEN_BACKEND_URL")
+            or os.environ.get("BACKEND_URL")
+            or "http://backend_cloud_dev:8000"
+        )
+        internal_secret = (
+            os.environ.get("INTERNAL_BACKEND_SECRET")
+            or os.environ.get("SANDBOX_API_KEY")
+            or ""
+        )
+        try:
+            import fitz
+            doc = fitz.open(file_path)
+        except Exception as e:
+            logger.warning("ocr_md_open_failed", filename=filename, error=str(e))
+            return ""
+
+        page_mds: list[str] = []
+        n = min(len(doc), max_pages)
+        truncated = len(doc) > max_pages
+        try:
+            with httpx.Client(timeout=120.0) as client:
+                for i in range(n):
+                    try:
+                        page = doc[i]
+                        # Render at ~150 DPI (2x default 72) — enough for OCR,
+                        # keeps the base64 payload reasonable.
+                        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+                        png = pix.tobytes("png")
+                        b64 = base64.b64encode(png).decode("ascii")
+                        resp = client.post(
+                            f"{backend_url.rstrip('/')}/api/internal/vision/ocr_markdown",
+                            headers={"Content-Type": "application/json",
+                                     "X-Internal-Secret": internal_secret},
+                            json={"job_id": job_id or "", "filename": f"{filename}#p{i+1}",
+                                  "mime": "image/png", "image_base64": b64},
+                        )
+                        if resp.status_code == 200:
+                            md = (resp.json().get("markdown") or "").strip()
+                            if md:
+                                page_mds.append(md)
+                        else:
+                            logger.warning("ocr_md_http_error", filename=filename,
+                                           page=i + 1, status=resp.status_code)
+                    except Exception as e:
+                        logger.warning("ocr_md_page_failed", filename=filename,
+                                       page=i + 1, error=str(e))
+        finally:
+            doc.close()
+
+        if truncated and page_mds:
+            page_mds.append(f"\n\n_[OCR truncated at {max_pages} pages of {len(doc)}]_")
+        result = "\n\n---\n\n".join(page_mds).strip()
+        if result:
+            logger.info("ocr_md_ok", filename=filename, pages=len(page_mds), chars=len(result))
+        return result
+
+    def _html_table_to_markdown(html: str) -> str:
+        """Convert a simple HTML <table> (as emitted by Unstructured's
+        text_as_html) into a GitHub-flavored Markdown table. Best-effort:
+        returns "" on any parse failure so callers can fall back to plain text.
+        Uses the stdlib HTMLParser — no new dependency."""
+        if not html or "<" not in html:
+            return ""
+        try:
+            from html.parser import HTMLParser
+
+            class _TableParser(HTMLParser):
+                def __init__(self):
+                    super().__init__()
+                    self.rows: list[list[str]] = []
+                    self._row: list[str] | None = None
+                    self._cell: list[str] | None = None
+
+                def handle_starttag(self, tag, attrs):
+                    if tag == "tr":
+                        self._row = []
+                    elif tag in ("td", "th"):
+                        self._cell = []
+
+                def handle_endtag(self, tag):
+                    if tag in ("td", "th") and self._cell is not None and self._row is not None:
+                        self._row.append(" ".join("".join(self._cell).split()))
+                        self._cell = None
+                    elif tag == "tr" and self._row is not None:
+                        if any(c.strip() for c in self._row):
+                            self.rows.append(self._row)
+                        self._row = None
+
+                def handle_data(self, data):
+                    if self._cell is not None:
+                        self._cell.append(data)
+
+            p = _TableParser()
+            p.feed(html)
+            rows = [r for r in p.rows if r]
+            if not rows:
+                return ""
+            width = max(len(r) for r in rows)
+            rows = [r + [""] * (width - len(r)) for r in rows]
+            # Escape pipes inside cells so they don't break the table.
+            def esc(c: str) -> str:
+                return c.replace("|", "\\|")
+            header = rows[0]
+            lines = [
+                "| " + " | ".join(esc(c) for c in header) + " |",
+                "| " + " | ".join("---" for _ in header) + " |",
+            ]
+            for r in rows[1:]:
+                lines.append("| " + " | ".join(esc(c) for c in r) + " |")
+            return "\n".join(lines)
+        except Exception:
+            return ""
 
     def _run_unstructured_pipeline(
         engine, doc_id: int, file_path: str, file_type: str,
@@ -3587,9 +3979,31 @@ def register_routes(app: FastAPI) -> None:
                 else:
                     os.environ["OCR_AGENT"] = "unstructured.partition.utils.ocr_models.tesseract_ocr.OCRAgentTesseract"
 
-                elements = partition(**partition_kwargs)
+                # Digital PDFs: prefer PyMuPDF's reading of the text layer over
+                # Unstructured's. See _pymupdf_text_blocks — Unstructured mangles
+                # RTL text (Arabic comes back dropped or scrambled). Returns None
+                # for scanned PDFs and when PyMuPDF is missing, so those fall
+                # through to Unstructured + OCR unchanged.
+                pymupdf_blocks = None
+                if file_type.lower() == "pdf":
+                    pymupdf_blocks = _pymupdf_text_blocks(str(file_path))
 
-                if not elements:
+                if pymupdf_blocks:
+                    # Group blocks into chunks near the same size Unstructured
+                    # targets, then expose each as a minimal stand-in carrying the
+                    # attributes the element loop below reads (.text/.metadata).
+                    # Everything downstream — offsets, page/bbox metadata, chunk
+                    # indexing, Tier-2 markdown — then works unchanged.
+                    elements = _blocks_to_pseudo_elements(
+                        pymupdf_blocks,
+                        max_characters=partition_kwargs["max_characters"],
+                    )
+                    logger.info("pdf_text_layer_via_pymupdf", doc_id=doc_id,
+                                blocks=len(pymupdf_blocks), chunks=len(elements))
+                else:
+                    elements = partition(**partition_kwargs)
+
+                if not elements and not pymupdf_blocks:
                     # Image with no OCR-extractable text — don't fail. Try a vision
                     # LLM first (describes the image + reads any visible text), then
                     # fall back to a filename-only placeholder if the vision call fails.
@@ -3658,7 +4072,9 @@ def register_routes(app: FastAPI) -> None:
                             for w in page.get_text("words"):
                                 if w[4].strip():
                                     words.append({
-                                        "text": w[4],
+                                        # Normalized so highlight lookups match
+                                        # the normalized chunk text below.
+                                        "text": _normalize_arabic_presentation_forms(w[4]),
                                         "bbox": [round(w[0], 1), round(w[1], 1), round(w[2], 1), round(w[3], 1)],
                                     })
                             pdf_page_words[page_num_1] = {
@@ -3670,6 +4086,39 @@ def register_routes(app: FastAPI) -> None:
                         logger.info("pymupdf_words_extracted", doc_id=doc_id, pages=len(pdf_page_words))
                     except Exception as e:
                         logger.warning("pymupdf_extraction_failed", doc_id=doc_id, error=str(e))
+
+                # ── Markdown rendition accumulation ──────────────────────────
+                # We build a Markdown version of the document alongside the plain
+                # extracted_text. Two tiers:
+                #   Tier 1 (digital PDFs): pymupdf4llm renders the whole PDF to
+                #     Markdown directly (headings/lists/tables) — computed below.
+                #   Tier 2 (DOCX/PPTX/other): map each Unstructured element to
+                #     Markdown by its element type, accumulated in md_parts here.
+                # Tier-1 output, when available, wins over the element-derived one.
+                md_parts: list[str] = []
+
+                def _element_to_markdown(el_obj, el_type_name: str, plain_text: str) -> str:
+                    """Render a single Unstructured element to Markdown by its type.
+                    Defensive: any failure falls back to the plain text (never raises)."""
+                    try:
+                        t = plain_text.strip()
+                        if not t:
+                            return ""
+                        if el_type_name in ("Title", "Header"):
+                            return f"## {t}"
+                        if el_type_name == "ListItem":
+                            # Preserve multi-line list items as separate bullets
+                            return "\n".join(f"- {ln.strip()}" for ln in t.splitlines() if ln.strip())
+                        if el_type_name == "Table":
+                            # Prefer the HTML table Unstructured attaches; convert to
+                            # a Markdown table. Fall back to plain text on any issue.
+                            html = getattr(getattr(el_obj, "metadata", None), "text_as_html", None)
+                            md_tbl = _html_table_to_markdown(html) if html else ""
+                            return md_tbl or t
+                        # NarrativeText, UncategorizedText, etc. → paragraph
+                        return t
+                    except Exception:
+                        return plain_text.strip()
 
                 # Track running character offset for highlight positioning
                 char_offset = 0
@@ -3686,6 +4135,10 @@ def register_routes(app: FastAPI) -> None:
                         except Exception:
                             raw = None
                     text = (raw or "").strip() if isinstance(raw, str) else ""
+                    # Normalize here — this single value feeds BOTH the embedded
+                    # chunk and extracted_text_parts, so Arabic chunks are indexed
+                    # as searchable letters rather than presentation-form glyphs.
+                    text = _normalize_arabic_presentation_forms(text)
                     if not text:
                         continue
 
@@ -3738,6 +4191,13 @@ def register_routes(app: FastAPI) -> None:
                     # Composite-chunk metadata. element_type is the first orig element's
                     # type so we can still distinguish "starts with a table" vs "narrative".
                     first_orig_type = type(first_orig).__name__ if first_orig is not el else el_type
+
+                    # Tier-2 Markdown: render this element by its type (headings,
+                    # bullets, tables). Used as extracted_markdown for non-PDF docs,
+                    # and as the fallback if Tier-1 pymupdf4llm produces nothing.
+                    md_chunk = _element_to_markdown(el, first_orig_type, text)
+                    if md_chunk:
+                        md_parts.append(md_chunk)
                     metadata = {
                         "file_id": file_id,
                         "filename": filename,
@@ -3821,14 +4281,93 @@ def register_routes(app: FastAPI) -> None:
                 else:
                     raise ValueError("No text content extracted from document")
 
-            # Save extracted text to DB
+            # ── Build the Markdown rendition ─────────────────────────────────
+            # Tier 1: for digital PDFs, pymupdf4llm renders the whole file to
+            # Markdown with far better structure than element-joining. If it
+            # yields nothing (scanned PDF with no text layer, or the dep is
+            # missing), we fall back to the Tier-2 element-derived Markdown.
+            extracted_markdown = ""
+            md_source = "none"
+            if file_type.lower() == "pdf":
+                try:
+                    import pymupdf4llm
+                    extracted_markdown = (pymupdf4llm.to_markdown(file_path) or "").strip()
+                    if extracted_markdown:
+                        md_source = "pymupdf4llm"
+                        logger.info("pymupdf4llm_markdown_ok", doc_id=doc_id,
+                                    chars=len(extracted_markdown))
+                except Exception as e:
+                    logger.warning("pymupdf4llm_markdown_failed", doc_id=doc_id, error=str(e))
+
+                # Tier 3: a scanned/image-only PDF has no meaningful text layer, so
+                # Tier-1 yields almost nothing. Detect that (very little text per
+                # page) and OCR the pages into Markdown via the backend VLM.
+                try:
+                    import fitz as _fitz
+                    _d = _fitz.open(file_path); _pages = len(_d); _d.close()
+                except Exception:
+                    _pages = 1
+                looks_scanned = len((extracted_markdown or "").strip()) < max(40 * _pages, 120)
+                if looks_scanned:
+                    logger.info("markdown_tier3_ocr_triggered", doc_id=doc_id,
+                                pages=_pages, tier1_chars=len(extracted_markdown or ""))
+                    ocr_md = _ocr_pdf_to_markdown(file_path, filename, job_id=job_id)
+                    if ocr_md and len(ocr_md) > len(extracted_markdown or ""):
+                        extracted_markdown = ocr_md
+                        md_source = "vlm_ocr"
+
+            # Tier 2 fallback (non-PDF, or PDF where Tier 1/3 produced nothing).
+            if not extracted_markdown and md_parts:
+                extracted_markdown = "\n\n".join(p for p in md_parts if p).strip()
+                if extracted_markdown:
+                    md_source = "element_types"
+            # Last resort: reuse plain text so the column is never emptier than
+            # extracted_text (keeps ?format=md always returning something usable).
+            if not extracted_markdown:
+                extracted_markdown = extracted_text
+
+            # Fold Arabic presentation forms in BOTH renditions, at the single
+            # point every tier funnels through. Arabic PDFs whose text layer
+            # stores pre-shaped glyphs otherwise persist unsearchable
+            # look-alikes ("ﻋﻤﺮﻭ" vs "عمرو"). No-op for documents without them.
+            extracted_text = _normalize_arabic_presentation_forms(extracted_text)
+            extracted_markdown = _normalize_arabic_presentation_forms(extracted_markdown)
+
+            # Scanned PDFs: adopt the Tier-3 VLM transcription as the TEXT rendition
+            # too. Without this, extracted_text (and the chunks embedded from it)
+            # keep Tesseract's output, which is eng-only in this image and turns
+            # Arabic into Latin look-alikes ("ols gle _3la gylb") — the document
+            # then reads as garbage and is unsearchable in its own language, even
+            # though a correct transcription already exists in extracted_markdown.
+            # Guarded on md_source so this only ever applies to pages the VLM
+            # actually transcribed, never to digital PDFs.
+            if md_source == "vlm_ocr" and extracted_markdown.strip():
+                ocr_text = _markdown_to_plain_text(extracted_markdown)
+                if len(ocr_text) > len(extracted_text.strip()):
+                    logger.info("text_rendition_from_vlm_ocr", doc_id=doc_id,
+                                was=len(extracted_text), now=len(ocr_text))
+                    extracted_text = ocr_text
+                    # Re-embed from the OCR text: the chunks built earlier came from
+                    # the Tesseract elements, so leaving them would keep retrieval
+                    # broken while only the stored column looked fixed.
+                    li_documents = _rebuild_li_documents_from_text(
+                        ocr_text, li_documents, filename=filename, file_id=file_id,
+                        file_type=file_type, source_path=source_path,
+                        doc_id=doc_id, kb_id=kb_id,
+                    )
+
+            # Save extracted text + markdown to DB
             with engine.connect() as c:
-                c.execute(sql_text("UPDATE document_kb_documents SET extracted_text=:t, updated_at=NOW() WHERE id=:id"),
-                          {"t": extracted_text, "id": doc_id})
+                c.execute(sql_text(
+                    "UPDATE document_kb_documents "
+                    "SET extracted_text=:t, extracted_markdown=:md, updated_at=NOW() "
+                    "WHERE id=:id"),
+                    {"t": extracted_text, "md": extracted_markdown, "id": doc_id})
                 c.commit()
 
             logger.info("parsing_done", doc_id=doc_id,
                         li_docs=len(li_documents), chars=len(extracted_text),
+                        md_chars=len(extracted_markdown), md_source=md_source,
                         media=is_media)
             _update_prog(30)
 
@@ -4231,6 +4770,91 @@ def register_routes(app: FastAPI) -> None:
                 })
 
         return {"documents": docs}
+
+    @app.get("/api/v1/documents/by-file/{file_id}/status", tags=["Documents"])
+    async def get_document_status(file_id: str):
+        """Return the current processing status/progress for a single document by
+        file_id. The backend polls this while a long index (e.g. video whisper
+        transcription) runs, so it can mirror live progress into its own DB instead
+        of blocking on one long process_document call."""
+        from sqlalchemy import text as sql_text
+
+        engine = _get_doc_db_engine()
+        with engine.connect() as conn:
+            row = conn.execute(
+                sql_text(
+                    "SELECT status, progress, chunk_count, error_message "
+                    "FROM document_kb_documents WHERE file_id = :fid "
+                    "ORDER BY updated_at DESC NULLS LAST LIMIT 1"
+                ),
+                {"fid": file_id},
+            ).fetchone()
+
+        if not row:
+            return JSONResponse(status_code=404, content={"error": "document not found"})
+        return {
+            "file_id": file_id,
+            "status": row[0],
+            "progress": row[1] or 0,
+            "chunk_count": row[2] or 0,
+            "error": row[3],
+        }
+
+    @app.get("/api/v1/documents/by-file/{file_id}/transcript", tags=["Documents"])
+    async def get_document_transcript(file_id: str, format: str = "text"):
+        """Return the full extracted body of a document, looked up by its stable
+        file_id. `format=text` (default) returns the plain extracted_text;
+        `format=md` returns the Markdown rendition (headings/lists/tables
+        preserved). For documents indexed before Markdown existed, the Markdown
+        is lazily backfilled here from the file on disk (Tier 1 pymupdf4llm for
+        PDFs) and cached back to the row on first request."""
+        from sqlalchemy import text as sql_text
+
+        want_md = (format or "text").lower() in ("md", "markdown")
+        engine = _get_doc_db_engine()
+        with engine.connect() as conn:
+            row = conn.execute(
+                sql_text(
+                    "SELECT id, filename, extracted_text, extracted_markdown, storage_path, file_type "
+                    "FROM document_kb_documents "
+                    "WHERE file_id = :fid ORDER BY updated_at DESC NULLS LAST LIMIT 1"
+                ),
+                {"fid": file_id},
+            ).fetchone()
+
+        if not row:
+            return JSONResponse(status_code=404, content={"error": "document not found"})
+
+        doc_pk, filename, plain, md, storage_path, ftype = row[0], row[1], row[2], row[3], row[4], row[5]
+
+        if not want_md:
+            return {"file_id": file_id, "filename": filename, "extracted_text": plain}
+
+        # Markdown requested. Backfill lazily if the column is empty.
+        if not (md and md.strip()):
+            md = ""
+            # Tier-1 backfill for PDFs whose file is still on disk.
+            if ftype and ftype.lower() == "pdf" and storage_path and os.path.exists(storage_path):
+                try:
+                    import pymupdf4llm
+                    md = (pymupdf4llm.to_markdown(storage_path) or "").strip()
+                except Exception as e:
+                    logger.warning("transcript_md_backfill_failed", file_id=file_id, error=str(e))
+            # Fall back to plain text so callers always get something.
+            if not md:
+                md = (plain or "").strip()
+            # Cache back so we only do this once.
+            if md:
+                try:
+                    with engine.connect() as c:
+                        c.execute(sql_text(
+                            "UPDATE document_kb_documents SET extracted_markdown=:md, updated_at=NOW() WHERE id=:id"),
+                            {"md": md, "id": doc_pk})
+                        c.commit()
+                except Exception as e:
+                    logger.warning("transcript_md_cache_failed", file_id=file_id, error=str(e))
+
+        return {"file_id": file_id, "filename": filename, "extracted_markdown": md, "extracted_text": plain}
 
     # Cache of transcoded videos so repeat views are instant
     _transcoded_video_cache: dict = {}
