@@ -145,8 +145,11 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     # Audio/Video processing
     ffmpeg
 
-# FreeTDS configuration for MSSQL connections
-# TDS 7.0 avoids TLS handshake issues with certain SQL Server configurations
+# FreeTDS configuration for MSSQL connections.
+# 7.0 is only the floor for tools that read this file (tsql, ODBC) — it avoids TLS
+# handshake issues with certain SQL Server configurations. The app itself negotiates
+# per connection in sandbox/connectors/mssql_tds.py (7.4 first, falling back to 7.0),
+# because 7.0 carries no column collation and mangles non-Latin-1 text.
 RUN printf '[global]\ntds version = 7.0\nencryption = off\nclient charset = UTF-8\ntext size = 64512\n' \
     > /etc/freetds/freetds.conf
 

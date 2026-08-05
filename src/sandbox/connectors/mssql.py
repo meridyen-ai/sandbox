@@ -11,6 +11,13 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, AsyncGenerator
 
 from sandbox.connectors.base import BaseConnector, QueryResult
+from sandbox.connectors.mssql_tds import (
+    connect_mssql,
+    detect_codepage,
+    needs_repair,
+    repair_row,
+    repair_text,
+)
 from sandbox.core.exceptions import ConnectionError, SQLExecutionError
 from sandbox.core.logging import get_logger
 
@@ -27,6 +34,10 @@ class MSSQLConnector(BaseConnector[Any]):
     executor to remain compatible with the async BaseConnector interface.
     """
 
+    # Code page of the connected database, resolved on connect. 1252 means
+    # FreeTDS decoded correctly and result rows are passed through untouched.
+    _codepage: int = 1252
+
     async def connect(self) -> Any:
         """Create a new SQL Server connection."""
         cfg = self.config
@@ -34,16 +45,24 @@ class MSSQLConnector(BaseConnector[Any]):
         def _connect() -> Any:
             import pymssql
             try:
-                return pymssql.connect(
+                # The TDS version is negotiated (7.4 first) rather than pinned to
+                # 7.0: only 7.1+ carries per-column collation, and without it
+                # FreeTDS decodes CP1254/CP1250/... varchar data as ISO-8859-1
+                # ('Ş' -> 'Þ') no matter what the client charset says.
+                conn, negotiated = connect_mssql(
+                    tds_version=cfg.extra_params.get("tds_version"),
                     server=cfg.host,
                     port=str(cfg.port),
                     database=cfg.database,
                     user=cfg.username,
                     password=cfg.password.get_secret_value(),
                     login_timeout=int(cfg.connection_timeout),
-                    tds_version="7.0",
                     as_dict=False,
+                    charset="UTF-8",
                 )
+                # Remember it on the in-memory config so reconnects skip the probe.
+                cfg.extra_params["tds_version"] = negotiated
+                return conn
             except pymssql.OperationalError as e:
                 raise ConnectionError(
                     f"Failed to connect to SQL Server: {e}",
@@ -62,11 +81,18 @@ class MSSQLConnector(BaseConnector[Any]):
         loop = asyncio.get_event_loop()
         conn = await loop.run_in_executor(_executor, _connect)
 
-        self._logger.debug(
+        # FreeTDS decodes every varchar with the server's default code page, so
+        # a database on a different one (e.g. Turkish_CI_AS under a CP1252
+        # server) needs its rows re-decoded. Resolved once per connection.
+        self._codepage = await loop.run_in_executor(_executor, detect_codepage, conn)
+
+        self._logger.info(
             "connection_created",
             connection_id=self.connection_id,
             host=cfg.host,
             database=cfg.database,
+            tds_version=cfg.extra_params.get("tds_version"),
+            codepage=self._codepage,
         )
 
         return conn
@@ -106,7 +132,12 @@ class MSSQLConnector(BaseConnector[Any]):
                         _pymssql_type_name(desc[1]) for desc in cursor.description
                     ]
                     rows = cursor.fetchall() or []
-                    rows = [tuple(r) for r in rows]
+                    codepage = self._codepage
+                    if needs_repair(codepage):
+                        rows = [repair_row(tuple(r), codepage) for r in rows]
+                        columns = [repair_text(c, codepage) for c in columns]
+                    else:
+                        rows = [tuple(r) for r in rows]
                 else:
                     columns = []
                     column_types = []
@@ -140,6 +171,9 @@ class MSSQLConnector(BaseConnector[Any]):
 
         def _fetch_batch(cursor: Any) -> list[tuple[Any, ...]]:
             rows = cursor.fetchmany(batch_size)
+            codepage = self._codepage
+            if needs_repair(codepage):
+                return [repair_row(tuple(r), codepage) for r in rows]
             return [tuple(r) for r in rows]
 
         def _prepare(q: str, params: dict[str, Any] | None) -> Any:

@@ -419,8 +419,11 @@ class SQLServerHandler(BaseDBHandler):
         try:
             import pymssql
 
-            conn = pymssql.connect(
-                **cls._pymssql_kwargs(connection_data, login_timeout=10, tds_version="7.0"),
+            from sandbox.connectors.mssql_tds import connect_mssql
+
+            conn, _ = connect_mssql(
+                tds_version=connection_data.get("tds_version"),
+                **cls._pymssql_kwargs(connection_data, login_timeout=10),
             )
             conn.close()
             return ConnectionTestResult(success=True, message="Connection successful")
@@ -431,9 +434,12 @@ class SQLServerHandler(BaseDBHandler):
 
     @classmethod
     def get_tables(cls, connection_data: Dict[str, Any]) -> List[Dict[str, Any]]:
-        import pymssql
+        from sandbox.connectors.mssql_tds import connect_mssql
 
-        conn = pymssql.connect(**cls._pymssql_kwargs(connection_data, tds_version="7.0"))
+        conn, _ = connect_mssql(
+            tds_version=connection_data.get("tds_version"),
+            **cls._pymssql_kwargs(connection_data),
+        )
 
         try:
             cursor = conn.cursor()
@@ -452,9 +458,12 @@ class SQLServerHandler(BaseDBHandler):
 
     @classmethod
     def get_columns(cls, connection_data: Dict[str, Any], table_name: str) -> List[Dict[str, Any]]:
-        import pymssql
+        from sandbox.connectors.mssql_tds import connect_mssql
 
-        conn = pymssql.connect(**cls._pymssql_kwargs(connection_data, tds_version="7.0"))
+        conn, _ = connect_mssql(
+            tds_version=connection_data.get("tds_version"),
+            **cls._pymssql_kwargs(connection_data),
+        )
 
         try:
             cursor = conn.cursor()
@@ -2875,16 +2884,21 @@ class DBHandlerService:
                     conn.close()
 
             elif _resolve_db_type(db_type) == "sqlserver":
-                import pymssql
-                conn = pymssql.connect(
+                from sandbox.connectors.mssql_tds import (
+                    connect_mssql,
+                    detect_codepage,
+                    repair_text,
+                )
+                conn, _ = connect_mssql(
+                    tds_version=connection_data.get("tds_version"),
                     server=connection_data.get("host"),
                     port=connection_data.get("port", 1433),
                     database=connection_data.get("database"),
                     user=connection_data.get("username") or connection_data.get("user"),
                     password=connection_data.get("password"),
-                    tds_version="7.0",
                 )
                 try:
+                    codepage = detect_codepage(conn)
                     cursor = conn.cursor()
                     cursor.execute(f"SELECT TOP {limit} * FROM {table_name}")
                     if cursor.description:
@@ -2892,7 +2906,7 @@ class DBHandlerService:
                         row = cursor.fetchone()
                         if row:
                             for i, col_name in enumerate(columns):
-                                sample_data[col_name] = row[i]
+                                sample_data[col_name] = repair_text(row[i], codepage)
                 finally:
                     conn.close()
 
@@ -2997,16 +3011,21 @@ class DBHandlerService:
                     conn.close()
 
             elif _resolve_db_type(db_type) == "sqlserver":
-                import pymssql
-                conn = pymssql.connect(
+                from sandbox.connectors.mssql_tds import (
+                    connect_mssql,
+                    detect_codepage,
+                    repair_text,
+                )
+                conn, _ = connect_mssql(
+                    tds_version=connection_data.get("tds_version"),
                     server=connection_data.get("host"),
                     port=connection_data.get("port", 1433),
                     database=connection_data.get("database"),
                     user=connection_data.get("username") or connection_data.get("user"),
                     password=connection_data.get("password"),
-                    tds_version="7.0",
                 )
                 try:
+                    codepage = detect_codepage(conn)
                     cursor = conn.cursor()
                     cursor.execute(f"SELECT TOP {limit} * FROM {table_name}")
                     if cursor.description:
@@ -3014,7 +3033,7 @@ class DBHandlerService:
                         for row in cursor.fetchall():
                             row_dict = {}
                             for i, col_name in enumerate(columns):
-                                val = row[i]
+                                val = repair_text(row[i], codepage)
                                 if hasattr(val, 'isoformat'):
                                     val = val.isoformat()
                                 elif isinstance(val, (bytes, memoryview)):
