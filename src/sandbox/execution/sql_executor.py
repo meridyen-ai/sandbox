@@ -173,14 +173,45 @@ class DataMasker:
 
     @staticmethod
     def _pattern_to_regex(pattern: str) -> re.Pattern[str]:
-        """Convert glob-like pattern to regex."""
-        # Escape special chars except *
-        escaped = re.escape(pattern).replace(r"\*", ".*")
-        return re.compile(f"^{escaped}$", re.IGNORECASE)
+        """Convert a glob-like pattern to a SEGMENT-AWARE regex.
+
+        `*` matches whole name segments, never part of a word. Column names are
+        segmented on `_`, `-`, `.`, digits and camelCase before matching, so
+        "*key*" matches `api_key` / `secretKey` / `key` but NOT `key1`,
+        `monkey_id` or `turkey`. Bare substring matching made "*key*" mask every
+        column with those three letters anywhere — analytical queries aliasing
+        label columns as key1/key2 came back as "R*****e" instead of "Revenue",
+        which reads as a broken query rather than a security control.
+        """
+        core = pattern.strip("*")
+        escaped = re.escape(core)
+        # (?:^|_) … (?:s?)(?:_|$) on the SEGMENTED name: the term must be one or
+        # more whole segments, so it can sit anywhere in the name but not inside
+        # a word. A trailing plural `s` still counts (`db_credentials`,
+        # `api_tokens`) — never weaken a security match for readability.
+        return re.compile(rf"(?:^|_){escaped}s?(?:_|$)", re.IGNORECASE)
+
+    @staticmethod
+    def _segment(column_name: str) -> str:
+        """Normalize a column name to underscore-separated lowercase segments.
+
+        `secretKey` → `secret_key`, `Key1` → `key_1`, `credit-card` → `credit_card`
+        — so one boundary rule covers snake_case, camelCase, kebab-case and
+        trailing-digit names alike.
+        """
+        s = re.sub(r"[\-.\s]+", "_", column_name)
+        s = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", s)   # camelCase → camel_Case
+        # NOTE: a trailing digit is deliberately NOT a segment break. `key1` /
+        # `key2` are generic positional aliases an analytical query hands to its
+        # output columns, not secrets — splitting them to `key_1` would make
+        # `key` a whole segment and mask the labels the report needs to read.
+        # A real secret is named for what it is (`api_key`, `secret_key`).
+        return s.lower()
 
     def is_sensitive_column(self, column_name: str) -> bool:
         """Check if column name matches sensitive patterns."""
-        return any(p.match(column_name) for p in self._patterns)
+        segmented = self._segment(column_name)
+        return any(p.search(segmented) for p in self._patterns)
 
     def mask_value(self, value: Any, column_name: str) -> Any:
         """Mask a single value if column is sensitive."""

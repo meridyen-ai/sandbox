@@ -163,14 +163,23 @@ class SecurityConfig(BaseModel):
         description="Banned SQL patterns"
     )
 
-    # Data masking
+    # Data masking.
+    #
+    # Patterns match on WORD BOUNDARIES, not bare substrings — `*` spans whole
+    # name segments (split on _ - or case changes), never mid-word. A bare
+    # "*key*" matched `key1`, `key2`, `monkey_id` and any other column with the
+    # letters "key" in it; "*pin*" matched `spinner` and `pinned`. Analytical
+    # queries that alias label columns as key1/key2 came back as "R*****e"
+    # instead of "Revenue" — unreadable output that looked like a query bug.
+    # Genuine secrets (api_key, secret_key, user_password) still match, because
+    # in those the term IS its own segment.
     sensitive_column_patterns: list[str] = Field(
         default_factory=lambda: [
             "*password*", "*secret*", "*token*", "*key*", "*credential*",
             "*ssn*", "*social_security*", "*credit_card*", "*card_number*",
             "*cvv*", "*pin*", "*account_number*",
         ],
-        description="Patterns for sensitive columns to mask"
+        description="Patterns for sensitive columns to mask (segment-aware)"
     )
     mask_sensitive_data: bool = Field(True, description="Enable data masking")
 
