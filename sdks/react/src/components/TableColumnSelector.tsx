@@ -21,6 +21,7 @@ import {
   ArrowLeft,
   RefreshCw,
   Folder,
+  X,
 } from 'lucide-react'
 import { useSandboxApi } from '../context/SandboxUIContext'
 import type { TableWithColumns, SelectedSchema, SchemaData } from '../types'
@@ -35,7 +36,18 @@ export interface TableColumnSelectorLabels {
   clearSelection?: string
   /** `{count}` is replaced with the total number of columns. */
   showAllColumns?: string
+  /** `{count}` is replaced with the total number of tables. */
+  showAllTables?: string
   showFewerColumns?: string
+  /** `{count}` is replaced with the number of missing tables. */
+  missingTablesTitle?: string
+  missingTablesHint?: string
+  removeAll?: string
+  remove?: string
+  removeMissingConfirmTitle?: string
+  /** `{count}` is replaced with how many tables are being removed. */
+  removeMissingConfirmBody?: string
+  cancel?: string
 }
 
 interface TableColumnSelectorProps {
@@ -46,6 +58,14 @@ interface TableColumnSelectorProps {
   onConfirm: (selectedSchema: SelectedSchema) => void
   loading?: boolean
   labels?: TableColumnSelectorLabels
+  /**
+   * Persist the removal of tables that no longer exist, immediately — without
+   * waiting for the user to save the rest of their selection. Clearing dead
+   * entries is a repair, not an edit, so it should not sit in a pending state
+   * alongside in-progress checkbox changes. Omit it and removal stays local
+   * until the user saves.
+   */
+  onRemoveMissingTables?: (tableKeys: string[]) => Promise<void>
 }
 
 interface SchemaGroup {
@@ -62,6 +82,9 @@ type TabType = 'all' | 'selected'
 
 /** How many columns the right-hand panel lists before "show all". */
 const COLUMN_PREVIEW_COUNT = 20
+
+/** How many tables the tree lists before "show all". */
+const TABLE_PREVIEW_COUNT = 50
 
 function schemaDataToTableWithColumns(data: SchemaData): TableWithColumns[] {
   const schemaName = data.schema || 'public'
@@ -107,6 +130,7 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
   onConfirm,
   loading: externalLoading,
   labels,
+  onRemoveMissingTables,
 }) => {
   const api = useSandboxApi()
   const [schema, setSchema] = useState<TableWithColumns[]>([])
@@ -129,12 +153,18 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
   const [activeTab, setActiveTab] = useState<TabType>('all')
   const [refreshing, setRefreshing] = useState(false)
   const [showAllColumns, setShowAllColumns] = useState(false)
+  const [showAllTables, setShowAllTables] = useState(false)
 
   // Collapse back to the preview whenever a different table is opened — an
   // expanded 300-column list should not carry over to the next table.
   useEffect(() => {
     setShowAllColumns(false)
   }, [selectedTable?.full_name])
+
+  // Likewise, a new search or tab starts from the short list.
+  useEffect(() => {
+    setShowAllTables(false)
+  }, [searchQuery, activeTab])
 
   useEffect(() => {
     loadSchema()
@@ -249,6 +279,20 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
     [groupedTables]
   )
 
+  /**
+   * Keys of the tables the tree actually renders. Capped until the user asks
+   * for the rest — a few hundred rows is a scroll, not a browse. Bulk
+   * select/clear deliberately stay on the whole filtered set (`visibleTables`),
+   * because "search, then select all" should act on the search, not on however
+   * many rows happen to be painted.
+   */
+  const renderedTableKeys = useMemo(() => {
+    if (showAllTables || visibleTables.length <= TABLE_PREVIEW_COUNT) return null
+    return new Set(
+      visibleTables.slice(0, TABLE_PREVIEW_COUNT).map((t) => t.full_name)
+    )
+  }, [visibleTables, showAllTables])
+
   const visibleAllSelected = useMemo(
     () =>
       visibleTables.length > 0 &&
@@ -291,14 +335,98 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
     })
   }
 
+  /**
+   * Selections pointing at tables the database no longer has — typically a view
+   * that was dropped and recreated under another name.
+   *
+   * These used to be invisible: the tree only lists tables present in the live
+   * schema, so a stale entry could not be seen or removed, yet it still rode
+   * along in every save and was handed to the AI as a queryable table. Surfacing
+   * them is the only way the user can clear them.
+   *
+   * Only meaningful once a schema has actually loaded — against an empty schema
+   * every selection would look missing.
+   */
+  const missingSelections = useMemo(() => {
+    if (schema.length === 0) return []
+    const known = new Set(schema.map((t) => t.full_name))
+    return Object.entries(selectedSchema)
+      .filter(
+        ([key, sel]) =>
+          !key.startsWith('_') &&
+          sel?.selected &&
+          (sel.columns?.length || 0) > 0 &&
+          !known.has(key)
+      )
+      .map(([key]) => key)
+      .sort((a, b) => a.localeCompare(b))
+  }, [schema, selectedSchema])
+
+  /**
+   * Whether this connection arrived with a selection. Saving an empty selection
+   * is meaningless when creating a connection, but it is exactly what removing
+   * the last stale table means when editing one — so the "pick something first"
+   * guard must not apply there.
+   */
+  const hadInitialSelection = useMemo(
+    () =>
+      Object.entries(initialSelectedSchema || {}).some(
+        ([key, value]) =>
+          !key.startsWith('_') &&
+          Boolean((value as { selected?: boolean } | undefined)?.selected)
+      ),
+    [initialSelectedSchema]
+  )
+
+  // Keys awaiting confirmation in the removal dialog; null = dialog closed.
+  const [pendingRemoval, setPendingRemoval] = useState<string[] | null>(null)
+  const [removing, setRemoving] = useState(false)
+  const [removeError, setRemoveError] = useState<string | null>(null)
+
+  const confirmRemoval = async () => {
+    if (!pendingRemoval) return
+    const keys = pendingRemoval
+    setRemoveError(null)
+
+    if (onRemoveMissingTables) {
+      setRemoving(true)
+      try {
+        await onRemoveMissingTables(keys)
+      } catch (err) {
+        setRemoveError(
+          err instanceof Error ? err.message : 'Could not remove the tables'
+        )
+        setRemoving(false)
+        return
+      }
+      setRemoving(false)
+    }
+
+    // Drop them locally too, whether they were persisted just now or will be
+    // written with the rest of the selection on save.
+    setSelectedSchema((prev) => {
+      const next = { ...prev }
+      keys.forEach((key) => delete next[key])
+      return next
+    })
+    setPendingRemoval(null)
+  }
+
   const selectionStats = useMemo(() => {
+    const known = new Set(schema.map((t) => t.full_name))
     const totalTables = schema.length
-    const selectedTables = Object.values(selectedSchema).filter(
-      (s) => s.selected && s.columns.length > 0
-    ).length
+    const entries = Object.entries(selectedSchema).filter(
+      ([key, s]) => !key.startsWith('_') && s.selected && s.columns.length > 0
+    )
+    // Count only what the tree can actually show, so the tab badge and the list
+    // below it can never disagree.
+    const selectedTables =
+      schema.length === 0
+        ? entries.length
+        : entries.filter(([key]) => known.has(key)).length
     const totalColumns = schema.reduce((sum, t) => sum + t.columns.length, 0)
-    const selectedColumns = Object.values(selectedSchema).reduce(
-      (sum, s) => sum + (s.columns?.length || 0),
+    const selectedColumns = entries.reduce(
+      (sum, [, s]) => sum + (s.columns?.length || 0),
       0
     )
     return { totalTables, selectedTables, totalColumns, selectedColumns }
@@ -490,14 +618,41 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
 
   return (
     <div className="flex flex-col h-full">
-      {/* Header */}
-      <div className="mb-4">
-        <p className="text-sm text-gray-500 dark:text-gray-400 mb-1">
-          Create connection
-        </p>
-        <h2 className="text-xl font-semibold text-gray-900 dark:text-white">
-          Select tables
-        </h2>
+      {/* Header — the actions live up here rather than under the lists, which
+          on a wide schema meant scrolling past hundreds of rows to save. */}
+      <div className="mb-4 flex items-start justify-between gap-4">
+        <div>
+          <p className="text-sm text-gray-500 dark:text-gray-400 mb-1">
+            Create connection
+          </p>
+          <h2 className="text-xl font-semibold text-gray-900 dark:text-white">
+            Select tables
+          </h2>
+        </div>
+        <div className="flex items-center gap-3 shrink-0">
+          <button
+            onClick={onBack}
+            className="flex items-center gap-2 px-3 py-2 text-blue-600 hover:text-blue-700 dark:text-blue-400 dark:hover:text-blue-300 text-sm font-medium transition-colors"
+          >
+            <ArrowLeft className="w-4 h-4" />
+            Back
+          </button>
+          <button
+            onClick={handleConfirm}
+            disabled={
+              (selectionStats.selectedColumns === 0 && !hadInitialSelection) ||
+              externalLoading
+            }
+            className="flex items-center gap-2 px-5 py-2.5 bg-blue-600 hover:bg-blue-700 rounded-lg text-sm font-medium text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {externalLoading ? (
+              <Loader2 className="w-4 h-4 animate-spin" />
+            ) : (
+              <Check className="w-4 h-4" />
+            )}
+            Save Selection
+          </button>
+        </div>
       </div>
 
       {/* Main Content - Two Column Layout */}
@@ -591,10 +746,60 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
 
           {/* Tree View */}
           <div className="flex-1 overflow-y-auto">
+            {/* Selections whose table is gone from the database. Shown on both
+                tabs and above the tree: it is a problem to resolve, not a
+                branch to browse, and it vanishes once cleared. */}
+            {missingSelections.length > 0 && (
+              <div className="border-b border-amber-200 dark:border-amber-900/40 bg-amber-50 dark:bg-amber-900/10">
+                <div className="flex items-center gap-2 px-3 py-2">
+                  <AlertCircle className="w-4 h-4 text-amber-600 dark:text-amber-500 shrink-0" />
+                  <span className="text-xs font-medium text-amber-800 dark:text-amber-300 flex-1">
+                    {(
+                      labels?.missingTablesTitle ??
+                      'Missing from database ({count})'
+                    ).replace('{count}', String(missingSelections.length))}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setPendingRemoval(missingSelections)}
+                    className="text-xs font-medium text-amber-700 dark:text-amber-400 hover:underline shrink-0"
+                  >
+                    {labels?.removeAll ?? 'Remove all'}
+                  </button>
+                </div>
+                <p className="px-3 pb-2 text-[11px] text-amber-700/80 dark:text-amber-400/70">
+                  {labels?.missingTablesHint ??
+                    'Still selected but no longer in the database. Removing them takes effect immediately.'}
+                </p>
+                {missingSelections.map((tableKey) => (
+                  <div
+                    key={tableKey}
+                    className="flex items-center gap-2 px-3 py-1 pl-7 hover:bg-amber-100/60 dark:hover:bg-amber-900/20"
+                  >
+                    <Table2 className="w-3.5 h-3.5 text-amber-500 shrink-0" />
+                    <span
+                      className="text-xs text-amber-900 dark:text-amber-200 line-through truncate flex-1"
+                      title={tableKey}
+                    >
+                      {tableKey}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setPendingRemoval([tableKey])}
+                      title={labels?.remove ?? 'Remove'}
+                      className="p-0.5 rounded hover:bg-amber-200 dark:hover:bg-amber-800/40 shrink-0"
+                    >
+                      <X className="w-3.5 h-3.5 text-amber-700 dark:text-amber-400" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+
             {groupedTables.map((db) => (
               <div key={db.databaseName}>
                 <div
-                  className="flex items-center gap-2 px-3 py-2 hover:bg-gray-50 dark:hover:bg-gray-700 cursor-pointer"
+                  className="flex items-center gap-2 px-3 py-1.5 hover:bg-gray-50 dark:hover:bg-gray-700 cursor-pointer"
                   onClick={() => toggleDatabase(db.databaseName)}
                 >
                   {expandedDatabases.has(db.databaseName) ? (
@@ -614,7 +819,7 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
                     return (
                       <div key={schemaKey}>
                         <div
-                          className="flex items-center gap-2 px-3 py-2 pl-7 hover:bg-gray-50 dark:hover:bg-gray-700 cursor-pointer"
+                          className="flex items-center gap-2 px-3 py-1.5 pl-7 hover:bg-gray-50 dark:hover:bg-gray-700 cursor-pointer"
                           onClick={() => toggleSchema(schemaKey)}
                         >
                           {expandedSchemas.has(schemaKey) ? (
@@ -629,7 +834,13 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
                         </div>
 
                         {expandedSchemas.has(schemaKey) &&
-                          schemaGroup.tables.map((table) => {
+                          schemaGroup.tables
+                            .filter(
+                              (t) =>
+                                !renderedTableKeys ||
+                                renderedTableKeys.has(t.full_name)
+                            )
+                            .map((table) => {
                             const isSelected =
                               selectedTable?.full_name === table.full_name
                             const selectionState =
@@ -638,7 +849,7 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
                             return (
                               <div
                                 key={table.full_name}
-                                className={`flex items-center gap-2 px-3 py-2 pl-14 cursor-pointer transition-colors ${
+                                className={`flex items-center gap-2 px-3 py-1 pl-12 cursor-pointer transition-colors ${
                                   isSelected
                                     ? 'bg-blue-50 dark:bg-blue-900/20 border-l-2 border-blue-600'
                                     : 'hover:bg-gray-50 dark:hover:bg-gray-700'
@@ -652,22 +863,23 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
                                   className="flex-shrink-0 hover:scale-110 transition-transform"
                                 >
                                   {selectionState === 'all' && (
-                                    <CheckSquare className="w-4 h-4 text-blue-600" />
+                                    <CheckSquare className="w-3.5 h-3.5 text-blue-600" />
                                   )}
                                   {selectionState === 'some' && (
-                                    <MinusSquare className="w-4 h-4 text-blue-600" />
+                                    <MinusSquare className="w-3.5 h-3.5 text-blue-600" />
                                   )}
                                   {selectionState === 'none' && (
-                                    <Square className="w-4 h-4 text-gray-400 hover:text-blue-500" />
+                                    <Square className="w-3.5 h-3.5 text-gray-400 hover:text-blue-500" />
                                   )}
                                 </div>
-                                <Table2 className="w-4 h-4 text-gray-500 flex-shrink-0" />
+                                <Table2 className="w-3.5 h-3.5 text-gray-500 flex-shrink-0" />
                                 <span
-                                  className={`text-sm truncate ${
+                                  className={`text-xs truncate ${
                                     isSelected
                                       ? 'text-blue-700 dark:text-blue-300 font-medium'
                                       : 'text-gray-700 dark:text-gray-300'
                                   }`}
+                                  title={table.table_name}
                                 >
                                   {table.table_name}
                                 </span>
@@ -704,6 +916,21 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
                   </p>
                 </div>
               )}
+
+            {visibleTables.length > TABLE_PREVIEW_COUNT && (
+              <button
+                type="button"
+                onClick={() => setShowAllTables((v) => !v)}
+                className="w-full px-3 py-2 text-xs font-medium text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 border-t border-gray-100 dark:border-gray-700 transition-colors"
+              >
+                {showAllTables
+                  ? labels?.showFewerColumns ?? 'Show fewer'
+                  : (labels?.showAllTables ?? 'Show all {count} tables').replace(
+                      '{count}',
+                      String(visibleTables.length)
+                    )}
+              </button>
+            )}
           </div>
         </div>
 
@@ -842,28 +1069,65 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
         </div>
       </div>
 
-      {/* Footer with Actions */}
-      <div className="flex items-center justify-between pt-4 mt-4 border-t border-gray-200 dark:border-gray-700">
-        <button
-          onClick={onBack}
-          className="flex items-center gap-2 text-blue-600 hover:text-blue-700 dark:text-blue-400 dark:hover:text-blue-300 text-sm font-medium transition-colors"
+      {/* Confirm removing selections whose table is gone. Destructive and
+          applied immediately, so it asks first. */}
+      {pendingRemoval && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+          onClick={() => !removing && setPendingRemoval(null)}
         >
-          <ArrowLeft className="w-4 h-4" />
-          Back
-        </button>
-        <button
-          onClick={handleConfirm}
-          disabled={selectionStats.selectedColumns === 0 || externalLoading}
-          className="flex items-center gap-2 px-5 py-2.5 bg-blue-600 hover:bg-blue-700 rounded-lg text-sm font-medium text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-        >
-          {externalLoading ? (
-            <Loader2 className="w-4 h-4 animate-spin" />
-          ) : (
-            <Check className="w-4 h-4" />
-          )}
-          Save Selection
-        </button>
-      </div>
+          <div
+            className="w-full max-w-md rounded-xl bg-white dark:bg-gray-800 shadow-xl border border-gray-200 dark:border-gray-700 p-5"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-start gap-3">
+              <AlertCircle className="w-5 h-5 text-amber-500 shrink-0 mt-0.5" />
+              <div className="min-w-0">
+                <h3 className="text-base font-semibold text-gray-900 dark:text-white">
+                  {labels?.removeMissingConfirmTitle ?? 'Remove from selection?'}
+                </h3>
+                <p className="mt-1 text-sm text-gray-600 dark:text-gray-400">
+                  {(
+                    labels?.removeMissingConfirmBody ??
+                    '{count} table(s) will be removed from this connection right away. This cannot be undone.'
+                  ).replace('{count}', String(pendingRemoval.length))}
+                </p>
+                <ul className="mt-2 max-h-32 overflow-y-auto text-xs text-gray-500 dark:text-gray-400 space-y-0.5">
+                  {pendingRemoval.map((key) => (
+                    <li key={key} className="truncate" title={key}>
+                      {key}
+                    </li>
+                  ))}
+                </ul>
+                {removeError && (
+                  <p className="mt-2 text-xs text-red-600 dark:text-red-400">
+                    {removeError}
+                  </p>
+                )}
+              </div>
+            </div>
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setPendingRemoval(null)}
+                disabled={removing}
+                className="px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors disabled:opacity-50"
+              >
+                {labels?.cancel ?? 'Cancel'}
+              </button>
+              <button
+                type="button"
+                onClick={confirmRemoval}
+                disabled={removing}
+                className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-red-600 hover:bg-red-700 rounded-lg transition-colors disabled:opacity-50"
+              >
+                {removing && <Loader2 className="w-4 h-4 animate-spin" />}
+                {labels?.remove ?? 'Remove'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
