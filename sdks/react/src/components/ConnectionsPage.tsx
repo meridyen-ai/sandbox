@@ -155,7 +155,7 @@ export function ConnectionsPage() {
         ...prev,
         [connection.id]: {
           connected: false,
-          error: err instanceof Error ? err.message : 'Test failed',
+          error: err instanceof Error ? err.message : t('dataSources.errors.testFailed'),
         },
       }))
     } finally {
@@ -357,12 +357,12 @@ export function ConnectionsPage() {
             <Database className="w-12 h-12 text-gray-300 dark:text-gray-600 mx-auto mb-4" />
             <h4 className="text-lg font-medium text-gray-900 dark:text-white mb-2">
               {searchQuery
-                ? 'No matching connections'
+                ? t('connections.noMatching')
                 : t('connections.noConnections')}
             </h4>
             <p className="text-gray-500 dark:text-gray-400 mb-6 max-w-sm mx-auto">
               {searchQuery
-                ? 'Try a different search term'
+                ? t('connections.tryDifferentSearch')
                 : t('connections.getStarted')}
             </p>
             {!searchQuery && (
@@ -485,7 +485,7 @@ export function ConnectionsPage() {
                         handleEditTables(connection)
                       }}
                       className="p-1.5 text-gray-400 hover:text-blue-600 rounded opacity-0 group-hover:opacity-100 hover:bg-gray-100 dark:hover:bg-gray-600 transition-all"
-                      title="Edit table selection"
+                      title={t('connections.editTableSelection')}
                     >
                       <Settings2 className="w-4 h-4" />
                     </button>
@@ -496,7 +496,7 @@ export function ConnectionsPage() {
                       }}
                       disabled={isTesting || currentlyDeleting}
                       className="p-1.5 text-gray-400 hover:text-blue-600 rounded opacity-0 group-hover:opacity-100 hover:bg-gray-100 dark:hover:bg-gray-600 transition-all"
-                      title="Test connection"
+                      title={t('connections.testConnection')}
                     >
                       <RefreshCw
                         className={`w-4 h-4 ${isTesting ? 'animate-spin' : ''}`}

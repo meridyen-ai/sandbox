@@ -23,15 +23,24 @@ import {
   Folder,
   X,
 } from 'lucide-react'
-import { useSandboxApi } from '../context/SandboxUIContext'
+import { useSandboxApi, useSandboxTranslation } from '../context/SandboxUIContext'
 import type { TableWithColumns, SelectedSchema, SchemaData } from '../types'
 
 /**
- * Overrides for the bulk-selection controls, so a host app that speaks another
- * language can pass its own strings (e.g. "Seçimi temizle"). English is used
- * for anything left out.
+ * Per-instance overrides for a few controls, kept for backwards compatibility
+ * with hosts that localized this component before it spoke `t()` itself.
+ *
+ * Prefer passing a `t` to `<SandboxUIProvider>`: it covers the whole component
+ * rather than these twelve strings. Anything set here still wins over `t()`,
+ * and anything left out falls through to `t()` — so the two can be mixed.
  */
 export interface TableColumnSelectorLabels {
+  /**
+   * The small line above the title. Defaults to "Create connection", which is
+   * wrong when the host mounts this to EDIT an existing connection — pass the
+   * right wording for the flow you are in.
+   */
+  eyebrow?: string
   selectAll?: string
   clearSelection?: string
   /** `{count}` is replaced with the total number of columns. */
@@ -133,6 +142,7 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
   onRemoveMissingTables,
 }) => {
   const api = useSandboxApi()
+  const { t } = useSandboxTranslation()
   const [schema, setSchema] = useState<TableWithColumns[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -208,7 +218,7 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
       setError(
         err instanceof Error
           ? err.message
-          : 'Failed to load database schema'
+          : t('tableSelector.errors.schemaLoadFailed')
       )
     } finally {
       setLoading(false)
@@ -394,7 +404,7 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
         await onRemoveMissingTables(keys)
       } catch (err) {
         setRemoveError(
-          err instanceof Error ? err.message : 'Could not remove the tables'
+          err instanceof Error ? err.message : t('tableSelector.errors.removeFailed')
         )
         setRemoving(false)
         return
@@ -585,7 +595,7 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
       <div className="flex flex-col items-center justify-center py-20">
         <Loader2 className="w-10 h-10 animate-spin text-blue-500 mb-4" />
         <p className="text-gray-500 dark:text-gray-400">
-          Loading database schema...
+          {t('tableSelector.loadingSchema')}
         </p>
       </div>
     )
@@ -604,7 +614,7 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
           className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-medium"
         >
           <RefreshCw className="w-4 h-4" />
-          Retry
+          {t('common.retry')}
         </button>
       </div>
     )
@@ -623,10 +633,10 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
       <div className="mb-4 flex items-start justify-between gap-4">
         <div>
           <p className="text-sm text-gray-500 dark:text-gray-400 mb-1">
-            Create connection
+            {labels?.eyebrow ?? t('tableSelector.eyebrow')}
           </p>
           <h2 className="text-xl font-semibold text-gray-900 dark:text-white">
-            Select tables
+            {t('tableSelector.title')}
           </h2>
         </div>
         <div className="flex items-center gap-3 shrink-0">
@@ -635,7 +645,7 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
             className="flex items-center gap-2 px-3 py-2 text-blue-600 hover:text-blue-700 dark:text-blue-400 dark:hover:text-blue-300 text-sm font-medium transition-colors"
           >
             <ArrowLeft className="w-4 h-4" />
-            Back
+            {t('common.back')}
           </button>
           <button
             onClick={handleConfirm}
@@ -650,7 +660,7 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
             ) : (
               <Check className="w-4 h-4" />
             )}
-            Save Selection
+            {t('tableSelector.saveSelection')}
           </button>
         </div>
       </div>
@@ -670,7 +680,7 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
                 onClick={() => loadSchema(true)}
                 disabled={refreshing}
                 className="p-1 hover:bg-gray-200 dark:hover:bg-gray-700 rounded transition-colors disabled:opacity-50"
-                title="Reload schema from database"
+                title={t('tableSelector.reloadSchema')}
               >
                 <RefreshCw className={`w-4 h-4 text-gray-500 hover:text-blue-600 ${refreshing ? 'animate-spin' : ''}`} />
               </button>
@@ -687,7 +697,7 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
                   : 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300'
               }`}
             >
-              All
+              {t('tableSelector.tabAll')}
             </button>
             <button
               onClick={() => setActiveTab('selected')}
@@ -697,7 +707,7 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
                   : 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300'
               }`}
             >
-              Selected
+              {t('tableSelector.tabSelected')}
               {selectionStats.selectedTables > 0 && (
                 <span className="bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300 text-xs px-1.5 py-0.5 rounded-full">
                   {selectionStats.selectedTables}
@@ -714,7 +724,7 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
                 type="text"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="Search tables..."
+                placeholder={t('tableSelector.searchTables')}
                 className="w-full pl-9 pr-3 py-2 text-sm bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg text-gray-900 dark:text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
               />
             </div>
@@ -727,7 +737,7 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
                 disabled={visibleTables.length === 0 || visibleAllSelected}
                 className="px-2 py-1 text-xs font-medium text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 rounded transition-colors disabled:opacity-40 disabled:hover:bg-transparent"
               >
-                {labels?.selectAll ?? 'Select all'}
+                {labels?.selectAll ?? t('tableSelector.selectAll')}
               </button>
               <button
                 type="button"
@@ -735,7 +745,7 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
                 disabled={visibleTables.length === 0 || !visibleAnySelected}
                 className="px-2 py-1 text-xs font-medium text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700 rounded transition-colors disabled:opacity-40 disabled:hover:bg-transparent"
               >
-                {labels?.clearSelection ?? 'Clear selection'}
+                {labels?.clearSelection ?? t('tableSelector.clearSelection')}
               </button>
               {/* Wordless on purpose: needs no translation */}
               <span className="ml-auto text-xs text-gray-400 tabular-nums">
@@ -756,7 +766,7 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
                   <span className="text-xs font-medium text-amber-800 dark:text-amber-300 flex-1">
                     {(
                       labels?.missingTablesTitle ??
-                      'Missing from database ({count})'
+                      t('tableSelector.missingTablesTitle')
                     ).replace('{count}', String(missingSelections.length))}
                   </span>
                   <button
@@ -764,12 +774,11 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
                     onClick={() => setPendingRemoval(missingSelections)}
                     className="text-xs font-medium text-amber-700 dark:text-amber-400 hover:underline shrink-0"
                   >
-                    {labels?.removeAll ?? 'Remove all'}
+                    {labels?.removeAll ?? t('tableSelector.removeAll')}
                   </button>
                 </div>
                 <p className="px-3 pb-2 text-[11px] text-amber-700/80 dark:text-amber-400/70">
-                  {labels?.missingTablesHint ??
-                    'Still selected but no longer in the database. Removing them takes effect immediately.'}
+                  {labels?.missingTablesHint ?? t('tableSelector.missingTablesHint')}
                 </p>
                 {missingSelections.map((tableKey) => (
                   <div
@@ -786,7 +795,7 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
                     <button
                       type="button"
                       onClick={() => setPendingRemoval([tableKey])}
-                      title={labels?.remove ?? 'Remove'}
+                      title={labels?.remove ?? t('tableSelector.remove')}
                       className="p-0.5 rounded hover:bg-amber-200 dark:hover:bg-amber-800/40 shrink-0"
                     >
                       <X className="w-3.5 h-3.5 text-amber-700 dark:text-amber-400" />
@@ -897,10 +906,10 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
                 <div className="flex flex-col items-center justify-center py-8 text-center px-4">
                   <Square className="w-8 h-8 text-gray-300 dark:text-gray-600 mb-2" />
                   <p className="text-sm text-gray-500 dark:text-gray-400">
-                    No tables selected yet
+                    {t('tableSelector.noTablesSelected')}
                   </p>
                   <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">
-                    Select columns from the All tab
+                    {t('tableSelector.noTablesSelectedHint')}
                   </p>
                 </div>
               )}
@@ -911,8 +920,8 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
                   <Table2 className="w-8 h-8 text-gray-300 dark:text-gray-600 mb-2" />
                   <p className="text-sm text-gray-500 dark:text-gray-400">
                     {searchQuery
-                      ? 'No tables match your search'
-                      : 'No tables found'}
+                      ? t('tableSelector.noTablesMatch')
+                      : t('tableSelector.noTablesFound')}
                   </p>
                 </div>
               )}
@@ -924,8 +933,8 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
                 className="w-full px-3 py-2 text-xs font-medium text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 border-t border-gray-100 dark:border-gray-700 transition-colors"
               >
                 {showAllTables
-                  ? labels?.showFewerColumns ?? 'Show fewer'
-                  : (labels?.showAllTables ?? 'Show all {count} tables').replace(
+                  ? labels?.showFewerColumns ?? t('tableSelector.showFewer')
+                  : (labels?.showAllTables ?? t('tableSelector.showAllTables')).replace(
                       '{count}',
                       String(visibleTables.length)
                     )}
@@ -943,8 +952,9 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
                   {selectedTable.table_name}
                 </h3>
                 <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                  {selectedColumnNames.length}/{selectedTable.columns.length}{' '}
-                  columns selected
+                  {t('tableSelector.columnsSelected')
+                    .replace('{selected}', String(selectedColumnNames.length))
+                    .replace('{total}', String(selectedTable.columns.length))}
                 </p>
               </div>
 
@@ -955,7 +965,7 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
                     type="text"
                     value={columnSearchQuery}
                     onChange={(e) => setColumnSearchQuery(e.target.value)}
-                    placeholder="Search columns..."
+                    placeholder={t('tableSelector.searchColumns')}
                     className="w-full pl-9 pr-3 py-2 text-sm bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg text-gray-900 dark:text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                   />
                 </div>
@@ -977,11 +987,12 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
                   )}
                 </div>
                 <div className="col-span-5">
-                  Column name ({selectedColumnNames.length}/
-                  {selectedTable.columns.length} selected)
+                  {t('tableSelector.colColumnName')
+                    .replace('{selected}', String(selectedColumnNames.length))
+                    .replace('{total}', String(selectedTable.columns.length))}
                 </div>
-                <div className="col-span-3">Data type</div>
-                <div className="col-span-3">Nullable</div>
+                <div className="col-span-3">{t('tableSelector.colDataType')}</div>
+                <div className="col-span-3">{t('tableSelector.colNullable')}</div>
               </div>
 
               <div className="flex-1 overflow-y-auto">
@@ -1025,7 +1036,7 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
                         <span
                           className={`text-xs ${column.nullable ? 'text-green-600 dark:text-green-400' : 'text-gray-400'}`}
                         >
-                          {column.nullable ? 'Yes' : 'No'}
+                          {column.nullable ? t('common.yes') : t('common.no')}
                         </span>
                       </div>
                     </div>
@@ -1040,9 +1051,9 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
                       className="w-full px-4 py-2 text-xs font-medium text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 transition-colors"
                     >
                       {showAllColumns
-                        ? labels?.showFewerColumns ?? 'Show fewer'
+                        ? labels?.showFewerColumns ?? t('tableSelector.showFewer')
                         : (
-                            labels?.showAllColumns ?? 'Show all {count} columns'
+                            labels?.showAllColumns ?? t('tableSelector.showAllColumns')
                           ).replace('{count}', String(filteredColumns.length))}
                     </button>
                   )}
@@ -1050,7 +1061,7 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
                 {filteredColumns.length === 0 && columnSearchQuery && (
                   <div className="flex flex-col items-center justify-center py-8 text-center">
                     <p className="text-sm text-gray-500 dark:text-gray-400">
-                      No columns match your search
+                      {t('tableSelector.noColumnsMatch')}
                     </p>
                   </div>
                 )}
@@ -1061,7 +1072,7 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
               <div className="text-center">
                 <Table2 className="w-12 h-12 text-gray-300 dark:text-gray-600 mx-auto mb-3" />
                 <p className="text-gray-500 dark:text-gray-400">
-                  Select a table to view its columns
+                  {t('tableSelector.selectTableHint')}
                 </p>
               </div>
             </div>
@@ -1084,12 +1095,13 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
               <AlertCircle className="w-5 h-5 text-amber-500 shrink-0 mt-0.5" />
               <div className="min-w-0">
                 <h3 className="text-base font-semibold text-gray-900 dark:text-white">
-                  {labels?.removeMissingConfirmTitle ?? 'Remove from selection?'}
+                  {labels?.removeMissingConfirmTitle ??
+                    t('tableSelector.removeMissingConfirmTitle')}
                 </h3>
                 <p className="mt-1 text-sm text-gray-600 dark:text-gray-400">
                   {(
                     labels?.removeMissingConfirmBody ??
-                    '{count} table(s) will be removed from this connection right away. This cannot be undone.'
+                    t('tableSelector.removeMissingConfirmBody')
                   ).replace('{count}', String(pendingRemoval.length))}
                 </p>
                 <ul className="mt-2 max-h-32 overflow-y-auto text-xs text-gray-500 dark:text-gray-400 space-y-0.5">
@@ -1113,7 +1125,7 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
                 disabled={removing}
                 className="px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors disabled:opacity-50"
               >
-                {labels?.cancel ?? 'Cancel'}
+                {labels?.cancel ?? t('common.cancel')}
               </button>
               <button
                 type="button"
@@ -1122,7 +1134,7 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
                 className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-red-600 hover:bg-red-700 rounded-lg transition-colors disabled:opacity-50"
               >
                 {removing && <Loader2 className="w-4 h-4 animate-spin" />}
-                {labels?.remove ?? 'Remove'}
+                {labels?.remove ?? t('tableSelector.remove')}
               </button>
             </div>
           </div>

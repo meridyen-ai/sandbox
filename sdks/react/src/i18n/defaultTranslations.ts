@@ -19,6 +19,10 @@ const translations: Record<string, string> = {
   'common.columns': 'columns',
   'common.tables': 'tables',
   'common.search': 'Search',
+  'common.yes': 'Yes',
+  'common.no': 'No',
+  /** Heading over a list of tables. `common.tables` is the lowercase unit used in counts. */
+  'common.tablesTitle': 'Tables',
 
   // dataSources
   'dataSources.title': 'Data Sources',
@@ -63,6 +67,78 @@ const translations: Record<string, string> = {
   'connections.getStarted': 'Get started by creating a new database connection.',
   'connections.deleteConfirm': 'Are you sure you want to delete this connection?',
   'connections.default': 'Default',
+  'connections.noMatching': 'No matching connections',
+  'connections.tryDifferentSearch': 'Try a different search term',
+  'connections.editTableSelection': 'Edit table selection',
+  'connections.testConnection': 'Test connection',
+
+  // tableSelector — the table/column picker.
+  // NOTE: the `{count}`, `{selected}` and `{total}` placeholders below are
+  // substituted by the component itself with String.replace, NOT by the host's
+  // interpolation engine. Keep the single braces exactly as written.
+  'tableSelector.eyebrow': 'Create connection',
+  'tableSelector.title': 'Select tables',
+  'tableSelector.saveSelection': 'Save Selection',
+  'tableSelector.loadingSchema': 'Loading database schema...',
+  'tableSelector.reloadSchema': 'Reload schema from database',
+  'tableSelector.tabAll': 'All',
+  'tableSelector.tabSelected': 'Selected',
+  'tableSelector.searchTables': 'Search tables...',
+  'tableSelector.searchColumns': 'Search columns...',
+  'tableSelector.selectAll': 'Select all',
+  'tableSelector.clearSelection': 'Clear selection',
+  'tableSelector.showFewer': 'Show fewer',
+  'tableSelector.showAllTables': 'Show all {count} tables',
+  'tableSelector.showAllColumns': 'Show all {count} columns',
+  'tableSelector.columnsSelected': '{selected}/{total} columns selected',
+  'tableSelector.colColumnName': 'Column name ({selected}/{total} selected)',
+  'tableSelector.colDataType': 'Data type',
+  'tableSelector.colNullable': 'Nullable',
+  'tableSelector.noTablesFound': 'No tables found',
+  'tableSelector.noTablesMatch': 'No tables match your search',
+  'tableSelector.noColumnsMatch': 'No columns match your search',
+  'tableSelector.noTablesSelected': 'No tables selected yet',
+  'tableSelector.noTablesSelectedHint': 'Select columns from the All tab',
+  'tableSelector.selectTableHint': 'Select a table to view its columns',
+  'tableSelector.missingTablesTitle': 'Missing from database ({count})',
+  'tableSelector.missingTablesHint':
+    'Still selected but no longer in the database. Removing them takes effect immediately.',
+  'tableSelector.removeAll': 'Remove all',
+  'tableSelector.remove': 'Remove',
+  'tableSelector.removeMissingConfirmTitle': 'Remove from selection?',
+  'tableSelector.removeMissingConfirmBody':
+    '{count} table(s) will be removed from this connection right away. This cannot be undone.',
+  'tableSelector.errors.schemaLoadFailed': 'Failed to load database schema',
+  'tableSelector.errors.removeFailed': 'Could not remove the tables',
+
+  // explorer — the SQL query explorer
+  'explorer.title': 'Query Explorer',
+  'explorer.loadingSchema': 'Loading database schema...',
+  'explorer.connectionError': 'Connection Error',
+  'explorer.fullscreen': 'Fullscreen',
+  'explorer.exitFullscreen': 'Exit Fullscreen',
+  'explorer.aiAssistant': 'AI Query Assistant',
+  'explorer.aiHint': 'Describe what you want to query in plain language',
+  'explorer.aiPlaceholder': 'e.g. Show top 10 customers by total order amount...',
+  'explorer.generate': 'Generate',
+  'explorer.generating': 'Generating...',
+  'explorer.copySql': 'Copy SQL',
+  'explorer.useQuery': 'Use this query in the editor',
+  'explorer.doubleClickHint': 'Double-click to generate SELECT query',
+  'explorer.noTables': 'No tables found',
+  'explorer.run': 'Run',
+  'explorer.running': 'Running...',
+  'explorer.sqlPlaceholder': 'Write your SQL query here... (Ctrl+Enter to execute)',
+  'explorer.queryError': 'Query Error',
+  'explorer.emptyHintBefore': 'Write a query and press ',
+  'explorer.emptyHintAfter': ' to execute',
+  'explorer.emptyHintDoubleClick':
+    'Double-click a table name in the sidebar to generate a SELECT query',
+  'explorer.errors.apiNotConfigured': 'Query API not configured.',
+  'explorer.errors.noConnections': 'No database connections configured.',
+  'explorer.errors.schemaLoadFailed': 'Failed to load schema',
+  'explorer.errors.queryFailed': 'Query execution failed',
+  'explorer.errors.generateFailed': 'Failed to generate SQL',
 }
 
 export function defaultT(key: string, params?: Record<string, string>): string {

@@ -7,7 +7,7 @@
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Database, Play, X, Maximize2, Minimize2, ChevronRight, ChevronDown, Table, Columns, Wand2, Loader2, Copy, ArrowRight } from 'lucide-react';
-import { useSandboxApi } from '../context/SandboxUIContext';
+import { useSandboxApi, useSandboxTranslation } from '../context/SandboxUIContext';
 import type { ConnectionWithSchema, QueryResult } from '../context/types';
 
 export interface DatabaseExplorerProps {
@@ -39,6 +39,7 @@ export function DatabaseExplorer({
   initialQuery,
 }: DatabaseExplorerProps) {
   const api = useSandboxApi();
+  const { t } = useSandboxTranslation();
   const [isFullscreen, setIsFullscreen] = useState(initialFullscreen);
   const [connections, setConnections] = useState<ConnectionWithSchema[]>([]);
   const [selectedConnection, setSelectedConnection] = useState<string | undefined>(connectionId);
@@ -74,7 +75,7 @@ export function DatabaseExplorer({
 
   const loadSchema = async () => {
     if (!api.query) {
-      setLoadError('Query API not configured.');
+      setLoadError(t('explorer.errors.apiNotConfigured'));
       setIsLoadingSchema(false);
       return;
     }
@@ -100,10 +101,10 @@ export function DatabaseExplorer({
           setSelectedConnection(conns[0].id);
         }
       } else {
-        setLoadError('No database connections configured.');
+        setLoadError(t('explorer.errors.noConnections'));
       }
     } catch (err: any) {
-      setLoadError(err?.message || 'Failed to load schema');
+      setLoadError(err?.message || t('explorer.errors.schemaLoadFailed'));
     } finally {
       setIsLoadingSchema(false);
     }
@@ -132,11 +133,11 @@ export function DatabaseExplorer({
         setResult(queryResult);
         onQueryResult?.(queryResult, query.trim());
       } else if (response?.status === 'error') {
-        setQueryError(response?.message || 'Query execution failed');
+        setQueryError(response?.message || t('explorer.errors.queryFailed'));
       }
     } catch (err: any) {
       setExecutionTime(Math.round(performance.now() - startTime));
-      setQueryError(err?.message || 'Query execution failed');
+      setQueryError(err?.message || t('explorer.errors.queryFailed'));
     } finally {
       setIsExecuting(false);
     }
@@ -183,11 +184,11 @@ export function DatabaseExplorer({
           explanation: response.explanation || '',
         });
       } else {
-        const errMsg = response?.error || 'Failed to generate SQL';
+        const errMsg = response?.error || t('explorer.errors.generateFailed');
         setAiError(typeof errMsg === 'string' ? errMsg : JSON.stringify(errMsg));
       }
     } catch (err: any) {
-      const errMsg = err?.message || 'Failed to generate SQL';
+      const errMsg = err?.message || t('explorer.errors.generateFailed');
       setAiError(typeof errMsg === 'string' ? errMsg : JSON.stringify(errMsg));
     } finally {
       setAiLoading(false);
@@ -213,7 +214,7 @@ export function DatabaseExplorer({
         <div className="flex-1 flex items-center justify-center">
           <div className="text-center">
             <Database className="w-8 h-8 text-blue-600 animate-pulse mx-auto mb-3" />
-            <p className="text-gray-600 dark:text-gray-400">Loading database schema...</p>
+            <p className="text-gray-600 dark:text-gray-400">{t('explorer.loadingSchema')}</p>
           </div>
         </div>
       </div>
@@ -228,7 +229,7 @@ export function DatabaseExplorer({
             <div className="w-16 h-16 bg-red-100 dark:bg-red-900/30 rounded-full flex items-center justify-center mx-auto mb-4">
               <X className="w-8 h-8 text-red-600 dark:text-red-400" />
             </div>
-            <h3 className="text-lg font-semibold text-gray-900 dark:text-dashboard-text mb-2">Connection Error</h3>
+            <h3 className="text-lg font-semibold text-gray-900 dark:text-dashboard-text mb-2">{t('explorer.connectionError')}</h3>
             <p className="text-gray-600 dark:text-gray-400 mb-4">{loadError}</p>
             <button
               onClick={loadSchema}
@@ -248,7 +249,7 @@ export function DatabaseExplorer({
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 px-4 py-2 border-b border-gray-200 dark:border-dashboard-border bg-gray-50 dark:bg-dashboard-elevated shrink-0">
         <div className="flex items-center gap-2 min-w-0">
           <Database className="w-5 h-5 text-blue-600 dark:text-blue-400 shrink-0" />
-          <h2 className="text-base sm:text-lg font-semibold text-gray-800 dark:text-dashboard-text whitespace-nowrap">Query Explorer</h2>
+          <h2 className="text-base sm:text-lg font-semibold text-gray-800 dark:text-dashboard-text whitespace-nowrap">{t('explorer.title')}</h2>
           {connectionSelectorSlot ? (
             connectionSelectorSlot
           ) : !hideConnectionSelector && connections.length > 0 ? (
@@ -269,7 +270,7 @@ export function DatabaseExplorer({
           <button
             onClick={() => setIsFullscreen(!isFullscreen)}
             className="p-2 text-gray-600 dark:text-gray-400 hover:text-gray-800 dark:hover:text-dashboard-text hover:bg-gray-100 dark:hover:bg-dashboard-subtle rounded-md transition-colors"
-            title={isFullscreen ? 'Exit Fullscreen' : 'Fullscreen'}
+            title={isFullscreen ? t('explorer.exitFullscreen') : t('explorer.fullscreen')}
           >
             {isFullscreen ? <Minimize2 className="w-4 h-4" /> : <Maximize2 className="w-4 h-4" />}
           </button>
@@ -286,8 +287,8 @@ export function DatabaseExplorer({
         <div className="shrink-0 border-b border-purple-200 dark:border-purple-800/50 bg-purple-50 dark:bg-purple-900/20 px-4 py-3">
           <div className="flex flex-wrap items-center gap-x-2 gap-y-1 mb-2">
             <Wand2 className="w-4 h-4 text-purple-600 dark:text-purple-400 shrink-0" />
-            <span className="text-sm font-medium text-purple-800 dark:text-purple-300">AI Query Assistant</span>
-            <span className="hidden sm:inline text-xs text-purple-500 dark:text-purple-400">Describe what you want to query in plain language</span>
+            <span className="text-sm font-medium text-purple-800 dark:text-purple-300">{t('explorer.aiAssistant')}</span>
+            <span className="hidden sm:inline text-xs text-purple-500 dark:text-purple-400">{t('explorer.aiHint')}</span>
           </div>
           <div className="flex flex-col sm:flex-row gap-2">
             <input
@@ -301,7 +302,7 @@ export function DatabaseExplorer({
                   generateSql();
                 }
               }}
-              placeholder="e.g. Show top 10 customers by total order amount..."
+              placeholder={t('explorer.aiPlaceholder')}
               className="flex-1 px-3 py-2 text-sm text-gray-900 dark:text-dashboard-text border border-purple-300 dark:border-purple-700 rounded-md focus:outline-none focus:ring-2 focus:ring-purple-500 bg-white dark:bg-dashboard-elevated cursor-text dark:placeholder-gray-500"
               style={{ caretColor: '#7c3aed' }}
               disabled={aiLoading}
@@ -314,12 +315,12 @@ export function DatabaseExplorer({
               {aiLoading ? (
                 <>
                   <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                  Generating...
+                  {t('explorer.generating')}
                 </>
               ) : (
                 <>
                   <Wand2 className="w-3.5 h-3.5" />
-                  Generate
+                  {t('explorer.generate')}
                 </>
               )}
             </button>
@@ -339,14 +340,14 @@ export function DatabaseExplorer({
                   <button
                     onClick={() => navigator.clipboard.writeText(aiResult.sql_query)}
                     className="p-1.5 text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 hover:bg-gray-200 dark:hover:bg-dashboard-subtle rounded transition-colors"
-                    title="Copy SQL"
+                    title={t('explorer.copySql')}
                   >
                     <Copy className="w-3.5 h-3.5" />
                   </button>
                   <button
                     onClick={useGeneratedQuery}
                     className="flex items-center gap-1 px-2 py-1 text-xs bg-purple-600 text-white rounded hover:bg-purple-700 transition-colors"
-                    title="Use this query in the editor"
+                    title={t('explorer.useQuery')}
                   >
                     <ArrowRight className="w-3 h-3" />
                     Use Query
@@ -363,7 +364,7 @@ export function DatabaseExplorer({
         {/* Schema Sidebar */}
         <div className="w-full md:w-56 max-h-36 md:max-h-none border-b md:border-b-0 md:border-r border-gray-200 dark:border-dashboard-border bg-gray-50 dark:bg-dashboard-elevated overflow-y-auto shrink-0">
           <div className="p-2">
-            <h3 className="text-xs font-semibold text-gray-500 dark:text-dashboard-text-secondary uppercase tracking-wider px-2 py-1">Tables</h3>
+            <h3 className="text-xs font-semibold text-gray-500 dark:text-dashboard-text-secondary uppercase tracking-wider px-2 py-1">{t('common.tablesTitle')}</h3>
             {currentConnection?.tables?.length ? (
               currentConnection.tables.map((table) => (
                 <div key={table.name}>
@@ -371,7 +372,7 @@ export function DatabaseExplorer({
                     onClick={() => toggleTable(table.name)}
                     onDoubleClick={() => insertTableQuery(table.name)}
                     className="w-full flex items-center gap-1 px-2 py-1 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-dashboard-subtle rounded transition-colors"
-                    title="Double-click to generate SELECT query"
+                    title={t('explorer.doubleClickHint')}
                   >
                     {expandedTables.has(table.name) ? (
                       <ChevronDown className="w-3 h-3 text-gray-400 dark:text-gray-500 shrink-0" />
@@ -397,7 +398,7 @@ export function DatabaseExplorer({
                 </div>
               ))
             ) : (
-              <p className="text-xs text-gray-400 dark:text-gray-500 px-2 py-2">No tables found</p>
+              <p className="text-xs text-gray-400 dark:text-gray-500 px-2 py-2">{t('explorer.noTables')}</p>
             )}
           </div>
         </div>
@@ -413,7 +414,7 @@ export function DatabaseExplorer({
                   className="flex items-center gap-1 px-3 py-1.5 bg-blue-600 text-white text-sm rounded-md hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                 >
                   <Play className="w-3.5 h-3.5" />
-                  {isExecuting ? 'Running...' : 'Run'}
+                  {isExecuting ? t('explorer.running') : t('explorer.run')}
                 </button>
               </div>
               <textarea
@@ -421,7 +422,7 @@ export function DatabaseExplorer({
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 onKeyDown={handleKeyDown}
-                placeholder="Write your SQL query here... (Ctrl+Enter to execute)"
+                placeholder={t('explorer.sqlPlaceholder')}
                 className="w-full h-28 sm:h-32 p-3 font-mono text-sm resize-none focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-inset border-0 dark:bg-dashboard-surface dark:text-dashboard-text dark:placeholder-gray-500"
                 spellCheck={false}
               />
@@ -441,7 +442,7 @@ export function DatabaseExplorer({
             {queryError && !isExecuting && (
               <div className="p-4">
                 <div className="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg p-4">
-                  <h4 className="text-sm font-semibold text-red-800 dark:text-red-400 mb-1">Query Error</h4>
+                  <h4 className="text-sm font-semibold text-red-800 dark:text-red-400 mb-1">{t('explorer.queryError')}</h4>
                   <pre className="text-sm text-red-700 dark:text-red-300 whitespace-pre-wrap font-mono">{queryError}</pre>
                 </div>
               </div>
@@ -524,8 +525,10 @@ export function DatabaseExplorer({
               <div className="flex items-center justify-center h-full text-gray-400 dark:text-gray-500">
                 <div className="text-center">
                   <Database className="w-12 h-12 mx-auto mb-3 opacity-30" />
-                  <p className="text-sm">Write a query and press <kbd className="px-1.5 py-0.5 bg-gray-100 dark:bg-dashboard-elevated border border-gray-300 dark:border-dashboard-border rounded text-xs">Ctrl+Enter</kbd> to execute</p>
-                  <p className="text-xs mt-1">Double-click a table name in the sidebar to generate a SELECT query</p>
+                  {/* Split around the <kbd> rather than interpolated, so the
+                      key chord keeps its own styling in every language. */}
+                  <p className="text-sm">{t('explorer.emptyHintBefore')}<kbd className="px-1.5 py-0.5 bg-gray-100 dark:bg-dashboard-elevated border border-gray-300 dark:border-dashboard-border rounded text-xs">Ctrl+Enter</kbd>{t('explorer.emptyHintAfter')}</p>
+                  <p className="text-xs mt-1">{t('explorer.emptyHintDoubleClick')}</p>
                 </div>
               </div>
             )}
