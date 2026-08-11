@@ -2494,13 +2494,33 @@ def register_routes(app: FastAPI) -> None:
             conns_to_sync = [c for c in conns_to_sync if str(c.id) in wanted]
 
         # Guard each connection with a hard timeout so one slow/unreachable
-        # database can't stall the whole sync past the caller's deadline.
-        per_connection_timeout = 90.0
+        # database can't stall the whole sync past the caller's deadline. Since
+        # every connection is introspected in parallel, this doubles as the
+        # ceiling for the request as a whole — callers should set their own
+        # timeout above it and treat overshoot as a dead sandbox.
+        per_connection_timeout = float(
+            os.environ.get("SANDBOX_FULL_SYNC_TIMEOUT_SECONDS", "90")
+        )
 
         async def _sync_connection_guarded(cc):
-            return await asyncio.wait_for(
-                _sync_connection(cc), timeout=per_connection_timeout
-            )
+            # asyncio's clock, not time.monotonic(): `time` is datetime.time here.
+            started = asyncio.get_running_loop().time()
+            try:
+                return await asyncio.wait_for(
+                    _sync_connection(cc), timeout=per_connection_timeout
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "full_sync_connection_timeout",
+                    connection=cc.id,
+                    db_type=cc.db_type.value,
+                    database=cc.database,
+                    timeout_seconds=per_connection_timeout,
+                    elapsed_seconds=round(
+                        asyncio.get_running_loop().time() - started, 1
+                    ),
+                )
+                raise
 
         # Sync the selected connections in parallel
         results = await asyncio.gather(
