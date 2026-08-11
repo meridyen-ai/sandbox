@@ -25,6 +25,16 @@ import {
 import { useSandboxApi } from '../context/SandboxUIContext'
 import type { TableWithColumns, SelectedSchema, SchemaData } from '../types'
 
+/**
+ * Overrides for the bulk-selection controls, so a host app that speaks another
+ * language can pass its own strings (e.g. "Seçimi temizle"). English is used
+ * for anything left out.
+ */
+export interface TableColumnSelectorLabels {
+  selectAll?: string
+  clearSelection?: string
+}
+
 interface TableColumnSelectorProps {
   connectionId: string
   connectionName: string
@@ -32,6 +42,7 @@ interface TableColumnSelectorProps {
   onBack: () => void
   onConfirm: (selectedSchema: SelectedSchema) => void
   loading?: boolean
+  labels?: TableColumnSelectorLabels
 }
 
 interface SchemaGroup {
@@ -89,6 +100,7 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
   onBack,
   onConfirm,
   loading: externalLoading,
+  labels,
 }) => {
   const api = useSandboxApi()
   const [schema, setSchema] = useState<TableWithColumns[]>([])
@@ -212,6 +224,59 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
       },
     ]
   }, [schema, connectionName, searchQuery, activeTab, tablesWithSelections])
+
+  /**
+   * The tables the tree is actually showing right now — already narrowed by the
+   * active tab and the search box. Bulk actions work on exactly this set: a
+   * "select all" that also picked up tables filtered out by the user's search
+   * would be a trap, since nothing on screen would show what it did.
+   */
+  const visibleTables = useMemo(
+    () => groupedTables.flatMap((db) => db.schemas.flatMap((s) => s.tables)),
+    [groupedTables]
+  )
+
+  const visibleAllSelected = useMemo(
+    () =>
+      visibleTables.length > 0 &&
+      visibleTables.every(
+        (table) =>
+          selectedSchema[table.full_name]?.columns.length ===
+          table.columns.length
+      ),
+    [visibleTables, selectedSchema]
+  )
+
+  const visibleAnySelected = useMemo(
+    () =>
+      visibleTables.some(
+        (table) => (selectedSchema[table.full_name]?.columns.length || 0) > 0
+      ),
+    [visibleTables, selectedSchema]
+  )
+
+  const handleSelectAllVisible = () => {
+    setSelectedSchema((prev) => {
+      const next = { ...prev }
+      visibleTables.forEach((table) => {
+        next[table.full_name] = {
+          selected: true,
+          columns: table.columns.map((c) => c.name),
+        }
+      })
+      return next
+    })
+  }
+
+  const handleClearVisible = () => {
+    setSelectedSchema((prev) => {
+      const next = { ...prev }
+      visibleTables.forEach((table) => {
+        next[table.full_name] = { selected: false, columns: [] }
+      })
+      return next
+    })
+  }
 
   const selectionStats = useMemo(() => {
     const totalTables = schema.length
@@ -380,7 +445,10 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
         <AlertCircle className="w-10 h-10 text-red-500 mb-4" />
         <p className="text-red-600 dark:text-red-400 mb-4">{error}</p>
         <button
-          onClick={loadSchema}
+          // Not `onClick={loadSchema}`: that handed the click event to the
+          // forceRefresh parameter, which broke the dts build (and only
+          // happened to do the right thing because an event object is truthy).
+          onClick={() => loadSchema(true)}
           className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-medium"
         >
           <RefreshCw className="w-4 h-4" />
@@ -470,6 +538,30 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
                 placeholder="Search tables..."
                 className="w-full pl-9 pr-3 py-2 text-sm bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg text-gray-900 dark:text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
               />
+            </div>
+
+            {/* Bulk actions over the tables currently listed below */}
+            <div className="flex items-center gap-2 mt-2">
+              <button
+                type="button"
+                onClick={handleSelectAllVisible}
+                disabled={visibleTables.length === 0 || visibleAllSelected}
+                className="px-2 py-1 text-xs font-medium text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 rounded transition-colors disabled:opacity-40 disabled:hover:bg-transparent"
+              >
+                {labels?.selectAll ?? 'Select all'}
+              </button>
+              <button
+                type="button"
+                onClick={handleClearVisible}
+                disabled={visibleTables.length === 0 || !visibleAnySelected}
+                className="px-2 py-1 text-xs font-medium text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700 rounded transition-colors disabled:opacity-40 disabled:hover:bg-transparent"
+              >
+                {labels?.clearSelection ?? 'Clear selection'}
+              </button>
+              {/* Wordless on purpose: needs no translation */}
+              <span className="ml-auto text-xs text-gray-400 tabular-nums">
+                {selectionStats.selectedTables}/{selectionStats.totalTables}
+              </span>
             </div>
           </div>
 

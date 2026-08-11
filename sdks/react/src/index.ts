@@ -22,6 +22,7 @@ export type {
 export { DataSourceSelector } from './components/DataSourceSelector'
 export { ConnectionForm } from './components/ConnectionForm'
 export { TableColumnSelector } from './components/TableColumnSelector'
+export type { TableColumnSelectorLabels } from './components/TableColumnSelector'
 export { ConnectionsPage } from './components/ConnectionsPage'
 export { DatabaseExplorer } from './components/DatabaseExplorer'
 export type { DatabaseExplorerProps } from './components/DatabaseExplorer'
