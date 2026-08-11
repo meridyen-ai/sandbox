@@ -33,6 +33,9 @@ import type { TableWithColumns, SelectedSchema, SchemaData } from '../types'
 export interface TableColumnSelectorLabels {
   selectAll?: string
   clearSelection?: string
+  /** `{count}` is replaced with the total number of columns. */
+  showAllColumns?: string
+  showFewerColumns?: string
 }
 
 interface TableColumnSelectorProps {
@@ -56,6 +59,9 @@ interface DatabaseGroup {
 }
 
 type TabType = 'all' | 'selected'
+
+/** How many columns the right-hand panel lists before "show all". */
+const COLUMN_PREVIEW_COUNT = 20
 
 function schemaDataToTableWithColumns(data: SchemaData): TableWithColumns[] {
   const schemaName = data.schema || 'public'
@@ -122,6 +128,13 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
   )
   const [activeTab, setActiveTab] = useState<TabType>('all')
   const [refreshing, setRefreshing] = useState(false)
+  const [showAllColumns, setShowAllColumns] = useState(false)
+
+  // Collapse back to the preview whenever a different table is opened — an
+  // expanded 300-column list should not carry over to the next table.
+  useEffect(() => {
+    setShowAllColumns(false)
+  }, [selectedTable?.full_name])
 
   useEffect(() => {
     loadSchema()
@@ -427,6 +440,17 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
         col.data_type.toLowerCase().includes(query)
     )
   }, [selectedTable, columnSearchQuery])
+
+  /**
+   * Wide tables (300+ columns) made this list unusable — a wall of rows to
+   * scroll past before reaching anything else. Show a screenful by default and
+   * let the user ask for the rest.
+   */
+  const visibleColumns = showAllColumns
+    ? filteredColumns
+    : filteredColumns.slice(0, COLUMN_PREVIEW_COUNT)
+
+  const hiddenColumnCount = filteredColumns.length - visibleColumns.length
 
   if (loading) {
     return (
@@ -734,12 +758,12 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
               </div>
 
               <div className="flex-1 overflow-y-auto">
-                {filteredColumns.map((column) => {
+                {visibleColumns.map((column) => {
                   const isSelected = selectedColumnNames.includes(column.name)
                   return (
                     <div
                       key={column.name}
-                      className={`grid grid-cols-12 gap-2 px-4 py-3 border-b border-gray-100 dark:border-gray-700 cursor-pointer transition-colors ${
+                      className={`grid grid-cols-12 gap-2 px-4 py-1 border-b border-gray-100 dark:border-gray-700 cursor-pointer transition-colors ${
                         isSelected
                           ? 'bg-blue-50 dark:bg-blue-900/10'
                           : 'hover:bg-gray-50 dark:hover:bg-gray-700'
@@ -748,30 +772,31 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
                     >
                       <div className="col-span-1 flex items-center">
                         {isSelected ? (
-                          <CheckSquare className="w-4 h-4 text-blue-600" />
+                          <CheckSquare className="w-3.5 h-3.5 text-blue-600" />
                         ) : (
-                          <Square className="w-4 h-4 text-gray-400" />
+                          <Square className="w-3.5 h-3.5 text-gray-400" />
                         )}
                       </div>
-                      <div className="col-span-5 flex items-center gap-2">
+                      <div className="col-span-5 flex items-center gap-2 min-w-0">
                         <span
-                          className={`text-sm ${
+                          className={`text-xs truncate ${
                             isSelected
                               ? 'text-gray-900 dark:text-white font-medium'
                               : 'text-gray-600 dark:text-gray-400'
                           }`}
+                          title={column.name}
                         >
                           {column.name}
                         </span>
                       </div>
-                      <div className="col-span-3 flex items-center">
-                        <span className="text-xs font-mono px-2 py-0.5 bg-gray-200 dark:bg-gray-700 rounded text-gray-600 dark:text-gray-400 uppercase">
+                      <div className="col-span-3 flex items-center min-w-0">
+                        <span className="text-[11px] font-mono px-1.5 py-0 bg-gray-200 dark:bg-gray-700 rounded text-gray-600 dark:text-gray-400 uppercase truncate">
                           {column.data_type}
                         </span>
                       </div>
                       <div className="col-span-3 flex items-center">
                         <span
-                          className={`text-sm ${column.nullable ? 'text-green-600 dark:text-green-400' : 'text-gray-400'}`}
+                          className={`text-xs ${column.nullable ? 'text-green-600 dark:text-green-400' : 'text-gray-400'}`}
                         >
                           {column.nullable ? 'Yes' : 'No'}
                         </span>
@@ -779,6 +804,21 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
                     </div>
                   )
                 })}
+
+                {(hiddenColumnCount > 0 || showAllColumns) &&
+                  filteredColumns.length > COLUMN_PREVIEW_COUNT && (
+                    <button
+                      type="button"
+                      onClick={() => setShowAllColumns((v) => !v)}
+                      className="w-full px-4 py-2 text-xs font-medium text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 transition-colors"
+                    >
+                      {showAllColumns
+                        ? labels?.showFewerColumns ?? 'Show fewer'
+                        : (
+                            labels?.showAllColumns ?? 'Show all {count} columns'
+                          ).replace('{count}', String(filteredColumns.length))}
+                    </button>
+                  )}
 
                 {filteredColumns.length === 0 && columnSearchQuery && (
                   <div className="flex flex-col items-center justify-center py-8 text-center">
