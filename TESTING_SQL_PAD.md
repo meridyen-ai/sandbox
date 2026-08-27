@@ -118,7 +118,7 @@ authentication:
   provider: static
   static_keys:
     - key: "sb_dev_test_key_123456789"
-      workspace_id: "dev_workspace"
+      space_id: "dev_space"
       name: "dev-key"
 ```
 

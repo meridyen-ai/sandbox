@@ -65,7 +65,7 @@ class SandboxExecutionServicer:
         self._logger.info(
             "execute_sql_started",
             request_id=request_id,
-            workspace_id=request.context.workspace_id,
+            space_id=request.context.space_id,
         )
 
         try:
@@ -124,7 +124,7 @@ class SandboxExecutionServicer:
         self._logger.info(
             "execute_python_started",
             request_id=request_id,
-            workspace_id=request.context.workspace_id,
+            space_id=request.context.space_id,
         )
 
         try:
@@ -291,7 +291,7 @@ class SandboxExecutionServicer:
         """Build ExecutionContext from protobuf context."""
         return ExecutionContext(
             request_id=proto_context.request_id or str(uuid.uuid4()),
-            workspace_id=proto_context.workspace_id or None,
+            space_id=proto_context.space_id or None,
             connection_id=proto_context.connection_id or None,
             user_id=proto_context.user_id or None,
             max_rows=proto_context.max_rows if proto_context.HasField("max_rows") else None,

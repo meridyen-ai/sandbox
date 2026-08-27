@@ -67,7 +67,7 @@ service LLMProxyService {
 
 message ExecutionContext {
   string request_id = 1;
-  string workspace_id = 2;
+  string space_id = 2;
   string connection_id = 3;
   string user_id = 4;
   string trace_id = 5;
@@ -305,7 +305,7 @@ message ResourceLimits {
 // =============================================================================
 
 message RegisterRequest {
-  string workspace_id = 1;
+  string space_id = 1;
   string registration_token = 2;
 
   // Sandbox info
@@ -379,7 +379,7 @@ message UnregisterResponse {
 
 message LLMInferenceRequest {
   string request_id = 1;
-  string workspace_id = 2;
+  string space_id = 2;
 
   // Messages
   repeated LLMMessage messages = 3;
@@ -413,7 +413,7 @@ message LLMInferenceResponse {
 
 message CodeGenerationRequest {
   string request_id = 1;
-  string workspace_id = 2;
+  string space_id = 2;
 
   CodeGenerationType code_type = 3;
   string user_query = 4;

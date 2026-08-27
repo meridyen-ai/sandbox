@@ -197,8 +197,8 @@ authentication:
   # Define API keys directly in config (for standalone deployments)
   static_keys:
     - key: "sb_change-me-in-production"
-      workspace_id: "default"
-      workspace_name: "Default Workspace"
+      space_id: "default"
+      space_name: "Default Space"
       name: "default-key"
       permissions:
         execute_sql: true
@@ -223,8 +223,8 @@ platform:
   # Use environment variable: SANDBOX_PLATFORM__REGISTRATION_TOKEN
   registration_token: null
 
-  # Workspace ID
-  workspace_id: null
+  # Space ID
+  space_id: null
 
   # Sandbox ID (auto-generated if not set)
   sandbox_id: null

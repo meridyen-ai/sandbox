@@ -221,7 +221,7 @@ class PlatformConnectionConfig(BaseModel):
     registration_token: SecretStr | None = Field(
         None, description="Registration token for sandbox"
     )
-    workspace_id: str | None = Field(None, description="Workspace ID")
+    space_id: str | None = Field(None, description="Space ID")
     sandbox_id: str | None = Field(None, description="Sandbox ID (auto-generated if not set)")
     heartbeat_interval_seconds: int = Field(30, description="Heartbeat interval", ge=10, le=300)
     reconnect_max_attempts: int = Field(5, description="Max reconnection attempts", ge=1, le=20)

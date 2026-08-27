@@ -46,7 +46,7 @@ Key sections to configure:
 
 - `execution_mode: hybrid`
 - `authentication.static_keys` - set a strong API key
-- `platform.platform_url` / `registration_token` / `workspace_id` - Meridyen cloud connection
+- `platform.platform_url` / `registration_token` / `space_id` - Meridyen cloud connection
 - `database_connections` - add your database sources
 - `resource_limits` - adjust memory/CPU/row limits as needed
 

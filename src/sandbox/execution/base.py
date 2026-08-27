@@ -39,7 +39,7 @@ class ExecutionContext:
     including security context, resource limits, and tracing info.
     """
     request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    workspace_id: str | None = None
+    space_id: str | None = None
     connection_id: str | None = None
     user_id: str | None = None
 
@@ -194,7 +194,7 @@ class BaseExecutor(ABC, Generic[T]):
             "execution_started",
             request_id=context.request_id,
             execution_type=execution_type,
-            workspace_id=context.workspace_id,
+            space_id=context.space_id,
             **extra,
         )
 
@@ -211,6 +211,7 @@ class BaseExecutor(ABC, Generic[T]):
             "execution_completed",
             request_id=context.request_id,
             execution_type=execution_type,
+            space_id=context.space_id,
             status=result.status.value,
             duration_ms=result.metrics.duration_ms,
             **extra,
@@ -228,6 +229,7 @@ class BaseExecutor(ABC, Generic[T]):
             "execution_error",
             request_id=context.request_id,
             execution_type=execution_type,
+            space_id=context.space_id,
             error_type=type(error).__name__,
             error_message=str(error),
             **extra,

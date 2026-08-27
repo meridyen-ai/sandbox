@@ -142,7 +142,7 @@ If the sandbox backend returns a 401 Unauthorized error (invalid or expired key)
 ┌────────────────────────────────────────────────────────┐
 │  Sandbox Backend validates API key                     │
 │  - Calls MVP: POST /api/v1/sandbox/validate-key        │
-│  - Gets workspace_id and permissions                   │
+│  - Gets space_id and permissions                   │
 └────────────┬───────────────────────────────────────────┘
              │
         ┌────┴────┐

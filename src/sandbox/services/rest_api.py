@@ -359,7 +359,7 @@ def _make_json_safe(value: Any) -> Any:
 class ExecutionContextModel(BaseModel):
     """Execution context from request."""
     request_id: str | None = Field(default_factory=lambda: str(uuid.uuid4()))
-    workspace_id: str | None = None
+    space_id: str | None = None
     connection_id: str | None = None
     user_id: str | None = None
     max_rows: int | None = None
@@ -530,12 +530,29 @@ def _init_api_keys_table():
                 name TEXT NOT NULL,
                 key_prefix TEXT NOT NULL,
                 key_hash TEXT NOT NULL,
-                workspace_id TEXT NOT NULL DEFAULT 'default',
-                workspace_name TEXT NOT NULL DEFAULT 'Default Workspace',
+                space_id TEXT NOT NULL DEFAULT 'default',
+                space_name TEXT NOT NULL DEFAULT 'Default Space',
                 permissions JSONB NOT NULL DEFAULT '{"execute_sql": true, "execute_python": true, "generate_visualizations": true}',
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """))
+
+        # workspace -> space rename. CREATE TABLE IF NOT EXISTS above is a no-op on
+        # pre-rename deployments, so migrate their columns here. Idempotent: the
+        # RENAME is skipped once the new column exists.
+        for old_col, new_col in (("workspace_id", "space_id"), ("workspace_name", "space_name")):
+            conn.execute(text(f"""
+                DO $$
+                BEGIN
+                    IF EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name = 'api_keys' AND column_name = '{old_col}')
+                       AND NOT EXISTS (SELECT 1 FROM information_schema.columns
+                                       WHERE table_name = 'api_keys' AND column_name = '{new_col}')
+                    THEN
+                        ALTER TABLE api_keys RENAME COLUMN {old_col} TO {new_col};
+                    END IF;
+                END $$;
+            """))
         conn.commit()
     logger.info("api_keys_table_initialized")
 
@@ -572,7 +589,7 @@ async def verify_sandbox_token(
        - Used for internal platform communication
 
     Returns:
-        Dict with workspace_id, user_id, and other context
+        Dict with space_id, user_id, and other context
     """
     from sandbox.auth.sandbox_auth import get_auth_provider
 
@@ -585,8 +602,8 @@ async def verify_sandbox_token(
         if claims and claims.get("type") == "user_session":
             return {
                 "auth_type": "user_session",
-                "workspace_id": "default",
-                "workspace_name": "Default Workspace",
+                "space_id": "default",
+                "space_name": "Default Space",
                 "user_id": claims.get("sub"),
                 "permissions": {
                     "execute_sql": True,
@@ -618,11 +635,11 @@ async def verify_sandbox_token(
         if not auth_result:
             raise AuthenticationError("Invalid or inactive sandbox API key")
 
-        # Return workspace context
+        # Return space context
         return {
             "auth_type": "sandbox_api_key",
-            "workspace_id": str(auth_result.workspace_id) if auth_result.workspace_id else None,
-            "workspace_name": auth_result.workspace_name,
+            "space_id": str(auth_result.space_id) if auth_result.space_id else None,
+            "space_name": auth_result.space_name,
             "user_id": str(auth_result.user_id) if auth_result.user_id else None,
             "api_key_name": auth_result.api_key_name,
             "permissions": auth_result.permissions or {
@@ -649,7 +666,7 @@ async def verify_sandbox_token(
             logger.warning("Development mode: accepting token without verification")
             return {
                 "auth_type": "dev",
-                "workspace_id": "dev",
+                "space_id": "dev",
                 "permissions": {}
             }
 
@@ -938,16 +955,16 @@ def register_routes(app: FastAPI) -> None:
             conn.execute(text("DELETE FROM api_keys"))
             conn.execute(
                 text("""
-                    INSERT INTO api_keys (id, name, key_prefix, key_hash, workspace_id, workspace_name, permissions)
-                    VALUES (:id, :name, :key_prefix, :key_hash, :workspace_id, :workspace_name, CAST(:permissions AS jsonb))
+                    INSERT INTO api_keys (id, name, key_prefix, key_hash, space_id, space_name, permissions)
+                    VALUES (:id, :name, :key_prefix, :key_hash, :space_id, :space_name, CAST(:permissions AS jsonb))
                 """),
                 {
                     "id": key_id,
                     "name": "meridyen-platform-key",
                     "key_prefix": key_prefix,
                     "key_hash": key_hash,
-                    "workspace_id": "default",
-                    "workspace_name": "Default Workspace",
+                    "space_id": "default",
+                    "space_name": "Default Space",
                     "permissions": json.dumps(permissions),
                 },
             )
@@ -992,7 +1009,7 @@ def register_routes(app: FastAPI) -> None:
             # Build execution context
             exec_context = ExecutionContext(
                 request_id=request_id,
-                workspace_id=request.context.workspace_id,
+                space_id=request.context.space_id,
                 connection_id=request.context.connection_id,
                 user_id=request.context.user_id,
                 max_rows=request.context.max_rows,
@@ -1048,7 +1065,7 @@ def register_routes(app: FastAPI) -> None:
         try:
             exec_context = ExecutionContext(
                 request_id=request_id,
-                workspace_id=request.context.workspace_id,
+                space_id=request.context.space_id,
                 user_id=request.context.user_id,
                 timeout_seconds=request.context.timeout_seconds,
                 max_memory_mb=request.context.max_memory_mb,
@@ -1109,7 +1126,7 @@ def register_routes(app: FastAPI) -> None:
         try:
             exec_context = ExecutionContext(
                 request_id=request_id,
-                workspace_id=request.context.workspace_id,
+                space_id=request.context.space_id,
                 max_output_size_kb=request.context.max_output_size_kb,
             )
 
@@ -1214,7 +1231,7 @@ def register_routes(app: FastAPI) -> None:
         """
         Return one connection including credentials.
 
-        Used by MVP schema sync when the workspace mirror row does not store secrets.
+        Used by MVP schema sync when the space mirror row does not store secrets.
         Requires the same API key / auth as other sandbox routes.
         """
         from sandbox.core.connection_store import get_connection as db_get_connection
@@ -2895,7 +2912,7 @@ def register_routes(app: FastAPI) -> None:
             conn.execute(sql_text("""
                 CREATE TABLE IF NOT EXISTS document_knowledge_bases (
                     id SERIAL PRIMARY KEY,
-                    workspace_id TEXT,
+                    space_id TEXT,
                     connection_id TEXT,
                     name VARCHAR(200) NOT NULL,
                     description TEXT,
@@ -2964,9 +2981,32 @@ def register_routes(app: FastAPI) -> None:
                 )
             """))
 
+            # workspace -> space rename for pre-existing deployments (see
+            # _init_api_keys_table). Renaming the column before the index block
+            # below keeps idx_dkb_space pointing at a column that exists.
+            conn.execute(sql_text("""
+                DO $$
+                BEGIN
+                    IF EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name = 'document_knowledge_bases'
+                                 AND column_name = 'workspace_id')
+                       AND NOT EXISTS (SELECT 1 FROM information_schema.columns
+                                       WHERE table_name = 'document_knowledge_bases'
+                                         AND column_name = 'space_id')
+                    THEN
+                        ALTER TABLE document_knowledge_bases RENAME COLUMN workspace_id TO space_id;
+                    END IF;
+                    IF EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_dkb_ws')
+                       AND NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_dkb_space')
+                    THEN
+                        ALTER INDEX idx_dkb_ws RENAME TO idx_dkb_space;
+                    END IF;
+                END $$;
+            """))
+
             # Indexes
             for idx_sql in [
-                "CREATE INDEX IF NOT EXISTS idx_dkb_ws ON document_knowledge_bases(workspace_id)",
+                "CREATE INDEX IF NOT EXISTS idx_dkb_space ON document_knowledge_bases(space_id)",
                 "CREATE INDEX IF NOT EXISTS idx_dkbd_kb ON document_kb_documents(knowledge_base_id)",
                 "CREATE INDEX IF NOT EXISTS idx_dkbd_status ON document_kb_documents(status)",
                 "CREATE INDEX IF NOT EXISTS idx_dkbc_doc ON document_kb_chunks(document_id)",
@@ -3039,7 +3079,7 @@ def register_routes(app: FastAPI) -> None:
             )
 
         # Locate the uploaded file by file_id — documents are stored at
-        # /app/data/documents/{workspace_id}/{folder_path}/{file_id}.ext, so we
+        # /app/data/documents/{space_id}/{folder_path}/{file_id}.ext, so we
         # search recursively (same strategy as /documents/process).
         data_dir = Path("/app/data/documents")
         file_path = None
@@ -3183,7 +3223,7 @@ def register_routes(app: FastAPI) -> None:
         body = await request.json()
         name = body.get("name", "Untitled KB")
         description = body.get("description", "")
-        workspace_id = body.get("workspace_id", "")
+        space_id = body.get("space_id", "")
         connection_id = body.get("connection_id", "")
 
         engine = _get_doc_db_engine()
@@ -3199,10 +3239,10 @@ def register_routes(app: FastAPI) -> None:
 
             conn.execute(
                 sql_text("""
-                    INSERT INTO document_knowledge_bases (workspace_id, connection_id, name, description)
+                    INSERT INTO document_knowledge_bases (space_id, connection_id, name, description)
                     VALUES (:ws, :cid, :name, :desc)
                 """),
-                {"ws": workspace_id, "cid": connection_id, "name": name, "desc": description},
+                {"ws": space_id, "cid": connection_id, "name": name, "desc": description},
             )
             conn.commit()
             row = conn.execute(
@@ -3217,14 +3257,14 @@ def register_routes(app: FastAPI) -> None:
     @app.post("/api/v1/documents/upload", tags=["Documents"])
     async def upload_document(
         file: UploadFile = File(...),
-        workspace_id: str = Form(""),
+        space_id: str = Form(""),
         folder_path: str = Form(""),
     ):
         """
         Upload a document file to the sandbox filesystem.
         Preserves directory structure when folder_path is provided.
 
-        Files are stored at: /app/data/documents/{workspace_id}/{folder_path}/{filename}
+        Files are stored at: /app/data/documents/{space_id}/{folder_path}/{filename}
         No S3, no BYTEA — just local filesystem in the sandbox volume.
         """
         content = await file.read()
@@ -3234,8 +3274,8 @@ def register_routes(app: FastAPI) -> None:
 
         # Build storage path preserving directory structure
         base_dir = Path("/app/data/documents")
-        if workspace_id:
-            base_dir = base_dir / workspace_id
+        if space_id:
+            base_dir = base_dir / space_id
         if folder_path:
             # Sanitize folder_path to prevent path traversal
             safe_folder = Path(folder_path.replace("..", "").strip("/"))
@@ -3286,7 +3326,7 @@ def register_routes(app: FastAPI) -> None:
         file_id = body.get("file_id", "")
         filename = body.get("filename", "unknown")
         connection_name = body.get("connection_name", filename)
-        workspace_id = body.get("workspace_id", "")
+        space_id = body.get("space_id", "")
 
         # Find the uploaded file on disk
         data_dir = Path("/app/data/documents")
@@ -3554,17 +3594,17 @@ def register_routes(app: FastAPI) -> None:
         filename = body.get("filename", "unknown")
         file_type = body.get("file_type", "txt")
         kb_id = int(body.get("kb_id", 0))
-        workspace_id = body.get("workspace_id", "")
+        space_id = body.get("space_id", "")
         ocr_strategy = body.get("ocr_strategy", "local")  # "local" or "google_vision"
         google_vision_credentials = body.get("google_vision_credentials")  # JSON string
         source_path = body.get("source_path", "")  # e.g. "Google Drive:/Reports/Q3/financial.pdf"
         source_type = body.get("source_type", "")  # e.g. "google_drive", "s3", "upload"
         # Indexing job id — forwarded to backend vision callbacks so tokens
-        # are attributed to the user/workspace/org that triggered the job.
+        # are attributed to the user/space/org that triggered the job.
         job_id = body.get("job_id", "") or ""
 
         # Find the uploaded file — search recursively because files are stored
-        # at /app/data/documents/{workspace_id}/{folder_path}/{file_id}.ext
+        # at /app/data/documents/{space_id}/{folder_path}/{file_id}.ext
         data_dir = Path("/app/data/documents")
         file_path = None
         for p in data_dir.rglob(f"{file_id}*"):
@@ -3680,7 +3720,7 @@ def register_routes(app: FastAPI) -> None:
 
         The backend owns model selection (from Settings/Models UI), API keys,
         and token accounting via LLMHelper → TokenAccumulator. Passing
-        `job_id` lets the backend attribute the tokens to the user/workspace/
+        `job_id` lets the backend attribute the tokens to the user/space/
         organization that triggered the indexing job.
 
         Returns (description, visible_text). Both empty strings on failure —
@@ -4841,7 +4881,7 @@ def register_routes(app: FastAPI) -> None:
 
     # --- KB Status ---
     @app.get("/api/v1/documents/kb-status", tags=["Documents"])
-    async def get_kb_status(kb_id: str, workspace_id: str = ""):
+    async def get_kb_status(kb_id: str, space_id: str = ""):
         """Get knowledge base processing status."""
         from sqlalchemy import text as sql_text
 
@@ -4872,7 +4912,7 @@ def register_routes(app: FastAPI) -> None:
 
     # --- List KB Documents ---
     @app.get("/api/v1/documents/list", tags=["Documents"])
-    async def list_kb_documents(kb_id: str, workspace_id: str = ""):
+    async def list_kb_documents(kb_id: str, space_id: str = ""):
         """List all documents in a knowledge base."""
         from sqlalchemy import text as sql_text
 
@@ -5188,7 +5228,7 @@ def register_routes(app: FastAPI) -> None:
 
     # --- Serve Document File ---
     @app.get("/api/v1/documents/file/{file_id}", tags=["Documents"])
-    async def get_document_file(file_id: str, workspace_id: str = ""):
+    async def get_document_file(file_id: str, space_id: str = ""):
         """Serve a document file from sandbox storage."""
         # Find the file by matching the stem (filename without extensions)
         # Use strict matching: filename must START with file_id and have ONE extension after
@@ -5227,7 +5267,7 @@ def register_routes(app: FastAPI) -> None:
 
     # --- Serve Spreadsheet as JSON ---
     @app.get("/api/v1/documents/file/{file_id}/sheets", tags=["Documents"])
-    async def get_spreadsheet_sheets(file_id: str, workspace_id: str = ""):
+    async def get_spreadsheet_sheets(file_id: str, space_id: str = ""):
         """Parse a spreadsheet file server-side and return all sheets as JSON.
 
         Much faster than client-side parsing for large files.
@@ -5279,7 +5319,7 @@ def register_routes(app: FastAPI) -> None:
 
     # --- Delete Document ---
     @app.delete("/api/v1/documents/{doc_id}", tags=["Documents"])
-    async def delete_kb_document(doc_id: str, kb_id: str = "", workspace_id: str = ""):
+    async def delete_kb_document(doc_id: str, kb_id: str = "", space_id: str = ""):
         """Delete a document and its chunks from the knowledge base."""
         from sqlalchemy import text as sql_text
 

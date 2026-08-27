@@ -20,8 +20,8 @@ export interface SandboxClientConfig {
 export interface ExecutionContext {
   /** Unique request identifier (auto-generated if not provided) */
   request_id?: string
-  /** Workspace ID */
-  workspace_id?: string
+  /** Space ID */
+  space_id?: string
   /** Database connection ID (required for SQL execution) */
   connection_id?: string
   /** User ID */
