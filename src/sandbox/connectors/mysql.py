@@ -255,6 +255,82 @@ class MySQLConnector(BaseConnector[Connection]):
                 for r in result
             ]
 
+    async def get_all_columns(
+        self, conn: Connection, schema: str | None = None
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Batch-fetch columns for EVERY table in the schema in one query.
+
+        Returns ``{table_name: [columns]}``. Without this the full-sync route
+        falls back to one INFORMATION_SCHEMA round trip per table, on its own
+        physical connection — the fan-out that made a few hundred tables take
+        minutes. Foreign keys come from KEY_COLUMN_USAGE in a second query
+        rather than a join, because joining it against every column row makes
+        MySQL materialise the whole constraint view per table.
+        """
+        schema = schema or self.config.database
+
+        columns_query = """
+            SELECT
+                table_name,
+                column_name,
+                data_type,
+                is_nullable,
+                column_default,
+                character_maximum_length,
+                numeric_precision,
+                numeric_scale,
+                column_key
+            FROM information_schema.columns
+            WHERE table_schema = %s
+            ORDER BY table_name, ordinal_position
+        """
+
+        fk_query = """
+            SELECT
+                table_name,
+                column_name,
+                referenced_table_schema,
+                referenced_table_name,
+                referenced_column_name
+            FROM information_schema.key_column_usage
+            WHERE table_schema = %s
+              AND referenced_table_name IS NOT NULL
+        """
+
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            await cursor.execute(columns_query, (schema,))
+            rows = await cursor.fetchall()
+            await cursor.execute(fk_query, (schema,))
+            fk_rows = await cursor.fetchall()
+
+        # (table, column) -> "schema.table.column"
+        fks: dict[tuple[str, str], str] = {}
+        for r in fk_rows:
+            fks.setdefault(
+                (r["table_name"], r["column_name"]),
+                f'{r["referenced_table_schema"]}.{r["referenced_table_name"]}'
+                f'.{r["referenced_column_name"]}',
+            )
+
+        tables: dict[str, list[dict[str, Any]]] = {}
+        for r in rows:
+            key = (r["table_name"], r["column_name"])
+            foreign_table = fks.get(key)
+            tables.setdefault(r["table_name"], []).append({
+                "name": r["column_name"],
+                "type": r["data_type"],
+                "nullable": r["is_nullable"] == "YES",
+                "default": r["column_default"],
+                "max_length": r["character_maximum_length"],
+                "precision": r["numeric_precision"],
+                "scale": r["numeric_scale"],
+                "is_primary_key": r["column_key"] == "PRI",
+                "is_unique": r["column_key"] in ("PRI", "UNI"),
+                "is_foreign_key": foreign_table is not None,
+                "foreign_table": foreign_table,
+            })
+        return tables
+
     async def test_connection(self, conn: Connection) -> bool:
         """Test if connection is valid."""
         try:

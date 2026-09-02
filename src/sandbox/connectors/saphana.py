@@ -247,6 +247,68 @@ class SAPHANAConnector(BaseConnector[Any]):
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(_executor, _get_columns)
 
+    async def get_all_columns(
+        self, conn: Any, schema: str | None = None
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Batch-fetch columns for EVERY table in the schema in one query.
+
+        Returns ``{table_name: [columns]}``. Without this the full-sync route
+        pays one SYS.TABLE_COLUMNS round trip per table, each on its own
+        physical connection.
+        """
+        schema = schema or self.config.schema_name
+
+        def _get_all_columns() -> dict[str, list[dict[str, Any]]]:
+            cursor = conn.cursor()
+            if schema:
+                cursor.execute(
+                    """
+                    SELECT
+                        TABLE_NAME,
+                        COLUMN_NAME,
+                        DATA_TYPE_NAME,
+                        IS_NULLABLE,
+                        DEFAULT_VALUE,
+                        LENGTH,
+                        SCALE
+                    FROM SYS.TABLE_COLUMNS
+                    WHERE SCHEMA_NAME = ?
+                    ORDER BY TABLE_NAME, POSITION
+                    """,
+                    (schema,),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT
+                        TABLE_NAME,
+                        COLUMN_NAME,
+                        DATA_TYPE_NAME,
+                        IS_NULLABLE,
+                        DEFAULT_VALUE,
+                        LENGTH,
+                        SCALE
+                    FROM SYS.TABLE_COLUMNS
+                    WHERE SCHEMA_NAME NOT LIKE 'SYS%' AND SCHEMA_NAME NOT LIKE '_SYS%'
+                    ORDER BY TABLE_NAME, POSITION
+                    """
+                )
+
+            tables: dict[str, list[dict[str, Any]]] = {}
+            for row in cursor.fetchall():
+                tables.setdefault(row[0], []).append({
+                    "name": row[1],
+                    "type": row[2],
+                    "nullable": row[3] == "TRUE",
+                    "default": row[4],
+                    "max_length": row[5],
+                    "scale": row[6],
+                })
+            return tables
+
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(_executor, _get_all_columns)
+
     async def test_connection(self, conn: Any) -> bool:
         """Test if connection is valid."""
         def _test() -> bool:

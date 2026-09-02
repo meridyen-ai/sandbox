@@ -5,7 +5,7 @@
  * synced to the host platform via the schema sync API.
  */
 
-import React, { useState, useEffect, useMemo } from 'react'
+import React, { useState, useEffect, useMemo, useRef } from 'react'
 import {
   ChevronDown,
   ChevronRight,
@@ -165,6 +165,36 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
   const [showAllColumns, setShowAllColumns] = useState(false)
   const [showAllTables, setShowAllTables] = useState(false)
 
+  /**
+   * Server-side pagination, when the host offers it.
+   *
+   * Without it this component asks for the whole schema up front — every table
+   * with every column — and then draws fifty rows. On a few hundred tables that
+   * is megabytes fetched to render a list. With it, `schema` holds only the
+   * pages actually loaded, each table's `columns` stays empty until the table is
+   * opened, and search and the Selected tab are resolved by the server.
+   */
+  const paginated = Boolean(api.schema.listTables)
+  const [serverTotal, setServerTotal] = useState(0)
+  // How many tables the connection has in total. `serverTotal` is the size of
+  // whatever query is on screen — on the Selected tab that is the selection,
+  // which would make the "x/y" counter read y/y.
+  const [serverTableTotal, setServerTableTotal] = useState(0)
+  const [serverMissing, setServerMissing] = useState<string[]>([])
+  const [loadingMore, setLoadingMore] = useState(false)
+  // Tables whose columns are being fetched right now, so the right-hand panel
+  // can say "loading" instead of showing a real table as having no columns.
+  const [loadingColumns, setLoadingColumns] = useState<Set<string>>(new Set())
+  const [syncPhase, setSyncPhase] = useState<string | null>(null)
+  const [syncProgress, setSyncProgress] = useState<{ done: number; total: number } | null>(null)
+  // Debounced copy of searchQuery — every keystroke must not be a request.
+  const [committedSearch, setCommittedSearch] = useState('')
+  // The first page is fetched by loadSchema; the search/tab effect must not
+  // fire a second request for the same empty query on mount. A ref rather than
+  // the `loading` flag, so a search typed during that first fetch is not
+  // silently dropped.
+  const firstPageRequested = useRef(false)
+
   // Collapse back to the preview whenever a different table is opened — an
   // expanded 300-column list should not carry over to the next table.
   useEffect(() => {
@@ -180,7 +210,198 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
     loadSchema()
   }, [connectionId])
 
+  // Debounce the search box before it becomes a request.
+  useEffect(() => {
+    if (!paginated) return
+    const id = setTimeout(() => setCommittedSearch(searchQuery), 250)
+    return () => clearTimeout(id)
+  }, [searchQuery, paginated])
+
+  // Search and tab are resolved server-side, so each is a fresh first page.
+  useEffect(() => {
+    if (!paginated) return
+    if (!firstPageRequested.current) {
+      firstPageRequested.current = true
+      return
+    }
+    void loadTablePage(0, true)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [committedSearch, activeTab])
+
+  /**
+   * A sync that is still filling the cache. The catalog phase lands first, so
+   * the table list is already worth drawing while columns are still arriving —
+   * poll until it settles rather than holding a spinner over the whole thing.
+   */
+  useEffect(() => {
+    if (!paginated || !api.schema.status) return
+    if (syncPhase !== 'pending' && syncPhase !== 'catalog') return
+    const id = setInterval(async () => {
+      try {
+        const st = await api.schema.status!(connectionId)
+        setSyncPhase(st.sync_phase ?? st.sync_status)
+        setSyncProgress({ done: st.tables_done ?? 0, total: st.tables_total ?? 0 })
+        if (st.sync_phase && st.sync_phase !== 'pending' && st.sync_phase !== 'catalog') {
+          void loadTablePage(0, true)
+        }
+      } catch {
+        // A failed poll is not worth surfacing; the next one may succeed.
+      }
+    }, 2000)
+    return () => clearInterval(id)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [paginated, syncPhase, connectionId])
+
+  const tableSummaryToRow = (t: {
+    schema_name: string
+    table_name: string
+    full_name: string
+    table_type: string
+    column_count: number
+  }): TableWithColumns => ({
+    schema_name: t.schema_name,
+    table_name: t.table_name,
+    table_type: t.table_type,
+    full_name: t.full_name,
+    columns: [],
+    column_count: t.column_count,
+    columns_loaded: false,
+  })
+
+  const loadTablePage = async (offset: number, replace: boolean) => {
+    if (!api.schema.listTables) return
+    firstPageRequested.current = true
+    if (replace) {
+      setLoading(true)
+    } else {
+      setLoadingMore(true)
+    }
+    try {
+      const page = await api.schema.listTables(connectionId, {
+        search: committedSearch || undefined,
+        offset,
+        limit: TABLE_PREVIEW_COUNT,
+        selectedOnly: activeTab === 'selected',
+      })
+      const rows = page.tables.map(tableSummaryToRow)
+      setServerTotal(page.total)
+      if (activeTab === 'all' && !committedSearch) setServerTableTotal(page.total)
+      if (page.sync_phase) setSyncPhase(page.sync_phase)
+      if (page.tables_total !== undefined) {
+        setSyncProgress({ done: page.tables_done ?? 0, total: page.tables_total })
+      }
+      if (offset === 0 && Array.isArray((page as { missing_selections?: string[] }).missing_selections)) {
+        setServerMissing((page as { missing_selections?: string[] }).missing_selections!)
+      }
+      setSchema((prev) => {
+        if (replace) return rows
+        // Appending a page: keep whatever columns are already loaded.
+        const byName = new Map(prev.map((t) => [t.full_name, t]))
+        rows.forEach((r) => {
+          if (!byName.has(r.full_name)) byName.set(r.full_name, r)
+        })
+        return Array.from(byName.values())
+      })
+      if (replace && rows.length > 0) {
+        const dbName = connectionName
+        setExpandedDatabases(new Set([dbName]))
+        setExpandedSchemas(new Set([`${dbName}.${rows[0].schema_name}`]))
+        setSelectedTable((cur) =>
+          cur && rows.some((r) => r.full_name === cur.full_name) ? cur : rows[0]
+        )
+        void ensureColumns([rows[0]])
+      }
+      setError(null)
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : t('tableSelector.errors.schemaLoadFailed')
+      )
+    } finally {
+      setLoading(false)
+      setLoadingMore(false)
+    }
+  }
+
+  /**
+   * Make sure these tables have their columns loaded, and hand them back.
+   *
+   * The paginated list carries names only, but selecting a table means
+   * selecting its columns by name — so anything that toggles a checkbox has to
+   * come through here first. Batched at 25, the server's per-request cap.
+   */
+  const ensureColumns = async (
+    tables: TableWithColumns[]
+  ): Promise<TableWithColumns[]> => {
+    if (!paginated || !api.schema.getTableColumns) return tables
+    const cold = tables.filter((t) => !t.columns_loaded)
+    if (cold.length === 0) return tables
+
+    setLoadingColumns((prev) => {
+      const next = new Set(prev)
+      cold.forEach((t) => next.add(t.full_name))
+      return next
+    })
+
+    const loaded = new Map<string, TableWithColumns>()
+    try {
+    for (let i = 0; i < cold.length; i += 25) {
+      const batch = cold.slice(i, i + 25)
+      try {
+        const fetched = await api.schema.getTableColumns(
+          connectionId,
+          batch.map((t) => t.full_name)
+        )
+        fetched.forEach((f) =>
+          loaded.set(f.full_name, {
+            ...f,
+            column_count: f.columns.length,
+            columns_loaded: true,
+          })
+        )
+      } catch (err) {
+        setError(
+          err instanceof Error ? err.message : t('tableSelector.errors.schemaLoadFailed')
+        )
+      }
+    }
+    } finally {
+      setLoadingColumns((prev) => {
+        const next = new Set(prev)
+        cold.forEach((t) => next.delete(t.full_name))
+        return next
+      })
+    }
+    if (loaded.size === 0) return tables
+
+    setSchema((prev) => prev.map((t) => loaded.get(t.full_name) ?? t))
+    setSelectedTable((cur) => (cur ? loaded.get(cur.full_name) ?? cur : cur))
+    return tables.map((t) => loaded.get(t.full_name) ?? t)
+  }
+
+  const openTable = (table: TableWithColumns) => {
+    setSelectedTable(table)
+    void ensureColumns([table])
+  }
+
   const loadSchema = async (forceRefresh?: boolean) => {
+    if (paginated) {
+      if (forceRefresh) {
+        setRefreshing(true)
+        try {
+          // Re-introspect first, then re-read the (now fresh) first page.
+          await api.schema.sync(connectionId, false, 10, true)
+        } catch (err) {
+          setError(
+            err instanceof Error ? err.message : t('tableSelector.errors.schemaLoadFailed')
+          )
+        } finally {
+          setRefreshing(false)
+        }
+      }
+      await loadTablePage(0, true)
+      return
+    }
+
     if (forceRefresh) {
       setRefreshing(true)
     } else {
@@ -226,12 +447,19 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
     }
   }
 
+  /** Total column count for a table, whether or not its columns are loaded. */
+  const columnTotal = (table: TableWithColumns) =>
+    table.column_count ?? table.columns.length
+
   const tablesWithSelections = useMemo(() => {
+    // In paginated mode the server answered the "selected" question already —
+    // `schema` IS the selected page — and columns are not loaded to count.
+    if (paginated) return schema
     return schema.filter((table) => {
       const selection = selectedSchema[table.full_name]
       return selection && selection.columns.length > 0
     })
-  }, [schema, selectedSchema])
+  }, [schema, selectedSchema, paginated])
 
   const groupedTables = useMemo((): DatabaseGroup[] => {
     const schemaMap = new Map<string, TableWithColumns[]>()
@@ -239,7 +467,7 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
     const baseTables =
       activeTab === 'selected' ? tablesWithSelections : schema
 
-    const filteredSchema = searchQuery
+    const filteredSchema = searchQuery && !paginated
       ? baseTables.filter(
           (table) =>
             table.table_name
@@ -276,7 +504,7 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
         ),
       },
     ]
-  }, [schema, connectionName, searchQuery, activeTab, tablesWithSelections])
+  }, [schema, connectionName, searchQuery, activeTab, tablesWithSelections, paginated])
 
   /**
    * The tables the tree is actually showing right now — already narrowed by the
@@ -297,19 +525,22 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
    * many rows happen to be painted.
    */
   const renderedTableKeys = useMemo(() => {
+    // Paginated mode never caps: every row in `schema` was fetched because the
+    // user asked for it, so hiding some of them again would be perverse.
+    if (paginated) return null
     if (showAllTables || visibleTables.length <= TABLE_PREVIEW_COUNT) return null
     return new Set(
       visibleTables.slice(0, TABLE_PREVIEW_COUNT).map((t) => t.full_name)
     )
-  }, [visibleTables, showAllTables])
+  }, [visibleTables, showAllTables, paginated])
 
   const visibleAllSelected = useMemo(
     () =>
       visibleTables.length > 0 &&
       visibleTables.every(
         (table) =>
-          selectedSchema[table.full_name]?.columns.length ===
-          table.columns.length
+          (selectedSchema[table.full_name]?.columns.length || 0) ===
+          columnTotal(table)
       ),
     [visibleTables, selectedSchema]
   )
@@ -322,10 +553,14 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
     [visibleTables, selectedSchema]
   )
 
-  const handleSelectAllVisible = () => {
+  const handleSelectAllVisible = async () => {
+    // Selecting a table means selecting its columns by name, so the ones on
+    // screen have to be fetched before they can be ticked. Bounded by the page
+    // size, not by the size of the database.
+    const tables = await ensureColumns(visibleTables)
     setSelectedSchema((prev) => {
       const next = { ...prev }
-      visibleTables.forEach((table) => {
+      tables.forEach((table) => {
         next[table.full_name] = {
           selected: true,
           columns: table.columns.map((c) => c.name),
@@ -358,6 +593,9 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
    * every selection would look missing.
    */
   const missingSelections = useMemo(() => {
+    // Paginated mode holds one page, so it cannot tell "not on this page" from
+    // "not in the database". The server diffs the whole cache for us.
+    if (paginated) return serverMissing
     if (schema.length === 0) return []
     const known = new Set(schema.map((t) => t.full_name))
     return Object.entries(selectedSchema)
@@ -370,7 +608,7 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
       )
       .map(([key]) => key)
       .sort((a, b) => a.localeCompare(b))
-  }, [schema, selectedSchema])
+  }, [schema, selectedSchema, paginated, serverMissing])
 
   /**
    * Whether this connection arrived with a selection. Saving an empty selection
@@ -424,10 +662,28 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
 
   const selectionStats = useMemo(() => {
     const known = new Set(schema.map((t) => t.full_name))
-    const totalTables = schema.length
     const entries = Object.entries(selectedSchema).filter(
       ([key, s]) => !key.startsWith('_') && s.selected && s.columns.length > 0
     )
+    const selectedColumns = entries.reduce(
+      (sum, [, s]) => sum + (s.columns?.length || 0),
+      0
+    )
+
+    if (paginated) {
+      // `schema` is one page; the counts describe the connection, so they come
+      // from the server total and from the selection itself, minus the entries
+      // the server told us no longer exist.
+      const gone = new Set(serverMissing)
+      return {
+        totalTables: serverTableTotal || serverTotal,
+        selectedTables: entries.filter(([key]) => !gone.has(key)).length,
+        totalColumns: schema.reduce((sum, t) => sum + columnTotal(t), 0),
+        selectedColumns,
+      }
+    }
+
+    const totalTables = schema.length
     // Count only what the tree can actually show, so the tab badge and the list
     // below it can never disagree.
     const selectedTables =
@@ -435,12 +691,8 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
         ? entries.length
         : entries.filter(([key]) => known.has(key)).length
     const totalColumns = schema.reduce((sum, t) => sum + t.columns.length, 0)
-    const selectedColumns = entries.reduce(
-      (sum, [, s]) => sum + (s.columns?.length || 0),
-      0
-    )
     return { totalTables, selectedTables, totalColumns, selectedColumns }
-  }, [schema, selectedSchema])
+  }, [schema, selectedSchema, paginated, serverTotal, serverTableTotal, serverMissing])
 
   const toggleDatabase = (dbName: string) => {
     setExpandedDatabases((prev) => {
@@ -512,7 +764,7 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
     }
   }
 
-  const handleToggleTableColumns = (
+  const handleToggleTableColumns = async (
     table: TableWithColumns,
     e: React.MouseEvent
   ) => {
@@ -520,7 +772,14 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
 
     const currentSelection = selectedSchema[table.full_name]
     const allSelected =
-      currentSelection?.columns.length === table.columns.length
+      (currentSelection?.columns.length || 0) === columnTotal(table) &&
+      columnTotal(table) > 0
+
+    if (!allSelected) {
+      // Ticking a table means listing its columns, which in paginated mode are
+      // not loaded until now.
+      ;[table] = await ensureColumns([table])
+    }
 
     if (allSelected) {
       setSelectedSchema((prev) => ({
@@ -546,7 +805,7 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
   ): 'all' | 'some' | 'none' => {
     const selection = selectedSchema[table.full_name]
     if (!selection || selection.columns.length === 0) return 'none'
-    if (selection.columns.length === table.columns.length) return 'all'
+    if (selection.columns.length >= columnTotal(table)) return 'all'
     return 'some'
   }
 
@@ -554,7 +813,7 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
     if (!selectedTable) return 'none'
     const selection = selectedSchema[selectedTable.full_name]
     if (!selection || selection.columns.length === 0) return 'none'
-    if (selection.columns.length === selectedTable.columns.length) return 'all'
+    if (selection.columns.length >= columnTotal(selectedTable)) return 'all'
     return 'some'
   }
 
@@ -754,6 +1013,21 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
             </div>
           </div>
 
+          {/* Still introspecting: the table list is already real (the catalog
+              phase lands first), the columns are not. Say so rather than
+              leaving the user to wonder why a table looks empty. */}
+          {paginated && (syncPhase === 'pending' || syncPhase === 'catalog') && (
+            <div className="flex items-center gap-2 px-3 py-2 text-xs text-blue-700 dark:text-blue-300 bg-blue-50 dark:bg-blue-900/20 border-b border-blue-100 dark:border-blue-900/40">
+              <Loader2 className="w-3 h-3 animate-spin shrink-0" />
+              <span className="truncate">
+                {t('tableSelector.loadingSchema')}
+                {syncProgress && syncProgress.total > 0
+                  ? ` (${syncProgress.done}/${syncProgress.total})`
+                  : ''}
+              </span>
+            </div>
+          )}
+
           {/* Tree View */}
           <div className="flex-1 overflow-y-auto">
             {/* Selections whose table is gone from the database. Shown on both
@@ -863,7 +1137,7 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
                                     ? 'bg-blue-50 dark:bg-blue-900/20 border-l-2 border-blue-600'
                                     : 'hover:bg-gray-50 dark:hover:bg-gray-700'
                                 }`}
-                                onClick={() => setSelectedTable(table)}
+                                onClick={() => openTable(table)}
                               >
                                 <div
                                   onClick={(e) =>
@@ -926,19 +1200,36 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
                 </div>
               )}
 
-            {visibleTables.length > TABLE_PREVIEW_COUNT && (
-              <button
-                type="button"
-                onClick={() => setShowAllTables((v) => !v)}
-                className="w-full px-3 py-2 text-xs font-medium text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 border-t border-gray-100 dark:border-gray-700 transition-colors"
-              >
-                {showAllTables
-                  ? labels?.showFewerColumns ?? t('tableSelector.showFewer')
-                  : (labels?.showAllTables ?? t('tableSelector.showAllTables')).replace(
-                      '{count}',
-                      String(visibleTables.length)
-                    )}
-              </button>
+            {paginated ? (
+              schema.length < serverTotal && (
+                <button
+                  type="button"
+                  disabled={loadingMore}
+                  onClick={() => loadTablePage(schema.length, false)}
+                  className="w-full px-3 py-2 text-xs font-medium text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 border-t border-gray-100 dark:border-gray-700 transition-colors disabled:opacity-50 flex items-center justify-center gap-2"
+                >
+                  {loadingMore && <Loader2 className="w-3 h-3 animate-spin" />}
+                  {(labels?.showAllTables ?? t('tableSelector.showAllTables')).replace(
+                    '{count}',
+                    String(serverTotal)
+                  )}
+                </button>
+              )
+            ) : (
+              visibleTables.length > TABLE_PREVIEW_COUNT && (
+                <button
+                  type="button"
+                  onClick={() => setShowAllTables((v) => !v)}
+                  className="w-full px-3 py-2 text-xs font-medium text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 border-t border-gray-100 dark:border-gray-700 transition-colors"
+                >
+                  {showAllTables
+                    ? labels?.showFewerColumns ?? t('tableSelector.showFewer')
+                    : (labels?.showAllTables ?? t('tableSelector.showAllTables')).replace(
+                        '{count}',
+                        String(visibleTables.length)
+                      )}
+                </button>
+              )
             )}
           </div>
         </div>
@@ -996,6 +1287,13 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
               </div>
 
               <div className="flex-1 overflow-y-auto">
+                {loadingColumns.has(selectedTable.full_name) &&
+                  selectedTable.columns.length === 0 && (
+                    <div className="flex items-center justify-center gap-2 py-10 text-sm text-gray-500 dark:text-gray-400">
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      {t('tableSelector.loadingSchema')}
+                    </div>
+                  )}
                 {visibleColumns.map((column) => {
                   const isSelected = selectedColumnNames.includes(column.name)
                   return (

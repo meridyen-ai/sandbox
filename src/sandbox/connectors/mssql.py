@@ -306,6 +306,35 @@ class MSSQLConnector(BaseConnector[Any]):
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(_executor_for(conn), _get_tables)
 
+    async def get_table_entries(
+        self, conn: Any, schema: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Same set as get_tables, but carrying TABLE vs VIEW."""
+        schema = schema or self.config.schema_name or "dbo"
+
+        def _get_entries() -> list[dict[str, Any]]:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT TABLE_NAME, TABLE_TYPE
+                FROM INFORMATION_SCHEMA.TABLES
+                WHERE TABLE_SCHEMA = %s
+                  AND TABLE_TYPE IN ('BASE TABLE', 'VIEW')
+                ORDER BY TABLE_NAME
+                """,
+                (schema,),
+            )
+            return [
+                {
+                    "name": row[0],
+                    "type": "VIEW" if row[1] == "VIEW" else "TABLE",
+                }
+                for row in cursor.fetchall()
+            ]
+
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(_executor_for(conn), _get_entries)
+
     async def get_columns(
         self, conn: Any, table: str, schema: str | None = None
     ) -> list[dict[str, Any]]:

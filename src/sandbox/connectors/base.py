@@ -102,6 +102,24 @@ class BaseConnector(ABC, Generic[T]):
         """Test if connection is valid."""
         pass
 
+    async def get_table_entries(
+        self, conn: T, schema: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Tables as ``[{"name", "type"}]``.
+
+        The catalog endpoint needs a table's kind (TABLE / VIEW) so the caller
+        can cache it without a second round trip, but ``get_tables`` predates
+        that and returns bare names. Connectors that can report the kind for
+        free override this; everyone else gets the same set ``get_tables``
+        returns, labelled TABLE. Deliberately the *same set* — the catalog and
+        the column sync must agree on which tables exist, or the cache ends up
+        holding tables whose columns never arrive.
+        """
+        return [
+            {"name": name, "type": "TABLE"}
+            for name in await self.get_tables(conn, schema=schema)
+        ]
+
     async def initialize_pool(self, min_size: int = 1, max_size: int = 10) -> None:
         """Initialize connection pool."""
         self._pool = ConnectionPool(

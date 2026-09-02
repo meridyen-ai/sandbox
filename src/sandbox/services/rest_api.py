@@ -2204,15 +2204,128 @@ def register_routes(app: FastAPI) -> None:
             logger.error("schema_sync_error", connection_id=connection_id, error=str(e))
             raise HTTPException(status_code=500, detail=str(e))
 
-    @app.get("/api/v1/schema/full-sync", tags=["Schema"])
-    async def full_sync_schema(
-        include_samples: bool = True,
-        sample_limit: int = 10,
+    @app.get("/api/v1/schema/catalog", tags=["Schema"])
+    async def catalog_schema(
         connection_ids: str | None = None,
         token_data: dict = Depends(verify_sandbox_token),
     ) -> JSONResponse:
         """
-        Bulk sync: returns all connections with schemas and sample data.
+        Table names only — the cheapest complete answer about a database.
+
+        One catalog query on one connection per database. No columns, no sample
+        rows, and deliberately NO filtering by the connection's selected_tables:
+        this is what a caller needs to render a table picker, so it has to list
+        everything the database has, including what the user has not selected.
+
+        Exists because full-sync is the wrong tool for "what is in here?" — it
+        pays for columns and a sample query per table, which on a few hundred
+        tables runs into minutes and then loses all of it to the deadline. Sync
+        the catalog first, and the picker is usable while columns are still
+        arriving.
+        """
+        from sandbox.connectors.factory import get_connector
+        from sandbox.core.config import get_config
+
+        config = get_config()
+        max_concurrent = max(1, config.resource_limits.max_concurrent_queries)
+        conn_semaphore = asyncio.Semaphore(max_concurrent)
+
+        async def _catalog_connection(conn_config):
+            is_upload = (
+                conn_config.database.startswith("upload_")
+                or conn_config.schema_name == "uploads"
+            )
+            connection_data = {
+                "id": conn_config.id,
+                "name": conn_config.name,
+                "db_type": "csv" if is_upload else conn_config.db_type.value,
+                "host": conn_config.host,
+                "port": conn_config.port,
+                "database": conn_config.database,
+                "schema": conn_config.schema_name,
+                "is_default": getattr(conn_config, "is_default", False),
+                "tables": [],
+            }
+            try:
+                connector = get_connector(conn_config.db_type, conn_config)
+                async with conn_semaphore, connector.get_connection() as conn:
+                    entries = await connector.get_table_entries(
+                        conn, schema=conn_config.schema_name
+                    )
+                connection_data["tables"] = entries
+            except Exception as e:
+                logger.warning(
+                    "catalog_connection_error",
+                    connection=conn_config.id,
+                    error=str(e),
+                )
+                connection_data["error"] = str(e)
+            return connection_data
+
+        conns_to_sync = config.database_connections
+        if connection_ids:
+            wanted = {c.strip() for c in connection_ids.split(",") if c.strip()}
+            conns_to_sync = [c for c in conns_to_sync if str(c.id) in wanted]
+
+        # Much tighter than full-sync's 90s: one catalog query either answers
+        # quickly or the database is unreachable, and a caller waiting to draw a
+        # table list should not be made to wait out a full introspection budget.
+        per_connection_timeout = float(
+            os.environ.get("SANDBOX_CATALOG_TIMEOUT_SECONDS", "30")
+        )
+
+        async def _guarded(cc):
+            try:
+                return await asyncio.wait_for(
+                    _catalog_connection(cc), timeout=per_connection_timeout
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "catalog_connection_timeout",
+                    connection=cc.id,
+                    timeout_seconds=per_connection_timeout,
+                )
+                raise
+
+        results = await asyncio.gather(
+            *[_guarded(cc) for cc in conns_to_sync], return_exceptions=True
+        )
+
+        catalog_connections = []
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                cc = conns_to_sync[i]
+                catalog_connections.append({
+                    "id": cc.id,
+                    "name": cc.name,
+                    "db_type": cc.db_type.value,
+                    "tables": [],
+                    "error": (
+                        "catalog listing timed out"
+                        if isinstance(result, asyncio.TimeoutError)
+                        else str(result)
+                    ),
+                })
+            else:
+                catalog_connections.append(result)
+
+        return JSONResponse(content={
+            "status": "success",
+            "synced_at": datetime.now(timezone.utc).isoformat(),
+            "connections": catalog_connections,
+        })
+
+    @app.get("/api/v1/schema/full-sync", tags=["Schema"])
+    async def full_sync_schema(
+        include_samples: bool = False,
+        include_columns: bool = True,
+        sample_limit: int = 10,
+        connection_ids: str | None = None,
+        tables: str | None = None,
+        token_data: dict = Depends(verify_sandbox_token),
+    ) -> JSONResponse:
+        """
+        Bulk sync: returns all connections with schemas and (optionally) samples.
 
         Pulls all connection metadata in one call.
         No credentials are included in the response.
@@ -2222,6 +2335,16 @@ def register_routes(app: FastAPI) -> None:
         single connection should always pass this — otherwise every connection
         in the (space-agnostic) store is introspected on each sync, which can
         take minutes and time out when the store holds many or large databases.
+
+        tables: optional comma-separated table-name allow-list, applied on top
+        of the connection's own selected_tables. This is how a caller asks for
+        sample rows for just the tables a user actually picked without first
+        having to persist that selection into the sandbox.
+
+        include_samples now defaults to FALSE. A sample is one query per table
+        and used to be the single most expensive part of a sync — the caller
+        that wants samples should say so, and say which tables it wants them
+        for.
         """
         from sandbox.connectors.factory import get_connector
         from sandbox.core.config import DatabaseType, get_config
@@ -2237,7 +2360,14 @@ def register_routes(app: FastAPI) -> None:
         max_concurrent = max(1, config.resource_limits.max_concurrent_queries)
         conn_semaphore = asyncio.Semaphore(max_concurrent)
 
-        async def _sync_table(connector, conn_config, table_name, selected_columns, include_samples, sample_limit):
+        # Explicit table filter, independent of the connection's stored
+        # selected_tables. None means "no filter"; an empty set would mean
+        # "nothing", which is never what a caller means by omitting the param.
+        table_allow_list: set[str] | None = None
+        if tables:
+            table_allow_list = {t.strip() for t in tables.split(",") if t.strip()} or None
+
+        async def _sync_table(connector, conn_config, table_name, selected_columns, table_type, include_samples, sample_limit):
             """Fetch columns and sample data for a single table."""
             async with conn_semaphore, connector.get_connection() as conn:
                 columns_info = await connector.get_columns(
@@ -2252,6 +2382,7 @@ def register_routes(app: FastAPI) -> None:
 
                 table_data = {
                     "name": table_name,
+                    "type": table_type,
                     "columns": columns_info,
                     "sample_data": None,
                 }
@@ -2338,11 +2469,33 @@ def register_routes(app: FastAPI) -> None:
 
             selected_tables_config = conn_config.selected_tables or {}
 
+            connector = None
+            pooled = False
             try:
                 connector = get_connector(conn_config.db_type, conn_config)
 
+                # Reuse a handful of physical connections for the whole sync.
+                # Without a pool, `get_connection()` opens a brand-new socket
+                # every time it is called — and it is called once per table for
+                # sample rows. On SQL Server that is a TDS negotiation plus a
+                # codepage probe plus a dedicated thread, per table; a few
+                # hundred tables spent minutes doing nothing but logging in.
+                # A failure here is not fatal: fall through to the old
+                # connection-per-call behaviour.
+                try:
+                    await connector.initialize_pool(
+                        min_size=1, max_size=min(8, max_concurrent)
+                    )
+                    pooled = True
+                except Exception as e:
+                    logger.warning(
+                        "full_sync_pool_init_failed",
+                        connection=conn_config.id,
+                        error=str(e),
+                    )
+
                 async with conn_semaphore, connector.get_connection() as conn:
-                    tables = await connector.get_tables(
+                    table_entries = await connector.get_table_entries(
                         conn, schema=conn_config.schema_name
                     )
 
@@ -2351,8 +2504,18 @@ def register_routes(app: FastAPI) -> None:
 
                 # Build list of tables to sync with their column selections
                 tables_to_sync = []
-                for table_name in tables:
-                    if selected_tables_config:
+                for entry in table_entries:
+                    table_name = entry["name"]
+                    if table_allow_list is not None:
+                        # An explicit list overrides the stored selection rather
+                        # than narrowing it. A caller naming tables knows what it
+                        # wants — typically a picker asking for the columns of a
+                        # table the user has *not* selected yet, which an AND
+                        # against selected_tables would answer with nothing.
+                        if table_name not in table_allow_list:
+                            continue
+                        selected_columns = None
+                    elif selected_tables_config:
                         full_name = f"{schema_prefix}.{table_name}"
                         table_selection = selected_tables_config.get(full_name)
                         if not table_selection or not table_selection.get("selected"):
@@ -2360,11 +2523,13 @@ def register_routes(app: FastAPI) -> None:
                         selected_columns = table_selection.get("columns", [])
                     else:
                         selected_columns = None
-                    tables_to_sync.append((table_name, selected_columns))
+                    tables_to_sync.append(
+                        (table_name, selected_columns, entry.get("type", "TABLE"))
+                    )
 
                 # Try batch column fetch (1 query for ALL tables) if connector supports it
                 all_columns_batch = None
-                if tables_to_sync and hasattr(connector, 'get_all_columns'):
+                if tables_to_sync and include_columns and hasattr(connector, 'get_all_columns'):
                     try:
                         async with conn_semaphore, connector.get_connection() as conn:
                             all_columns_batch = await connector.get_all_columns(
@@ -2384,14 +2549,23 @@ def register_routes(app: FastAPI) -> None:
 
                 # Build table data
                 if tables_to_sync:
-                    if all_columns_batch:
+                    # Batch columns in hand, or none wanted: either way there is
+                    # no per-table column query to make.
+                    if all_columns_batch or not include_columns:
+                        if all_columns_batch is None:
+                            all_columns_batch = {}
                         # Fast path: use batch-fetched columns, only fetch sample data in parallel
-                        async def _build_table_from_batch(tname, sel_cols):
+                        async def _build_table_from_batch(tname, sel_cols, ttype):
                             columns_info = all_columns_batch.get(tname, [])
                             if sel_cols is not None and sel_cols:
                                 columns_info = [c for c in columns_info if c.get("name") in sel_cols]
 
-                            table_data = {"name": tname, "columns": columns_info, "sample_data": None}
+                            table_data = {
+                                "name": tname,
+                                "type": ttype,
+                                "columns": columns_info,
+                                "sample_data": None,
+                            }
 
                             if include_samples:
                                 try:
@@ -2451,15 +2625,18 @@ def register_routes(app: FastAPI) -> None:
                             return table_data
 
                         table_results = await asyncio.gather(
-                            *[_build_table_from_batch(tname, sel_cols) for tname, sel_cols in tables_to_sync],
+                            *[
+                                _build_table_from_batch(tname, sel_cols, ttype)
+                                for tname, sel_cols, ttype in tables_to_sync
+                            ],
                             return_exceptions=True,
                         )
                     else:
                         # Fallback: fetch columns per table in parallel
                         table_results = await asyncio.gather(
                             *[
-                                _sync_table(connector, conn_config, tname, sel_cols, include_samples, sample_limit)
-                                for tname, sel_cols in tables_to_sync
+                                _sync_table(connector, conn_config, tname, sel_cols, ttype, include_samples, sample_limit)
+                                for tname, sel_cols, ttype in tables_to_sync
                             ],
                             return_exceptions=True,
                         )
@@ -2482,6 +2659,12 @@ def register_routes(app: FastAPI) -> None:
                     error=str(e),
                 )
                 connection_data["error"] = str(e)
+            finally:
+                if pooled and connector is not None:
+                    try:
+                        await connector.close_pool()
+                    except Exception:
+                        pass
 
             return connection_data
 

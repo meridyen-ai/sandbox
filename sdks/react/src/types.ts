@@ -106,6 +106,15 @@ export interface TableWithColumns {
   table_type: string
   full_name: string
   columns: ColumnInfo[]
+  /**
+   * How many columns the table has, known before the columns themselves are.
+   * In the paginated picker `columns` starts empty and is filled in when the
+   * table is opened, so anything asking "are all of them selected?" has to
+   * count against this rather than against what happens to be loaded.
+   */
+  column_count?: number
+  /** True once `columns` really holds every column of this table. */
+  columns_loaded?: boolean
 }
 
 export interface SelectedSchema {
