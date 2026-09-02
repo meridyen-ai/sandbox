@@ -131,7 +131,15 @@ function normalizeSchema(raw: Record<string, unknown>): SelectedSchema {
     if (Array.isArray(entry.columns)) {
       cols = entry.columns
     } else if (entry.columns && typeof entry.columns === 'object') {
-      cols = Object.keys(entry.columns)
+      // The dict shape carries a per-column `selected` flag; every key would
+      // re-check columns the user deliberately unchecked.
+      cols = Object.entries(entry.columns as Record<string, unknown>)
+        .filter(([, meta]) =>
+          meta && typeof meta === 'object'
+            ? (meta as { selected?: boolean }).selected !== false
+            : meta !== false
+        )
+        .map(([name]) => name)
     } else {
       cols = []
     }
