@@ -89,6 +89,15 @@ const translations: Record<string, string> = {
   'tableSelector.clearSelection': 'Clear selection',
   'tableSelector.showFewer': 'Show fewer',
   'tableSelector.showAllTables': 'Show all {count} tables',
+  // Server-paginated list: each click fetches the next page, so the label
+  // must not promise all of them the way showAllTables does.
+  'tableSelector.showMoreTables': 'Show more tables',
+  'tableSelector.tablesShown': '{shown} of {total} shown',
+  'tableSelector.allTablesShown': 'All {count} tables shown',
+  'tableSelector.syncingSchema': 'Reading database schema',
+  'tableSelector.syncingTables': '{done} of {total} tables',
+  'tableSelector.syncingCounting': 'Counting tables…',
+  'tableSelector.syncingHint': 'You can start selecting; columns load as they arrive.',
   'tableSelector.showAllColumns': 'Show all {count} columns',
   'tableSelector.columnsSelected': '{selected}/{total} columns selected',
   'tableSelector.colColumnName': 'Column name ({selected}/{total} selected)',

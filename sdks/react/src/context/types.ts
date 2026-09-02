@@ -85,6 +85,10 @@ export interface TablePage {
   sync_error?: string | null
   tables_total?: number
   tables_done?: number
+  /** True while a sync is actually running, as opposed to merely unfinished. */
+  in_progress?: boolean
+  /** Selections whose table the database no longer has, diffed server-side. */
+  missing_selections?: string[]
 }
 
 export interface SchemaSyncStatus {

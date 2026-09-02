@@ -95,6 +95,15 @@ const COLUMN_PREVIEW_COUNT = 20
 /** How many tables the tree lists before "show all". */
 const TABLE_PREVIEW_COUNT = 50
 
+/**
+ * How many more the paginated list fetches per "show more".
+ *
+ * Larger than the first page on purpose: the first page is what the user waits
+ * for, so it stays small, but 645 tables at 50 a click is thirteen clicks.
+ * Capped at 200 by the server.
+ */
+const TABLE_PAGE_MORE = 150
+
 function schemaDataToTableWithColumns(data: SchemaData): TableWithColumns[] {
   const schemaName = data.schema || 'public'
   return data.tables.map((table) => ({
@@ -186,6 +195,7 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
   // can say "loading" instead of showing a real table as having no columns.
   const [loadingColumns, setLoadingColumns] = useState<Set<string>>(new Set())
   const [syncPhase, setSyncPhase] = useState<string | null>(null)
+  const [syncRunning, setSyncRunning] = useState(false)
   const [syncProgress, setSyncProgress] = useState<{ done: number; total: number } | null>(null)
   // Debounced copy of searchQuery — every keystroke must not be a request.
   const [committedSearch, setCommittedSearch] = useState('')
@@ -234,14 +244,15 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
    * poll until it settles rather than holding a spinner over the whole thing.
    */
   useEffect(() => {
-    if (!paginated || !api.schema.status) return
-    if (syncPhase !== 'pending' && syncPhase !== 'catalog') return
+    if (!paginated || !api.schema.status || !syncRunning) return
     const id = setInterval(async () => {
       try {
         const st = await api.schema.status!(connectionId)
         setSyncPhase(st.sync_phase ?? st.sync_status)
         setSyncProgress({ done: st.tables_done ?? 0, total: st.tables_total ?? 0 })
-        if (st.sync_phase && st.sync_phase !== 'pending' && st.sync_phase !== 'catalog') {
+        if (!st.in_progress) {
+          // Finished (or died). Either way, stop polling and show what landed.
+          setSyncRunning(false)
           void loadTablePage(0, true)
         }
       } catch {
@@ -250,7 +261,7 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
     }, 2000)
     return () => clearInterval(id)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [paginated, syncPhase, connectionId])
+  }, [paginated, syncRunning, connectionId])
 
   const tableSummaryToRow = (t: {
     schema_name: string
@@ -280,13 +291,17 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
       const page = await api.schema.listTables(connectionId, {
         search: committedSearch || undefined,
         offset,
-        limit: TABLE_PREVIEW_COUNT,
+        limit: replace ? TABLE_PREVIEW_COUNT : TABLE_PAGE_MORE,
         selectedOnly: activeTab === 'selected',
       })
       const rows = page.tables.map(tableSummaryToRow)
       setServerTotal(page.total)
       if (activeTab === 'all' && !committedSearch) setServerTableTotal(page.total)
       if (page.sync_phase) setSyncPhase(page.sync_phase)
+      // Only a sync that is actually running earns a progress banner. A cache
+      // left mid-phase by a crash or a restart is not "in progress", and
+      // keying off the phase alone would show the banner forever.
+      setSyncRunning(Boolean(page.in_progress))
       if (page.tables_total !== undefined) {
         setSyncProgress({ done: page.tables_done ?? 0, total: page.tables_total })
       }
@@ -1014,17 +1029,38 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
           </div>
 
           {/* Still introspecting: the table list is already real (the catalog
-              phase lands first), the columns are not. Say so rather than
-              leaving the user to wonder why a table looks empty. */}
-          {paginated && (syncPhase === 'pending' || syncPhase === 'catalog') && (
-            <div className="flex items-center gap-2 px-3 py-2 text-xs text-blue-700 dark:text-blue-300 bg-blue-50 dark:bg-blue-900/20 border-b border-blue-100 dark:border-blue-900/40">
-              <Loader2 className="w-3 h-3 animate-spin shrink-0" />
-              <span className="truncate">
-                {t('tableSelector.loadingSchema')}
-                {syncProgress && syncProgress.total > 0
-                  ? ` (${syncProgress.done}/${syncProgress.total})`
-                  : ''}
-              </span>
+              phase lands first), the columns are not. A short title, a bar and
+              the counts — the long one-line sentence this replaced was clipped
+              with an ellipsis in the sidebar and said nothing about progress. */}
+          {paginated && syncRunning && (
+            <div className="px-3 py-2.5 bg-blue-50 dark:bg-blue-900/20 border-b border-blue-100 dark:border-blue-900/40">
+              <div className="flex items-center gap-2">
+                <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-600 dark:text-blue-400 shrink-0" />
+                <span className="text-xs font-medium text-blue-800 dark:text-blue-200">
+                  {t('tableSelector.syncingSchema')}
+                </span>
+                <span className="ml-auto text-[11px] text-blue-700/80 dark:text-blue-300/80 tabular-nums shrink-0">
+                  {syncProgress && syncProgress.total > 0
+                    ? t('tableSelector.syncingTables')
+                        .replace('{done}', String(syncProgress.done))
+                        .replace('{total}', String(syncProgress.total))
+                    : t('tableSelector.syncingCounting')}
+                </span>
+              </div>
+              <div className="mt-1.5 h-1 rounded-full bg-blue-100 dark:bg-blue-900/40 overflow-hidden">
+                <div
+                  className="h-full rounded-full bg-blue-500 transition-[width] duration-500"
+                  style={{
+                    width:
+                      syncProgress && syncProgress.total > 0
+                        ? `${Math.min(100, Math.round((syncProgress.done / syncProgress.total) * 100))}%`
+                        : '15%',
+                  }}
+                />
+              </div>
+              <p className="mt-1.5 text-[11px] leading-snug text-blue-700/80 dark:text-blue-300/80">
+                {t('tableSelector.syncingHint')}
+              </p>
             </div>
           )}
 
@@ -1201,19 +1237,33 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
               )}
 
             {paginated ? (
-              schema.length < serverTotal && (
-                <button
-                  type="button"
-                  disabled={loadingMore}
-                  onClick={() => loadTablePage(schema.length, false)}
-                  className="w-full px-3 py-2 text-xs font-medium text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 border-t border-gray-100 dark:border-gray-700 transition-colors disabled:opacity-50 flex items-center justify-center gap-2"
-                >
-                  {loadingMore && <Loader2 className="w-3 h-3 animate-spin" />}
-                  {(labels?.showAllTables ?? t('tableSelector.showAllTables')).replace(
-                    '{count}',
-                    String(serverTotal)
-                  )}
-                </button>
+              // Each click fetches the next page, so this must not say "show
+              // all N" — it loads a page, and the user needs to see how far
+              // through the list they are.
+              serverTotal > 0 && (
+                <div className="border-t border-gray-100 dark:border-gray-700 px-3 py-2 sticky bottom-0 bg-white dark:bg-gray-800">
+                  {schema.length < serverTotal ? (
+                    <button
+                      type="button"
+                      disabled={loadingMore}
+                      onClick={() => loadTablePage(schema.length, false)}
+                      className="w-full flex items-center justify-center gap-2 px-3 py-1.5 rounded-lg border border-blue-200 dark:border-blue-900/50 text-xs font-medium text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 transition-colors disabled:opacity-50"
+                    >
+                      {loadingMore && <Loader2 className="w-3 h-3 animate-spin" />}
+                      {t('tableSelector.showMoreTables')}
+                    </button>
+                  ) : null}
+                  <p className="mt-1.5 text-center text-[11px] text-gray-400 dark:text-gray-500 tabular-nums">
+                    {schema.length < serverTotal
+                      ? t('tableSelector.tablesShown')
+                          .replace('{shown}', String(schema.length))
+                          .replace('{total}', String(serverTotal))
+                      : t('tableSelector.allTablesShown').replace(
+                          '{count}',
+                          String(serverTotal)
+                        )}
+                  </p>
+                </div>
               )
             ) : (
               visibleTables.length > TABLE_PREVIEW_COUNT && (
