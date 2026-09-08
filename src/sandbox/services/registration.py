@@ -100,7 +100,7 @@ class SandboxRegistration:
 
         # Build registration payload
         payload = {
-            "workspace_id": self.config.platform.workspace_id,
+            "space_id": self.config.platform.space_id,
             "registration_token": self.config.platform.registration_token.get_secret_value()
             if self.config.platform.registration_token
             else None,

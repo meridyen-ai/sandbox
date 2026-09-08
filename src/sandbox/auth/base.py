@@ -20,8 +20,8 @@ class AuthResult:
     """Result of a successful authentication attempt."""
 
     authenticated: bool
-    workspace_id: str | None = None
-    workspace_name: str | None = None
+    space_id: str | None = None
+    space_name: str | None = None
     user_id: str | None = None
     api_key_name: str | None = None
     permissions: dict[str, Any] = field(

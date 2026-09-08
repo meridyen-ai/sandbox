@@ -39,6 +39,11 @@ UPLOAD_DB_PREFIX = "upload_"
 # Chunk size for loading large files (rows per batch)
 LOAD_CHUNK_SIZE = 50_000
 
+# PostgreSQL's hard per-table ceiling. Loading more than this fails with
+# psycopg2.errors.TooManyColumns, so callers check it and raise a readable
+# error instead of letting a giant CREATE TABLE statement reach the user.
+MAX_POSTGRES_COLUMNS = 1600
+
 _engine: Engine | None = None
 _db_engines: dict[str, Engine] = {}
 
@@ -70,6 +75,26 @@ def get_upload_db_config() -> dict[str, Any]:
         "password": _UPLOAD_DB_PASSWORD,
         "schema": UPLOADS_SCHEMA,
     }
+
+
+def drop_phantom_columns(df: "pd.DataFrame") -> "pd.DataFrame":
+    """Drop Excel's phantom trailing columns before loading to Postgres.
+
+    Excel stores a "used range" that formatting/stray whitespace can stretch far
+    past the real data, so openpyxl/pandas report thousands of empty `Unnamed: N`
+    columns. Loading those verbatim blows past PostgreSQL's hard 1600-column
+    ceiling and surfaces as psycopg2.errors.TooManyColumns (one real sheet here
+    reported 16,369 columns for 25 columns of actual data).
+
+    A column is phantom only when it is BOTH unnamed (pandas' `Unnamed: N`
+    placeholder for a blank header) and entirely empty, so genuinely-empty but
+    named columns are preserved.
+    """
+    phantom = [
+        c for c in df.columns
+        if str(c).startswith("Unnamed:") and df[c].isna().all()
+    ]
+    return df.drop(columns=phantom) if phantom else df
 
 
 def deduplicate_columns(columns: list[str]) -> list[str]:
@@ -334,11 +359,28 @@ def load_excel_sheet_to_postgres(
     if df.empty:
         return {"table_name": safe_table, "row_count": 0, "column_count": 0}
 
+    # Drop Excel's phantom trailing columns first — a sheet whose used range is
+    # padded with empty columns otherwise exceeds Postgres's 1600-column limit.
+    if has_header:
+        df = drop_phantom_columns(df)
+        if df.empty or not len(df.columns):
+            return {"table_name": safe_table, "row_count": 0, "column_count": 0}
+
     # Sanitize and deduplicate column names
     df.columns = deduplicate_columns([
         sanitize_table_name(str(c)) if has_header else f"col_{i}"
         for i, c in enumerate(df.columns)
     ])
+
+    # Even after pruning, a genuinely wide sheet cannot become a Postgres table.
+    # Name the real cause rather than letting psycopg2 surface a multi-kilobyte
+    # CREATE TABLE dump in the UI.
+    if len(df.columns) > MAX_POSTGRES_COLUMNS:
+        raise ValueError(
+            f"Sheet {sheet_name!r} has {len(df.columns)} columns with data, but "
+            f"PostgreSQL tables support at most {MAX_POSTGRES_COLUMNS}. "
+            "Reduce or split the columns and re-upload."
+        )
 
     # Load in chunks for large sheets
     total_rows = len(df)

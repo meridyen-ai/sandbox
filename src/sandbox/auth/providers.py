@@ -31,8 +31,8 @@ class StaticKeyAuthProvider(AuthProvider):
           provider: static
           static_keys:
             - key: "sb_my-secret-key-here"
-              workspace_id: "ws_1"
-              workspace_name: "Default Workspace"
+              space_id: "ws_1"
+              space_name: "Default Space"
               permissions:
                 execute_sql: true
                 execute_python: true
@@ -51,8 +51,8 @@ class StaticKeyAuthProvider(AuthProvider):
         if key_config:
             return AuthResult(
                 authenticated=True,
-                workspace_id=str(key_config.get("workspace_id", "default")),
-                workspace_name=key_config.get("workspace_name", "Default"),
+                space_id=str(key_config.get("space_id", "default")),
+                space_name=key_config.get("space_name", "Default"),
                 user_id=key_config.get("user_id"),
                 api_key_name=key_config.get("name", "static-key"),
                 permissions=key_config.get("permissions", {}),
@@ -78,7 +78,7 @@ class StaticKeyAuthProvider(AuthProvider):
 
             with engine.connect() as conn:
                 result = conn.execute(
-                    text("SELECT name, workspace_id, workspace_name, permissions FROM api_keys WHERE key_hash = :key_hash"),
+                    text("SELECT name, space_id, space_name, permissions FROM api_keys WHERE key_hash = :key_hash"),
                     {"key_hash": key_hash},
                 )
                 row = result.fetchone()
@@ -92,8 +92,8 @@ class StaticKeyAuthProvider(AuthProvider):
 
             return AuthResult(
                 authenticated=True,
-                workspace_id=str(row[1]),
-                workspace_name=row[2],
+                space_id=str(row[1]),
+                space_name=row[2],
                 api_key_name=row[0],
                 permissions=permissions,
             )
@@ -107,7 +107,7 @@ class RemoteAuthProvider(AuthProvider):
     Validates API keys by calling an external HTTP endpoint.
 
     The remote endpoint receives POST {"api_key": "..."} and must return:
-      {"valid": true, "workspace_id": "...", ...} or {"valid": false}
+      {"valid": true, "space_id": "...", ...} or {"valid": false}
 
     Config example (sandbox.yaml):
         authentication:
@@ -151,8 +151,8 @@ class RemoteAuthProvider(AuthProvider):
 
             return AuthResult(
                 authenticated=True,
-                workspace_id=str(data.get("workspace_id", "")),
-                workspace_name=data.get("workspace_name"),
+                space_id=str(data.get("space_id", "")),
+                space_name=data.get("space_name"),
                 user_id=str(data.get("user_id", "")) if data.get("user_id") else None,
                 api_key_name=data.get("api_key_name"),
                 permissions=data.get("permissions", {}),
@@ -200,8 +200,8 @@ class NoopAuthProvider(AuthProvider):
     async def verify(self, api_key: str) -> AuthResult | None:
         return AuthResult(
             authenticated=True,
-            workspace_id="dev",
-            workspace_name="Development",
+            space_id="dev",
+            space_name="Development",
             permissions={
                 "execute_sql": True,
                 "execute_python": True,

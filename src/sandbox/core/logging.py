@@ -23,7 +23,11 @@ def _add_sandbox_context(
     """Add sandbox-specific context to log entries."""
     config = get_config()
     event_dict["sandbox_id"] = config.platform.sandbox_id
-    event_dict["workspace_id"] = config.platform.workspace_id
+    # Only fall back to the process-level space when the log call did not supply
+    # a per-request one. This sandbox is shared, so config.platform.space_id is
+    # usually None and would otherwise mask the requesting space.
+    if event_dict.get("space_id") is None:
+        event_dict["space_id"] = config.platform.space_id
     event_dict["execution_mode"] = config.execution_mode.value
     event_dict["environment"] = config.environment
     return event_dict

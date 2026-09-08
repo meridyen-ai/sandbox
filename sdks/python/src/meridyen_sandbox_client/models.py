@@ -12,7 +12,7 @@ class ExecutionContext:
 
     connection_id: str | None = None
     request_id: str | None = None
-    workspace_id: str | None = None
+    space_id: str | None = None
     user_id: str | None = None
     max_rows: int = 10000
     timeout_seconds: int = 300
@@ -23,8 +23,8 @@ class ExecutionContext:
             d["connection_id"] = self.connection_id
         if self.request_id:
             d["request_id"] = self.request_id
-        if self.workspace_id:
-            d["workspace_id"] = self.workspace_id
+        if self.space_id:
+            d["space_id"] = self.space_id
         if self.user_id:
             d["user_id"] = self.user_id
         d["max_rows"] = self.max_rows
