@@ -38,6 +38,15 @@ from sandbox.core.exceptions import (
 from sandbox.core.logging import get_logger, bind_context, clear_context, setup_logging
 from sandbox.execution.base import ExecutionContext
 from sandbox.execution.sql_executor import SQLExecutor
+from sandbox.execution.virtual_objects.registry import registry as vo_registry
+from sandbox.execution.virtual_objects.runner import run as vo_run
+from sandbox.services.schema_sql import (
+    build_sample_query,
+    merge_virtual_entries,
+    samples_enabled_for,
+    virtual_column_info,
+    virtual_columns,
+)
 from sandbox.execution.python_executor import PythonExecutor
 from sandbox.visualization.generator import VisualizationGenerator, ChartType
 
@@ -789,7 +798,33 @@ def create_rest_app() -> FastAPI:
     return app
 
 
+def _flag_virtual_conflicts(conflicts: list) -> None:
+    """Mark virtual objects whose name a real table/view has since taken.
+
+    The virtual object keeps the name (SQL referencing it is expanded), but
+    the admin should know the real relation is now shadowed.
+    """
+    from sandbox.core import virtual_object_store
+
+    for obj in conflicts:
+        if obj.status == "conflict":
+            continue
+        try:
+            virtual_object_store.set_status(
+                obj.id,
+                "conflict",
+                f"A table or view named '{obj.name}' now exists and is hidden by this object",
+            )
+            vo_registry.invalidate(obj.connection_id)
+        except Exception as e:
+            logger.warning("virtual_object_conflict_flag_failed", object=obj.id, error=str(e))
+
+
 def register_routes(app: FastAPI) -> None:
+    from sandbox.services.virtual_objects_api import register_virtual_object_routes
+
+    register_virtual_object_routes(app, verify_sandbox_token)
+
     """Register API routes."""
 
     # ==========================================================================
@@ -2120,9 +2155,16 @@ def register_routes(app: FastAPI) -> None:
             # which tables from the shared schema belong to this connection
             selected_tables_config = conn_config.selected_tables or {}
 
+            virtual = await vo_registry.get(connection_id)
+
             async with connector.get_connection() as conn:
-                # Get all tables
-                tables = await connector.get_tables(conn, schema=conn_config.schema_name)
+                # Get all tables (plus virtual objects: custom queries / procedures)
+                merged_entries, _ = merge_virtual_entries(
+                    await connector.get_table_entries(conn, schema=conn_config.schema_name),
+                    virtual,
+                )
+                tables = [e["name"] for e in merged_entries]
+                table_types = {e["name"]: e.get("type", "TABLE") for e in merged_entries}
 
                 schema_data = {
                     "connection_id": connection_id,
@@ -2161,7 +2203,10 @@ def register_routes(app: FastAPI) -> None:
 
                 for table_name, selected_columns in tables_to_process:
                     # Use batch result or fall back to per-table fetch
-                    if all_columns_batch and table_name in all_columns_batch:
+                    vobj = virtual.get(table_name)
+                    if vobj is not None:
+                        columns_info = virtual_column_info(vobj)
+                    elif all_columns_batch and table_name in all_columns_batch:
                         columns_info = all_columns_batch[table_name]
                     else:
                         columns_info = await connector.get_columns(
@@ -2176,27 +2221,23 @@ def register_routes(app: FastAPI) -> None:
 
                     table_data = {
                         "name": table_name,
+                        "type": table_types.get(table_name, "TABLE"),
                         "columns": columns_info,
                         "sample_data": None
                     }
 
-                    if include_samples:
+                    if include_samples and samples_enabled_for(vobj):
                         try:
-                            if selected_columns:
-                                col_list = ", ".join(f'"{c}"' for c in selected_columns)
-                            else:
-                                col_list = "*"
-
-                            is_mssql = conn_config.db_type == DatabaseType.MSSQL
-                            top_clause = f"TOP {sample_limit} " if is_mssql else ""
-                            limit_clause = "" if is_mssql else f" LIMIT {sample_limit}"
-
-                            if conn_config.schema_name:
-                                sample_query = f'SELECT {top_clause}{col_list} FROM "{conn_config.schema_name}"."{table_name}"{limit_clause}'
-                            else:
-                                sample_query = f'SELECT {top_clause}{col_list} FROM "{table_name}"{limit_clause}'
-
-                            result = await connector.execute(conn, sample_query)
+                            sample_query = build_sample_query(
+                                conn_config.db_type.value,
+                                conn_config.schema_name,
+                                table_name,
+                                selected_columns,
+                                sample_limit,
+                            )
+                            result = await vo_run(
+                                connector, conn, conn_config, sample_query, objects=virtual
+                            )
 
                             table_data["sample_data"] = {
                                 "columns": result.columns,
@@ -2269,6 +2310,12 @@ def register_routes(app: FastAPI) -> None:
                     entries = await connector.get_table_entries(
                         conn, schema=conn_config.schema_name
                     )
+                # fresh=True raises if the store is unreadable: callers treat
+                # this listing as authoritative, so a partial one would make
+                # them drop every virtual object from their cache.
+                virtual = await vo_registry.get(conn_config.id, fresh=True)
+                entries, conflicts = merge_virtual_entries(entries, virtual)
+                _flag_virtual_conflicts(conflicts)
                 connection_data["tables"] = entries
             except Exception as e:
                 logger.warning(
@@ -2384,12 +2431,16 @@ def register_routes(app: FastAPI) -> None:
         if tables:
             table_allow_list = {t.strip() for t in tables.split(",") if t.strip()} or None
 
-        async def _sync_table(connector, conn_config, table_name, selected_columns, table_type, include_samples, sample_limit):
+        async def _sync_table(connector, conn_config, table_name, selected_columns, table_type, include_samples, sample_limit, virtual):
             """Fetch columns and sample data for a single table."""
+            vobj = virtual.get(table_name)
             async with conn_semaphore, connector.get_connection() as conn:
-                columns_info = await connector.get_columns(
-                    conn, table_name, schema=conn_config.schema_name
-                )
+                if vobj is not None:
+                    columns_info = virtual_column_info(vobj)
+                else:
+                    columns_info = await connector.get_columns(
+                        conn, table_name, schema=conn_config.schema_name
+                    )
 
                 if selected_columns is not None and selected_columns:
                     columns_info = [
@@ -2404,49 +2455,18 @@ def register_routes(app: FastAPI) -> None:
                     "sample_data": None,
                 }
 
-                if include_samples:
+                if include_samples and samples_enabled_for(vobj):
                     try:
-                        is_mssql = conn_config.db_type == DatabaseType.MSSQL
-
-                        if is_mssql:
-                            # T-SQL uses [schema].[table], not PostgreSQL-style double quotes.
-                            def _mssql_esc(n: str) -> str:
-                                return str(n).replace("]", "]]")
-
-                            if selected_columns:
-                                col_list = ", ".join(
-                                    f"[{_mssql_esc(c)}]" for c in selected_columns
-                                )
-                            else:
-                                col_list = "*"
-                            top_clause = f"TOP {sample_limit} "
-                            if conn_config.schema_name:
-                                from_part = (
-                                    f"[{_mssql_esc(conn_config.schema_name)}]"
-                                    f".[{_mssql_esc(table_name)}]"
-                                )
-                            else:
-                                from_part = f"[{_mssql_esc(table_name)}]"
-                            sample_query = f"SELECT {top_clause}{col_list} FROM {from_part}"
-                        else:
-                            if selected_columns:
-                                col_list = ", ".join(f'"{c}"' for c in selected_columns)
-                            else:
-                                col_list = "*"
-                            top_clause = ""
-                            limit_clause = f" LIMIT {sample_limit}"
-                            if conn_config.schema_name:
-                                sample_query = (
-                                    f'SELECT {top_clause}{col_list} FROM '
-                                    f'"{conn_config.schema_name}"."{table_name}"{limit_clause}'
-                                )
-                            else:
-                                sample_query = (
-                                    f'SELECT {top_clause}{col_list} FROM '
-                                    f'"{table_name}"{limit_clause}'
-                                )
-
-                        result = await connector.execute(conn, sample_query)
+                        sample_query = build_sample_query(
+                            conn_config.db_type.value,
+                            conn_config.schema_name,
+                            table_name,
+                            selected_columns,
+                            sample_limit,
+                        )
+                        result = await vo_run(
+                            connector, conn, conn_config, sample_query, objects=virtual
+                        )
                         table_data["sample_data"] = {
                             "columns": result.columns,
                             "rows": [
@@ -2515,6 +2535,9 @@ def register_routes(app: FastAPI) -> None:
                     table_entries = await connector.get_table_entries(
                         conn, schema=conn_config.schema_name
                     )
+                virtual = await vo_registry.get(conn_config.id, fresh=True)
+                table_entries, conflicts = merge_virtual_entries(table_entries, virtual)
+                _flag_virtual_conflicts(conflicts)
 
                 default_schema = "dbo" if conn_config.db_type == DatabaseType.MSSQL else "public"
                 schema_prefix = conn_config.schema_name or default_schema
@@ -2563,6 +2586,8 @@ def register_routes(app: FastAPI) -> None:
                             connection=conn_config.id,
                             error=str(e),
                         )
+                    if all_columns_batch is not None:
+                        all_columns_batch.update(virtual_columns(virtual))
 
                 # Build table data
                 if tables_to_sync:
@@ -2584,50 +2609,20 @@ def register_routes(app: FastAPI) -> None:
                                 "sample_data": None,
                             }
 
-                            if include_samples:
+                            if include_samples and samples_enabled_for(virtual.get(tname)):
                                 try:
-                                    is_mssql = conn_config.db_type == DatabaseType.MSSQL
-
-                                    def _mssql_esc2(n: str) -> str:
-                                        return str(n).replace("]", "]]")
-
-                                    if is_mssql:
-                                        if sel_cols:
-                                            col_list = ", ".join(
-                                                f"[{_mssql_esc2(c)}]" for c in sel_cols
-                                            )
-                                        else:
-                                            col_list = "*"
-                                        top_clause = f"TOP {sample_limit} "
-                                        if conn_config.schema_name:
-                                            from_part = (
-                                                f"[{_mssql_esc2(conn_config.schema_name)}]"
-                                                f".[{_mssql_esc2(tname)}]"
-                                            )
-                                        else:
-                                            from_part = f"[{_mssql_esc2(tname)}]"
-                                        sample_query = (
-                                            f"SELECT {top_clause}{col_list} FROM {from_part}"
-                                        )
-                                    else:
-                                        if sel_cols:
-                                            col_list = ", ".join(f'"{c}"' for c in sel_cols)
-                                        else:
-                                            col_list = "*"
-                                        top_clause = ""
-                                        limit_clause = f" LIMIT {sample_limit}"
-                                        if conn_config.schema_name:
-                                            sample_query = (
-                                                f'SELECT {top_clause}{col_list} FROM '
-                                                f'"{conn_config.schema_name}"."{tname}"{limit_clause}'
-                                            )
-                                        else:
-                                            sample_query = (
-                                                f'SELECT {top_clause}{col_list} FROM '
-                                                f'"{tname}"{limit_clause}'
-                                            )
+                                    sample_query = build_sample_query(
+                                        conn_config.db_type.value,
+                                        conn_config.schema_name,
+                                        tname,
+                                        sel_cols,
+                                        sample_limit,
+                                    )
                                     async with conn_semaphore, connector.get_connection() as sconn:
-                                        result = await connector.execute(sconn, sample_query)
+                                        result = await vo_run(
+                                            connector, sconn, conn_config, sample_query,
+                                            objects=virtual,
+                                        )
                                     table_data["sample_data"] = {
                                         "columns": result.columns,
                                         "rows": [
@@ -2652,7 +2647,7 @@ def register_routes(app: FastAPI) -> None:
                         # Fallback: fetch columns per table in parallel
                         table_results = await asyncio.gather(
                             *[
-                                _sync_table(connector, conn_config, tname, sel_cols, ttype, include_samples, sample_limit)
+                                _sync_table(connector, conn_config, tname, sel_cols, ttype, include_samples, sample_limit, virtual)
                                 for tname, sel_cols, ttype in tables_to_sync
                             ],
                             return_exceptions=True,
@@ -2789,13 +2784,10 @@ def register_routes(app: FastAPI) -> None:
             connector = get_connector(conn_config.db_type, conn_config)
 
             async with connector.get_connection() as conn:
-                # Build query
-                if conn_config.schema_name:
-                    query = f'SELECT * FROM "{conn_config.schema_name}"."{table_name}" LIMIT {limit}'
-                else:
-                    query = f'SELECT * FROM "{table_name}" LIMIT {limit}'
-
-                result = await connector.execute(conn, query)
+                query = build_sample_query(
+                    conn_config.db_type.value, conn_config.schema_name, table_name, None, limit
+                )
+                result = await vo_run(connector, conn, conn_config, query)
 
                 return JSONResponse(content={
                     "columns": result.columns,

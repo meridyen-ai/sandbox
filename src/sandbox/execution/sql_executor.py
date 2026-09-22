@@ -31,6 +31,9 @@ from sandbox.execution.base import (
     ExecutionResult,
     ExecutionStatus,
 )
+from sandbox.execution.virtual_objects.errors import sanitize
+from sandbox.execution.virtual_objects.models import ExpansionPlan
+from sandbox.execution.virtual_objects.runner import execute_plan, plan_query
 
 logger = get_logger(__name__)
 
@@ -327,8 +330,23 @@ class SQLExecutor(BaseExecutor[SQLExecutionResult]):
         """
         metrics = ExecutionMetrics()
         self._log_start(context, "sql", query_preview=query[:100])
+        plan: ExpansionPlan | None = None
 
         try:
+            # Resolve virtual objects (custom queries, stored procedures) the
+            # query references. The caller's SQL was validated as-is; what the
+            # expansion adds is generated here and never re-validated.
+            conn_cfg = get_config().get_connection(context.connection_id or "")
+            if conn_cfg is not None:
+                plan = await plan_query(conn_cfg, query)
+                if not plan.noop:
+                    logger.info(
+                        "virtual_objects_expanded",
+                        request_id=context.request_id,
+                        objects=[o.name for o in plan.used],
+                        materialized=[s.obj.name for s in plan.steps],
+                    )
+
             # Acquire per-connection lock to serialize concurrent access
             # (FreeTDS/pymssql is not thread-safe for shared connections)
             conn_id = context.connection_id or ""
@@ -360,7 +378,9 @@ class SQLExecutor(BaseExecutor[SQLExecutionResult]):
 
                 try:
                     rows, columns = await asyncio.wait_for(
-                        self._execute_query(connector, connection, query, parameters, max_rows),
+                        self._execute_query(
+                            connector, connection, query, parameters, max_rows, plan
+                        ),
                         timeout=timeout,
                     )
                 except asyncio.TimeoutError:
@@ -418,10 +438,13 @@ class SQLExecutor(BaseExecutor[SQLExecutionResult]):
         except Exception as e:
             metrics.complete()
             self._log_error(context, e, "sql")
+            # Scrubbed and without `cause`: a database error raised while running
+            # the expanded batch may name the procedure or its temp table, and
+            # the caller (often an LLM) must only ever see the object's name.
             raise SQLExecutionError(
-                f"SQL execution failed: {e}",
+                f"SQL execution failed: {sanitize(str(e), plan)}",
                 query=query,
-                cause=e,
+                cause=e if plan is None or plan.noop else None,
             )
 
     async def _get_connection(self, connection_id: str | None) -> tuple[Any, Any]:
@@ -477,13 +500,19 @@ class SQLExecutor(BaseExecutor[SQLExecutionResult]):
         query: str,
         parameters: dict[str, Any] | None,
         max_rows: int,
+        plan: ExpansionPlan | None = None,
     ) -> tuple[list[dict[str, Any]], list[ColumnInfo]]:
         """Execute query via the connector's database-agnostic interface.
 
         Uses connector.execute() which returns a unified QueryResult
         regardless of database type (PostgreSQL, MySQL, MSSQL, etc.).
         """
-        result = await connector.execute(connection, query, parameters)
+        if plan is None or plan.noop:
+            result = await connector.execute(connection, query, parameters)
+        else:
+            result = await execute_plan(
+                connector, connection, plan, original_sql=query, parameters=parameters
+            )
 
         if not result.rows:
             columns = [

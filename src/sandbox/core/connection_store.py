@@ -313,6 +313,15 @@ def migrate_from_json() -> int:
 
 
 def init_connection_store() -> None:
-    """Initialize the connection store: create table + migrate from JSON."""
+    """Initialize the connection store: create tables + migrate from JSON."""
     ensure_connections_table()
     migrate_from_json()
+
+    from sandbox.core.virtual_object_store import ensure_virtual_objects_table
+
+    try:
+        ensure_virtual_objects_table()
+    except Exception as e:
+        # Virtual objects are additive; a failure here must not take the
+        # connection store (and with it every query) down.
+        logger.error("virtual_objects_table_init_failed", error=str(e))

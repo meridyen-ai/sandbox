@@ -32,6 +32,7 @@ Meridyen Sandbox is a **secure code execution engine** that runs SQL queries and
 - **Secure Python execution** — RestrictedPython with resource limits and process isolation
 - **SQL injection prevention** — Parameterized queries and query validation
 - **Data masking** — Configurable sensitive column masking
+- **Views, custom queries and stored procedures as tables** — views are listed separately; admins can define [virtual objects](docs/virtual-objects.md) (a custom `SELECT`, a SQL Server procedure, a Postgres set-returning function) that any SQL can query by name, with no write permission or `CREATE VIEW` needed on the database
 - **Three deployment modes** — Cloud, Hybrid (client infra + cloud LLM), Air-gapped (fully on-premise)
 - **gRPC + REST APIs** — High-performance communication
 - **Pluggable authentication** — Static keys, remote HTTP validation, or custom providers

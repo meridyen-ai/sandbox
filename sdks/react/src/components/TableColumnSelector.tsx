@@ -1,8 +1,12 @@
 /**
- * Table and Column Selector Component
+ * Table and Column Selector — an object explorer for choosing which relations
+ * and columns a connection exposes.
  *
- * Provides a UI for selecting which tables and columns should be
- * synced to the host platform via the schema sync API.
+ * Laid out like a database IDE's object explorer: the connection, then one
+ * folder per kind of relation — Tables, Views, Stored Procedures, Custom
+ * Queries — each with its own count, loaded lazily and selectable as a whole.
+ * Every kind behaves the same once selected (columns, samples, SQL); the
+ * folders only make the difference visible.
  */
 
 import React, { useState, useEffect, useMemo, useRef } from 'react'
@@ -20,10 +24,17 @@ import {
   MinusSquare,
   ArrowLeft,
   RefreshCw,
-  Folder,
   X,
+  Eye,
+  Workflow,
+  FileCode2,
+  Plus,
+  Pencil,
+  ListChecks,
 } from 'lucide-react'
 import { useSandboxApi, useSandboxTranslation } from '../context/SandboxUIContext'
+import { TABLE_KINDS, normalizeTableKind } from '../context/types'
+import type { TableKind } from '../context/types'
 import type { TableWithColumns, SelectedSchema, SchemaData } from '../types'
 
 /**
@@ -31,8 +42,8 @@ import type { TableWithColumns, SelectedSchema, SchemaData } from '../types'
  * with hosts that localized this component before it spoke `t()` itself.
  *
  * Prefer passing a `t` to `<SandboxUIProvider>`: it covers the whole component
- * rather than these twelve strings. Anything set here still wins over `t()`,
- * and anything left out falls through to `t()` — so the two can be mixed.
+ * rather than these strings. Anything set here still wins over `t()`, and
+ * anything left out falls through to `t()` — so the two can be mixed.
  */
 export interface TableColumnSelectorLabels {
   /**
@@ -75,41 +86,56 @@ interface TableColumnSelectorProps {
    * until the user saves.
    */
   onRemoveMissingTables?: (tableKeys: string[]) => Promise<void>
+  /**
+   * Offer "add a custom SQL query" / "add a stored procedure" on their folders.
+   * The host owns the editor; after it saves, remount this component (change
+   * its `key`) so the new object is listed.
+   */
+  onAddCustomQuery?: () => void
+  onAddProcedure?: () => void
+  /** Offer "Edit definition" on custom queries and procedures. */
+  onEditVirtualObject?: (table: VirtualObjectRef) => void
 }
 
-interface SchemaGroup {
+/** A custom query / stored procedure row, as handed to `onEditVirtualObject`. */
+export interface VirtualObjectRef {
   schemaName: string
-  tables: TableWithColumns[]
+  tableName: string
+  fullName: string
+  kind: TableKind
 }
 
-interface DatabaseGroup {
-  databaseName: string
-  schemas: SchemaGroup[]
+const KIND_ICONS: Record<TableKind, React.ComponentType<{ className?: string }>> = {
+  TABLE: Table2,
+  VIEW: Eye,
+  PROCEDURE: Workflow,
+  QUERY: FileCode2,
 }
 
-type TabType = 'all' | 'selected'
+const KIND_ICON_CLASS: Record<TableKind, string> = {
+  TABLE: 'text-sky-600 dark:text-sky-400',
+  VIEW: 'text-teal-600 dark:text-teal-400',
+  PROCEDURE: 'text-violet-600 dark:text-violet-400',
+  QUERY: 'text-amber-600 dark:text-amber-400',
+}
 
 /** How many columns the right-hand panel lists before "show all". */
-const COLUMN_PREVIEW_COUNT = 20
+const COLUMN_PREVIEW_COUNT = 200
 
-/** How many tables the tree lists before "show all". */
-const TABLE_PREVIEW_COUNT = 50
+/** Rows a folder shows (non-paginated) or fetches first (paginated). */
+const FOLDER_PAGE = 100
 
-/**
- * How many more the paginated list fetches per "show more".
- *
- * Larger than the first page on purpose: the first page is what the user waits
- * for, so it stays small, but 645 tables at 50 a click is thirteen clicks.
- * Capped at 200 by the server.
- */
-const TABLE_PAGE_MORE = 150
+/** Rows each further "load more" fetches. Capped at 200 by the server. */
+const FOLDER_PAGE_MORE = 200
+
+const kindOf = (t: { table_type?: string }) => normalizeTableKind(t.table_type)
 
 function schemaDataToTableWithColumns(data: SchemaData): TableWithColumns[] {
   const schemaName = data.schema || 'public'
   return data.tables.map((table) => ({
     schema_name: schemaName,
     table_name: table.name,
-    table_type: 'table',
+    table_type: table.type || 'TABLE',
     full_name: `${schemaName}.${table.name}`,
     columns: table.columns.map((col) => ({
       name: col.name,
@@ -118,6 +144,8 @@ function schemaDataToTableWithColumns(data: SchemaData): TableWithColumns[] {
       default_value: null,
       sample_data: null,
     })),
+    column_count: table.columns.length,
+    columns_loaded: true,
   }))
 }
 
@@ -148,6 +176,30 @@ function normalizeSchema(raw: Record<string, unknown>): SelectedSchema {
   return out
 }
 
+type SelectionState = 'all' | 'some' | 'none'
+
+const CheckIcon: React.FC<{ state: SelectionState; className?: string }> = ({ state, className = 'w-3.5 h-3.5' }) =>
+  state === 'all' ? (
+    <CheckSquare className={`${className} text-blue-600 dark:text-blue-400`} />
+  ) : state === 'some' ? (
+    <MinusSquare className={`${className} text-blue-600 dark:text-blue-400`} />
+  ) : (
+    <Square className={`${className} text-gray-400 dark:text-gray-500`} />
+  )
+
+interface FolderMeta {
+  total: number
+  loading: boolean
+  loaded: boolean
+}
+
+const emptyFolders = (): Record<TableKind, FolderMeta> => ({
+  TABLE: { total: 0, loading: false, loaded: false },
+  VIEW: { total: 0, loading: false, loaded: false },
+  PROCEDURE: { total: 0, loading: false, loaded: false },
+  QUERY: { total: 0, loading: false, loaded: false },
+})
+
 export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
   connectionId,
   connectionName,
@@ -157,6 +209,9 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
   loading: externalLoading,
   labels,
   onRemoveMissingTables,
+  onAddCustomQuery,
+  onAddProcedure,
+  onEditVirtualObject,
 }) => {
   const api = useSandboxApi()
   const { t } = useSandboxTranslation()
@@ -165,103 +220,83 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
   const [error, setError] = useState<string | null>(null)
   const [searchQuery, setSearchQuery] = useState('')
   const [columnSearchQuery, setColumnSearchQuery] = useState('')
-  const [expandedDatabases, setExpandedDatabases] = useState<Set<string>>(
-    new Set()
-  )
-  const [expandedSchemas, setExpandedSchemas] = useState<Set<string>>(
-    new Set()
-  )
-  const [selectedTable, setSelectedTable] = useState<TableWithColumns | null>(
-    null
-  )
+  const [selectedTable, setSelectedTable] = useState<TableWithColumns | null>(null)
   const [selectedSchema, setSelectedSchema] = useState<SelectedSchema>(
     initialSelectedSchema ? normalizeSchema(initialSelectedSchema) : {}
   )
-  const [activeTab, setActiveTab] = useState<TabType>('all')
   const [refreshing, setRefreshing] = useState(false)
   const [showAllColumns, setShowAllColumns] = useState(false)
-  const [showAllTables, setShowAllTables] = useState(false)
+
+  // Explorer state: which folders are open, which kinds are shown, and whether
+  // only the current selection is listed.
+  const [expandedDb, setExpandedDb] = useState(true)
+  const [expandedFolders, setExpandedFolders] = useState<Set<TableKind>>(new Set(['TABLE']))
+  const [hiddenKinds, setHiddenKinds] = useState<Set<TableKind>>(new Set())
+  const [selectedOnly, setSelectedOnly] = useState(false)
+  // Non-paginated folders cap how many rows they draw until asked for more.
+  const [expandedFolderLimits, setExpandedFolderLimits] = useState<Set<TableKind>>(new Set())
 
   /**
    * Server-side pagination, when the host offers it.
    *
    * Without it this component asks for the whole schema up front — every table
-   * with every column — and then draws fifty rows. On a few hundred tables that
-   * is megabytes fetched to render a list. With it, `schema` holds only the
-   * pages actually loaded, each table's `columns` stays empty until the table is
-   * opened, and search and the Selected tab are resolved by the server.
+   * with every column. With it, each folder fetches its own kind a page at a
+   * time when opened, each table's `columns` stays empty until it is opened,
+   * and search and the selected-only filter are resolved by the server.
    */
   const paginated = Boolean(api.schema.listTables)
-  const [serverTotal, setServerTotal] = useState(0)
-  // How many tables the connection has in total. `serverTotal` is the size of
-  // whatever query is on screen — on the Selected tab that is the selection,
-  // which would make the "x/y" counter read y/y.
+  const [folders, setFolders] = useState<Record<TableKind, FolderMeta>>(emptyFolders)
+  const [serverTypeCounts, setServerTypeCounts] = useState<Partial<Record<TableKind, number>>>({})
+  // How many relations the connection has in total, independent of filters.
   const [serverTableTotal, setServerTableTotal] = useState(0)
   const [serverMissing, setServerMissing] = useState<string[]>([])
-  const [loadingMore, setLoadingMore] = useState(false)
-  // Tables whose columns are being fetched right now, so the right-hand panel
-  // can say "loading" instead of showing a real table as having no columns.
+  // Tables whose columns are being fetched right now.
   const [loadingColumns, setLoadingColumns] = useState<Set<string>>(new Set())
-  const [syncPhase, setSyncPhase] = useState<string | null>(null)
   const [syncRunning, setSyncRunning] = useState(false)
   const [syncProgress, setSyncProgress] = useState<{ done: number; total: number } | null>(null)
   // Debounced copy of searchQuery — every keystroke must not be a request.
   const [committedSearch, setCommittedSearch] = useState('')
-  // The first page is fetched by loadSchema; the search/tab effect must not
-  // fire a second request for the same empty query on mount. A ref rather than
-  // the `loading` flag, so a search typed during that first fetch is not
-  // silently dropped.
-  const firstPageRequested = useRef(false)
+  const firstLoadDone = useRef(false)
+  // Filters of the request in flight; a response for stale filters is dropped.
+  const requestKey = useRef('')
 
-  // Collapse back to the preview whenever a different table is opened — an
-  // expanded 300-column list should not carry over to the next table.
   useEffect(() => {
     setShowAllColumns(false)
+    setColumnSearchQuery('')
   }, [selectedTable?.full_name])
-
-  // Likewise, a new search or tab starts from the short list.
-  useEffect(() => {
-    setShowAllTables(false)
-  }, [searchQuery, activeTab])
 
   useEffect(() => {
     loadSchema()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connectionId])
 
-  // Debounce the search box before it becomes a request.
   useEffect(() => {
     if (!paginated) return
     const id = setTimeout(() => setCommittedSearch(searchQuery), 250)
     return () => clearTimeout(id)
   }, [searchQuery, paginated])
 
-  // Search and tab are resolved server-side, so each is a fresh first page.
+  // Search and the selected-only filter are resolved server-side: start over.
   useEffect(() => {
-    if (!paginated) return
-    if (!firstPageRequested.current) {
-      firstPageRequested.current = true
-      return
-    }
-    void loadTablePage(0, true)
+    if (!paginated || !firstLoadDone.current) return
+    void reloadFolders()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [committedSearch, activeTab])
+  }, [committedSearch, selectedOnly])
 
   /**
-   * A sync that is still filling the cache. The catalog phase lands first, so
-   * the table list is already worth drawing while columns are still arriving —
-   * poll until it settles rather than holding a spinner over the whole thing.
+   * A sync still filling the cache. The catalog lands first, so the list is
+   * already worth drawing while columns are still arriving — poll until it
+   * settles rather than holding a spinner over the whole thing.
    */
   useEffect(() => {
     if (!paginated || !api.schema.status || !syncRunning) return
     const id = setInterval(async () => {
       try {
         const st = await api.schema.status!(connectionId)
-        setSyncPhase(st.sync_phase ?? st.sync_status)
         setSyncProgress({ done: st.tables_done ?? 0, total: st.tables_total ?? 0 })
         if (!st.in_progress) {
-          // Finished (or died). Either way, stop polling and show what landed.
           setSyncRunning(false)
-          void loadTablePage(0, true)
+          void reloadFolders()
         }
       } catch {
         // A failed poll is not worth surfacing; the next one may succeed.
@@ -271,134 +306,151 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [paginated, syncRunning, connectionId])
 
-  const tableSummaryToRow = (t: {
+  const tableSummaryToRow = (row: {
     schema_name: string
     table_name: string
     full_name: string
     table_type: string
     column_count: number
   }): TableWithColumns => ({
-    schema_name: t.schema_name,
-    table_name: t.table_name,
-    table_type: t.table_type,
-    full_name: t.full_name,
+    schema_name: row.schema_name,
+    table_name: row.table_name,
+    table_type: row.table_type,
+    full_name: row.full_name,
     columns: [],
-    column_count: t.column_count,
+    column_count: row.column_count,
     columns_loaded: false,
   })
 
-  const loadTablePage = async (offset: number, replace: boolean) => {
-    if (!api.schema.listTables) return
-    firstPageRequested.current = true
-    if (replace) {
-      setLoading(true)
-    } else {
-      setLoadingMore(true)
-    }
+  const filterKey = () => `${committedSearch}\u0000${selectedOnly}`
+
+  /** Fetch one page of one folder. Returns the per-kind counts it reported. */
+  const loadFolder = async (
+    kind: TableKind,
+    offset: number
+  ): Promise<Partial<Record<TableKind, number>> | null> => {
+    if (!api.schema.listTables) return null
+    const key = filterKey()
+    setFolders((prev) => ({ ...prev, [kind]: { ...prev[kind], loading: true } }))
     try {
       const page = await api.schema.listTables(connectionId, {
         search: committedSearch || undefined,
         offset,
-        limit: replace ? TABLE_PREVIEW_COUNT : TABLE_PAGE_MORE,
-        selectedOnly: activeTab === 'selected',
+        limit: offset === 0 ? FOLDER_PAGE : FOLDER_PAGE_MORE,
+        selectedOnly,
+        types: [kind],
       })
+      if (key !== requestKey.current) return null // filters changed meanwhile
       const rows = page.tables.map(tableSummaryToRow)
-      setServerTotal(page.total)
-      if (activeTab === 'all' && !committedSearch) setServerTableTotal(page.total)
-      if (page.sync_phase) setSyncPhase(page.sync_phase)
-      // Only a sync that is actually running earns a progress banner. A cache
-      // left mid-phase by a crash or a restart is not "in progress", and
-      // keying off the phase alone would show the banner forever.
+      setFolders((prev) => ({ ...prev, [kind]: { total: page.total, loading: false, loaded: true } }))
+      if (page.type_counts) {
+        setServerTypeCounts(page.type_counts)
+        if (!committedSearch && !selectedOnly) {
+          setServerTableTotal(
+            TABLE_KINDS.reduce((sum, k) => sum + (page.type_counts?.[k] || 0), 0)
+          )
+        }
+      }
       setSyncRunning(Boolean(page.in_progress))
       if (page.tables_total !== undefined) {
         setSyncProgress({ done: page.tables_done ?? 0, total: page.tables_total })
       }
-      if (offset === 0 && Array.isArray((page as { missing_selections?: string[] }).missing_selections)) {
-        setServerMissing((page as { missing_selections?: string[] }).missing_selections!)
+      if (offset === 0 && Array.isArray(page.missing_selections)) {
+        setServerMissing(page.missing_selections)
       }
       setSchema((prev) => {
-        if (replace) return rows
-        // Appending a page: keep whatever columns are already loaded.
-        const byName = new Map(prev.map((t) => [t.full_name, t]))
-        rows.forEach((r) => {
-          if (!byName.has(r.full_name)) byName.set(r.full_name, r)
+        const byName = new Map(prev.map((row) => [row.full_name, row]))
+        rows.forEach((row) => {
+          if (!byName.has(row.full_name)) byName.set(row.full_name, row)
         })
         return Array.from(byName.values())
       })
-      if (replace && rows.length > 0) {
-        const dbName = connectionName
-        setExpandedDatabases(new Set([dbName]))
-        setExpandedSchemas(new Set([`${dbName}.${rows[0].schema_name}`]))
-        setSelectedTable((cur) =>
-          cur && rows.some((r) => r.full_name === cur.full_name) ? cur : rows[0]
-        )
-        void ensureColumns([rows[0]])
-      }
       setError(null)
+      return page.type_counts ?? null
     } catch (err) {
-      setError(
-        err instanceof Error ? err.message : t('tableSelector.errors.schemaLoadFailed')
+      setFolders((prev) => ({ ...prev, [kind]: { ...prev[kind], loading: false } }))
+      setError(err instanceof Error ? err.message : t('tableSelector.errors.schemaLoadFailed'))
+      return null
+    }
+  }
+
+  /** Start the explorer over for the current filters. */
+  const reloadFolders = async () => {
+    requestKey.current = filterKey()
+    setSchema([])
+    setFolders(emptyFolders())
+    setLoading(!firstLoadDone.current)
+    try {
+      // The first folder also reports every kind's count, which decides what
+      // opens by default: the first kind that has anything in it.
+      const counts = await loadFolder('TABLE', 0)
+      let open = expandedFolders
+      if (!firstLoadDone.current && counts) {
+        const first = TABLE_KINDS.find((k) => (counts[k] || 0) > 0)
+        open = new Set(first ? [first] : ['TABLE'])
+        setExpandedFolders(open)
+      }
+      await Promise.all(
+        Array.from(open)
+          .filter((k) => k !== 'TABLE')
+          .map((k) => loadFolder(k, 0))
       )
     } finally {
+      firstLoadDone.current = true
       setLoading(false)
-      setLoadingMore(false)
     }
   }
 
   /**
    * Make sure these tables have their columns loaded, and hand them back.
-   *
-   * The paginated list carries names only, but selecting a table means
-   * selecting its columns by name — so anything that toggles a checkbox has to
-   * come through here first. Batched at 25, the server's per-request cap.
+   * Batched at 25, the server's per-request cap.
    */
-  const ensureColumns = async (
-    tables: TableWithColumns[]
-  ): Promise<TableWithColumns[]> => {
+  const ensureColumns = async (tables: TableWithColumns[]): Promise<TableWithColumns[]> => {
     if (!paginated || !api.schema.getTableColumns) return tables
-    const cold = tables.filter((t) => !t.columns_loaded)
+    const cold = tables.filter((row) => !row.columns_loaded)
     if (cold.length === 0) return tables
 
     setLoadingColumns((prev) => {
       const next = new Set(prev)
-      cold.forEach((t) => next.add(t.full_name))
+      cold.forEach((row) => next.add(row.full_name))
       return next
     })
 
     const loaded = new Map<string, TableWithColumns>()
     try {
-    for (let i = 0; i < cold.length; i += 25) {
-      const batch = cold.slice(i, i + 25)
-      try {
-        const fetched = await api.schema.getTableColumns(
-          connectionId,
-          batch.map((t) => t.full_name)
-        )
-        fetched.forEach((f) =>
-          loaded.set(f.full_name, {
-            ...f,
-            column_count: f.columns.length,
-            columns_loaded: true,
+      for (let i = 0; i < cold.length; i += 25) {
+        const batch = cold.slice(i, i + 25)
+        try {
+          const fetched = await api.schema.getTableColumns(
+            connectionId,
+            batch.map((row) => row.full_name)
+          )
+          fetched.forEach((f) => {
+            const known = batch.find((b) => b.full_name === f.full_name)
+            loaded.set(f.full_name, {
+              ...f,
+              // The columns endpoint does not know the kind; keep the list's.
+              table_type: known?.table_type ?? f.table_type,
+              column_count: f.columns.length,
+              columns_loaded: true,
+            })
           })
-        )
-      } catch (err) {
-        setError(
-          err instanceof Error ? err.message : t('tableSelector.errors.schemaLoadFailed')
-        )
+        } catch (err) {
+          setError(err instanceof Error ? err.message : t('tableSelector.errors.schemaLoadFailed'))
+        }
       }
-    }
     } finally {
       setLoadingColumns((prev) => {
         const next = new Set(prev)
-        cold.forEach((t) => next.delete(t.full_name))
+        cold.forEach((row) => next.delete(row.full_name))
         return next
       })
     }
     if (loaded.size === 0) return tables
 
-    setSchema((prev) => prev.map((t) => loaded.get(t.full_name) ?? t))
+    setSchema((prev) => prev.map((row) => loaded.get(row.full_name) ?? row))
     setSelectedTable((cur) => (cur ? loaded.get(cur.full_name) ?? cur : cur))
-    return tables.map((t) => loaded.get(t.full_name) ?? t)
+    return tables.map((row) => loaded.get(row.full_name) ?? row)
   }
 
   const openTable = (table: TableWithColumns) => {
@@ -406,22 +458,32 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
     void ensureColumns([table])
   }
 
+  // Open the first listed relation once there is something to show.
+  useEffect(() => {
+    if (selectedTable || schema.length === 0) return
+    const first = [...schema].sort(
+      (a, b) =>
+        TABLE_KINDS.indexOf(kindOf(a)) - TABLE_KINDS.indexOf(kindOf(b)) ||
+        a.table_name.localeCompare(b.table_name)
+    )[0]
+    if (first) openTable(first)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [schema, selectedTable])
+
   const loadSchema = async (forceRefresh?: boolean) => {
     if (paginated) {
       if (forceRefresh) {
         setRefreshing(true)
         try {
-          // Re-introspect first, then re-read the (now fresh) first page.
+          // Re-introspect first, then re-read the (now fresh) folders.
           await api.schema.sync(connectionId, false, 10, true)
         } catch (err) {
-          setError(
-            err instanceof Error ? err.message : t('tableSelector.errors.schemaLoadFailed')
-          )
+          setError(err instanceof Error ? err.message : t('tableSelector.errors.schemaLoadFailed'))
         } finally {
           setRefreshing(false)
         }
       }
-      await loadTablePage(0, true)
+      await reloadFolders()
       return
     }
 
@@ -435,199 +497,147 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
       const schemaData = await api.schema.sync(connectionId, true, 10, forceRefresh)
       const data = schemaDataToTableWithColumns(schemaData)
       setSchema(data)
-
-      if (
-        !initialSelectedSchema ||
-        Object.keys(initialSelectedSchema).length === 0
-      ) {
+      if (!initialSelectedSchema || Object.keys(initialSelectedSchema).length === 0) {
         const defaultSelection: SelectedSchema = {}
         data.forEach((table) => {
-          defaultSelection[table.full_name] = {
-            selected: false,
-            columns: [],
-          }
+          defaultSelection[table.full_name] = { selected: false, columns: [] }
         })
         setSelectedSchema(defaultSelection)
       }
-
-      if (data.length > 0) {
-        const firstTable = data[0]
-        const dbName = connectionName
-        const schemaKey = `${dbName}.${firstTable.schema_name}`
-        setExpandedDatabases(new Set([dbName]))
-        setExpandedSchemas(new Set([schemaKey]))
-        setSelectedTable(firstTable)
-      }
+      const first = TABLE_KINDS.find((k) => data.some((row) => kindOf(row) === k))
+      if (first) setExpandedFolders(new Set([first]))
     } catch (err) {
-      setError(
-        err instanceof Error
-          ? err.message
-          : t('tableSelector.errors.schemaLoadFailed')
-      )
+      setError(err instanceof Error ? err.message : t('tableSelector.errors.schemaLoadFailed'))
     } finally {
+      firstLoadDone.current = true
       setLoading(false)
       setRefreshing(false)
     }
   }
 
   /** Total column count for a table, whether or not its columns are loaded. */
-  const columnTotal = (table: TableWithColumns) =>
-    table.column_count ?? table.columns.length
+  const columnTotal = (table: TableWithColumns) => table.column_count ?? table.columns.length
 
-  const tablesWithSelections = useMemo(() => {
-    // In paginated mode the server answered the "selected" question already —
-    // `schema` IS the selected page — and columns are not loaded to count.
-    if (paginated) return schema
-    return schema.filter((table) => {
-      const selection = selectedSchema[table.full_name]
-      return selection && selection.columns.length > 0
-    })
-  }, [schema, selectedSchema, paginated])
+  const isSelected = (table: TableWithColumns) =>
+    (selectedSchema[table.full_name]?.columns.length || 0) > 0
 
-  const groupedTables = useMemo((): DatabaseGroup[] => {
-    const schemaMap = new Map<string, TableWithColumns[]>()
-
-    const baseTables =
-      activeTab === 'selected' ? tablesWithSelections : schema
-
-    const filteredSchema = searchQuery && !paginated
-      ? baseTables.filter(
-          (table) =>
-            table.table_name
-              .toLowerCase()
-              .includes(searchQuery.toLowerCase()) ||
-            table.schema_name
-              .toLowerCase()
-              .includes(searchQuery.toLowerCase())
-        )
-      : baseTables
-
-    filteredSchema.forEach((table) => {
-      const key = table.schema_name || 'public'
-      if (!schemaMap.has(key)) {
-        schemaMap.set(key, [])
+  /**
+   * Relations of each folder as the tree draws them. Paginated: the server
+   * already applied search and selected-only. Otherwise filtered here.
+   */
+  const rowsByKind = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase()
+    const out: Record<TableKind, TableWithColumns[]> = { TABLE: [], VIEW: [], PROCEDURE: [], QUERY: [] }
+    schema.forEach((row) => {
+      if (!paginated) {
+        if (selectedOnly && !isSelected(row)) return
+        if (q && !row.table_name.toLowerCase().includes(q) && !row.schema_name.toLowerCase().includes(q)) {
+          return
+        }
       }
-      schemaMap.get(key)!.push(table)
+      out[kindOf(row)].push(row)
     })
-
-    const schemas: SchemaGroup[] = Array.from(schemaMap.entries()).map(
-      ([schemaName, tables]) => ({
-        schemaName,
-        tables: tables.sort((a, b) =>
-          a.table_name.localeCompare(b.table_name)
-        ),
-      })
+    TABLE_KINDS.forEach((k) =>
+      out[k].sort(
+        (a, b) => a.schema_name.localeCompare(b.schema_name) || a.table_name.localeCompare(b.table_name)
+      )
     )
+    return out
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [schema, searchQuery, selectedOnly, paginated, selectedSchema])
 
-    return [
-      {
-        databaseName: connectionName,
-        schemas: schemas.sort((a, b) =>
-          a.schemaName.localeCompare(b.schemaName)
-        ),
-      },
-    ]
-  }, [schema, connectionName, searchQuery, activeTab, tablesWithSelections, paginated])
+  /** How many relations each folder holds under the current filters. */
+  const folderTotal = (kind: TableKind): number => {
+    if (!paginated) return rowsByKind[kind].length
+    // Before a folder has been opened, the counts come from any response.
+    return folders[kind].loaded ? folders[kind].total : serverTypeCounts[kind] || 0
+  }
 
-  /**
-   * The tables the tree is actually showing right now — already narrowed by the
-   * active tab and the search box. Bulk actions work on exactly this set: a
-   * "select all" that also picked up tables filtered out by the user's search
-   * would be a trap, since nothing on screen would show what it did.
-   */
+  /** Per-kind totals for the filter toggles (ignoring the kind toggles themselves). */
+  const kindTotals = useMemo((): Record<TableKind, number> => {
+    const out = { TABLE: 0, VIEW: 0, PROCEDURE: 0, QUERY: 0 } as Record<TableKind, number>
+    TABLE_KINDS.forEach((k) => {
+      out[k] = paginated ? serverTypeCounts[k] || 0 : rowsByKind[k].length
+    })
+    return out
+  }, [paginated, serverTypeCounts, rowsByKind])
+
+  // A folder is worth drawing when it has something, or when it is where new
+  // objects of its kind are added.
+  const addHandler = (kind: TableKind): (() => void) | undefined =>
+    kind === 'PROCEDURE' ? onAddProcedure : kind === 'QUERY' ? onAddCustomQuery : undefined
+  const visibleFolders = TABLE_KINDS.filter(
+    (k) => !hiddenKinds.has(k) && (folderTotal(k) > 0 || Boolean(addHandler(k)))
+  )
+
+  /** Rows the tree actually shows (open folders, loaded rows, caps applied). */
+  const folderRows = (kind: TableKind): TableWithColumns[] => {
+    const rows = rowsByKind[kind]
+    if (paginated || expandedFolderLimits.has(kind)) return rows
+    return rows.slice(0, FOLDER_PAGE)
+  }
+
+  /** Every row bulk actions apply to: whatever the open folders list. */
   const visibleTables = useMemo(
-    () => groupedTables.flatMap((db) => db.schemas.flatMap((s) => s.tables)),
-    [groupedTables]
+    () => visibleFolders.filter((k) => expandedFolders.has(k)).flatMap((k) => rowsByKind[k]),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [rowsByKind, expandedFolders, hiddenKinds, schema]
   )
 
-  /**
-   * Keys of the tables the tree actually renders. Capped until the user asks
-   * for the rest — a few hundred rows is a scroll, not a browse. Bulk
-   * select/clear deliberately stay on the whole filtered set (`visibleTables`),
-   * because "search, then select all" should act on the search, not on however
-   * many rows happen to be painted.
-   */
-  const renderedTableKeys = useMemo(() => {
-    // Paginated mode never caps: every row in `schema` was fetched because the
-    // user asked for it, so hiding some of them again would be perverse.
-    if (paginated) return null
-    if (showAllTables || visibleTables.length <= TABLE_PREVIEW_COUNT) return null
-    return new Set(
-      visibleTables.slice(0, TABLE_PREVIEW_COUNT).map((t) => t.full_name)
-    )
-  }, [visibleTables, showAllTables, paginated])
+  const selectionStateOf = (table: TableWithColumns): SelectionState => {
+    const selection = selectedSchema[table.full_name]
+    if (!selection || selection.columns.length === 0) return 'none'
+    if (selection.columns.length >= columnTotal(table)) return 'all'
+    return 'some'
+  }
 
-  const visibleAllSelected = useMemo(
-    () =>
-      visibleTables.length > 0 &&
-      visibleTables.every(
-        (table) =>
-          (selectedSchema[table.full_name]?.columns.length || 0) ===
-          columnTotal(table)
-      ),
-    [visibleTables, selectedSchema]
-  )
+  const groupState = (tables: TableWithColumns[]): SelectionState => {
+    if (tables.length === 0) return 'none'
+    const states = tables.map(selectionStateOf)
+    if (states.every((s) => s === 'all')) return 'all'
+    if (states.some((s) => s !== 'none')) return 'some'
+    return 'none'
+  }
 
-  const visibleAnySelected = useMemo(
-    () =>
-      visibleTables.some(
-        (table) => (selectedSchema[table.full_name]?.columns.length || 0) > 0
-      ),
-    [visibleTables, selectedSchema]
-  )
-
-  const handleSelectAllVisible = async () => {
-    // Selecting a table means selecting its columns by name, so the ones on
-    // screen have to be fetched before they can be ticked. Bounded by the page
-    // size, not by the size of the database.
-    const tables = await ensureColumns(visibleTables)
+  const selectTables = async (tables: TableWithColumns[]) => {
+    // Selecting a table means selecting its columns by name, so they have to
+    // be fetched first. Bounded by what is loaded, not by the database.
+    const withCols = await ensureColumns(tables)
     setSelectedSchema((prev) => {
       const next = { ...prev }
-      tables.forEach((table) => {
-        next[table.full_name] = {
-          selected: true,
-          columns: table.columns.map((c) => c.name),
-        }
+      withCols.forEach((table) => {
+        next[table.full_name] = { selected: true, columns: table.columns.map((c) => c.name) }
       })
       return next
     })
   }
 
-  const handleClearVisible = () => {
+  const clearTables = (tables: TableWithColumns[]) => {
     setSelectedSchema((prev) => {
       const next = { ...prev }
-      visibleTables.forEach((table) => {
+      tables.forEach((table) => {
         next[table.full_name] = { selected: false, columns: [] }
       })
       return next
     })
   }
 
+  const toggleGroup = (tables: TableWithColumns[]) =>
+    groupState(tables) === 'all' ? clearTables(tables) : void selectTables(tables)
+
   /**
-   * Selections pointing at tables the database no longer has — typically a view
-   * that was dropped and recreated under another name.
-   *
-   * These used to be invisible: the tree only lists tables present in the live
-   * schema, so a stale entry could not be seen or removed, yet it still rode
-   * along in every save and was handed to the AI as a queryable table. Surfacing
-   * them is the only way the user can clear them.
-   *
-   * Only meaningful once a schema has actually loaded — against an empty schema
-   * every selection would look missing.
+   * Selections pointing at relations the database no longer has — typically a
+   * view that was dropped and recreated under another name. They are shown so
+   * the user can clear them; left alone they would still be handed to the AI.
    */
   const missingSelections = useMemo(() => {
-    // Paginated mode holds one page, so it cannot tell "not on this page" from
-    // "not in the database". The server diffs the whole cache for us.
     if (paginated) return serverMissing
     if (schema.length === 0) return []
-    const known = new Set(schema.map((t) => t.full_name))
+    const known = new Set(schema.map((row) => row.full_name))
     return Object.entries(selectedSchema)
       .filter(
         ([key, sel]) =>
-          !key.startsWith('_') &&
-          sel?.selected &&
-          (sel.columns?.length || 0) > 0 &&
-          !known.has(key)
+          !key.startsWith('_') && sel?.selected && (sel.columns?.length || 0) > 0 && !known.has(key)
       )
       .map(([key]) => key)
       .sort((a, b) => a.localeCompare(b))
@@ -636,15 +646,13 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
   /**
    * Whether this connection arrived with a selection. Saving an empty selection
    * is meaningless when creating a connection, but it is exactly what removing
-   * the last stale table means when editing one — so the "pick something first"
-   * guard must not apply there.
+   * the last stale table means when editing one.
    */
   const hadInitialSelection = useMemo(
     () =>
       Object.entries(initialSelectedSchema || {}).some(
         ([key, value]) =>
-          !key.startsWith('_') &&
-          Boolean((value as { selected?: boolean } | undefined)?.selected)
+          !key.startsWith('_') && Boolean((value as { selected?: boolean } | undefined)?.selected)
       ),
     [initialSelectedSchema]
   )
@@ -664,17 +672,13 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
       try {
         await onRemoveMissingTables(keys)
       } catch (err) {
-        setRemoveError(
-          err instanceof Error ? err.message : t('tableSelector.errors.removeFailed')
-        )
+        setRemoveError(err instanceof Error ? err.message : t('tableSelector.errors.removeFailed'))
         setRemoving(false)
         return
       }
       setRemoving(false)
     }
 
-    // Drop them locally too, whether they were persisted just now or will be
-    // written with the rest of the selection on save.
     setSelectedSchema((prev) => {
       const next = { ...prev }
       keys.forEach((key) => delete next[key])
@@ -684,168 +688,78 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
   }
 
   const selectionStats = useMemo(() => {
-    const known = new Set(schema.map((t) => t.full_name))
     const entries = Object.entries(selectedSchema).filter(
       ([key, s]) => !key.startsWith('_') && s.selected && s.columns.length > 0
     )
-    const selectedColumns = entries.reduce(
-      (sum, [, s]) => sum + (s.columns?.length || 0),
-      0
-    )
-
-    if (paginated) {
-      // `schema` is one page; the counts describe the connection, so they come
-      // from the server total and from the selection itself, minus the entries
-      // the server told us no longer exist.
-      const gone = new Set(serverMissing)
-      return {
-        totalTables: serverTableTotal || serverTotal,
-        selectedTables: entries.filter(([key]) => !gone.has(key)).length,
-        totalColumns: schema.reduce((sum, t) => sum + columnTotal(t), 0),
-        selectedColumns,
-      }
+    const selectedColumns = entries.reduce((sum, [, s]) => sum + (s.columns?.length || 0), 0)
+    const gone = new Set(missingSelections)
+    return {
+      totalTables: paginated ? serverTableTotal : schema.length,
+      selectedTables: entries.filter(([key]) => !gone.has(key)).length,
+      selectedColumns,
     }
+  }, [schema, selectedSchema, paginated, serverTableTotal, missingSelections])
 
-    const totalTables = schema.length
-    // Count only what the tree can actually show, so the tab badge and the list
-    // below it can never disagree.
-    const selectedTables =
-      schema.length === 0
-        ? entries.length
-        : entries.filter(([key]) => known.has(key)).length
-    const totalColumns = schema.reduce((sum, t) => sum + t.columns.length, 0)
-    return { totalTables, selectedTables, totalColumns, selectedColumns }
-  }, [schema, selectedSchema, paginated, serverTotal, serverTableTotal, serverMissing])
-
-  const toggleDatabase = (dbName: string) => {
-    setExpandedDatabases((prev) => {
+  const toggleFolder = (kind: TableKind) => {
+    setExpandedFolders((prev) => {
       const next = new Set(prev)
-      if (next.has(dbName)) {
-        next.delete(dbName)
+      if (next.has(kind)) {
+        next.delete(kind)
       } else {
-        next.add(dbName)
+        next.add(kind)
+        if (paginated && !folders[kind].loaded && !folders[kind].loading) void loadFolder(kind, 0)
       }
       return next
     })
   }
 
-  const toggleSchema = (schemaKey: string) => {
-    setExpandedSchemas((prev) => {
+  const toggleKindVisible = (kind: TableKind) => {
+    setHiddenKinds((prev) => {
       const next = new Set(prev)
-      if (next.has(schemaKey)) {
-        next.delete(schemaKey)
-      } else {
-        next.add(schemaKey)
-      }
+      if (next.has(kind)) next.delete(kind)
+      else next.add(kind)
       return next
     })
   }
 
   const handleToggleColumn = (columnName: string) => {
     if (!selectedTable) return
-
     setSelectedSchema((prev) => {
       const tableKey = selectedTable.full_name
       const current = prev[tableKey] || { selected: false, columns: [] }
       const columns = current.columns.includes(columnName)
         ? current.columns.filter((c) => c !== columnName)
         : [...current.columns, columnName]
-
-      return {
-        ...prev,
-        [tableKey]: {
-          selected: columns.length > 0,
-          columns,
-        },
-      }
+      return { ...prev, [tableKey]: { selected: columns.length > 0, columns } }
     })
   }
 
   const handleToggleAllColumns = () => {
     if (!selectedTable) return
-
-    const currentSelection = selectedSchema[selectedTable.full_name]
     const allSelected =
-      currentSelection?.columns.length === selectedTable.columns.length
-
-    if (allSelected) {
-      setSelectedSchema((prev) => ({
-        ...prev,
-        [selectedTable.full_name]: {
-          selected: false,
-          columns: [],
-        },
-      }))
-    } else {
-      setSelectedSchema((prev) => ({
-        ...prev,
-        [selectedTable.full_name]: {
-          selected: true,
-          columns: selectedTable.columns.map((c) => c.name),
-        },
-      }))
-    }
+      (selectedSchema[selectedTable.full_name]?.columns.length || 0) >= selectedTable.columns.length &&
+      selectedTable.columns.length > 0
+    setSelectedSchema((prev) => ({
+      ...prev,
+      [selectedTable.full_name]: allSelected
+        ? { selected: false, columns: [] }
+        : { selected: true, columns: selectedTable.columns.map((c) => c.name) },
+    }))
   }
 
-  const handleToggleTableColumns = async (
-    table: TableWithColumns,
-    e: React.MouseEvent
-  ) => {
+  const handleToggleTable = async (table: TableWithColumns, e: React.MouseEvent) => {
     e.stopPropagation()
-
-    const currentSelection = selectedSchema[table.full_name]
-    const allSelected =
-      (currentSelection?.columns.length || 0) === columnTotal(table) &&
-      columnTotal(table) > 0
-
-    if (!allSelected) {
-      // Ticking a table means listing its columns, which in paginated mode are
-      // not loaded until now.
-      ;[table] = await ensureColumns([table])
-    }
-
-    if (allSelected) {
-      setSelectedSchema((prev) => ({
-        ...prev,
-        [table.full_name]: {
-          selected: false,
-          columns: [],
-        },
-      }))
+    if (selectionStateOf(table) === 'all' && columnTotal(table) > 0) {
+      clearTables([table])
     } else {
-      setSelectedSchema((prev) => ({
-        ...prev,
-        [table.full_name]: {
-          selected: true,
-          columns: table.columns.map((c) => c.name),
-        },
-      }))
+      await selectTables([table])
     }
-  }
-
-  const getTableSelectionState = (
-    table: TableWithColumns
-  ): 'all' | 'some' | 'none' => {
-    const selection = selectedSchema[table.full_name]
-    if (!selection || selection.columns.length === 0) return 'none'
-    if (selection.columns.length >= columnTotal(table)) return 'all'
-    return 'some'
-  }
-
-  const getHeaderCheckboxState = (): 'all' | 'some' | 'none' => {
-    if (!selectedTable) return 'none'
-    const selection = selectedSchema[selectedTable.full_name]
-    if (!selection || selection.columns.length === 0) return 'none'
-    if (selection.columns.length >= columnTotal(selectedTable)) return 'all'
-    return 'some'
   }
 
   const handleConfirm = () => {
     const cleanedSchema: SelectedSchema = {}
     Object.entries(selectedSchema).forEach(([key, value]) => {
-      if (value.selected && value.columns.length > 0) {
-        cleanedSchema[key] = value
-      }
+      if (value.selected && value.columns.length > 0) cleanedSchema[key] = value
     })
     onConfirm(cleanedSchema)
   }
@@ -855,45 +769,30 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
     if (!columnSearchQuery) return selectedTable.columns
     const query = columnSearchQuery.toLowerCase()
     return selectedTable.columns.filter(
-      (col) =>
-        col.name.toLowerCase().includes(query) ||
-        col.data_type.toLowerCase().includes(query)
+      (col) => col.name.toLowerCase().includes(query) || col.data_type.toLowerCase().includes(query)
     )
   }, [selectedTable, columnSearchQuery])
 
-  /**
-   * Wide tables (300+ columns) made this list unusable — a wall of rows to
-   * scroll past before reaching anything else. Show a screenful by default and
-   * let the user ask for the rest.
-   */
-  const visibleColumns = showAllColumns
-    ? filteredColumns
-    : filteredColumns.slice(0, COLUMN_PREVIEW_COUNT)
-
+  const visibleColumns = showAllColumns ? filteredColumns : filteredColumns.slice(0, COLUMN_PREVIEW_COUNT)
   const hiddenColumnCount = filteredColumns.length - visibleColumns.length
 
   if (loading) {
     return (
       <div className="flex flex-col items-center justify-center py-20">
-        <Loader2 className="w-10 h-10 animate-spin text-blue-500 mb-4" />
-        <p className="text-gray-500 dark:text-gray-400">
-          {t('tableSelector.loadingSchema')}
-        </p>
+        <Loader2 className="w-8 h-8 animate-spin text-blue-500 mb-3" />
+        <p className="text-sm text-gray-500 dark:text-gray-400">{t('tableSelector.loadingSchema')}</p>
       </div>
     )
   }
 
-  if (error) {
+  if (error && schema.length === 0) {
     return (
       <div className="flex flex-col items-center justify-center py-20">
-        <AlertCircle className="w-10 h-10 text-red-500 mb-4" />
-        <p className="text-red-600 dark:text-red-400 mb-4">{error}</p>
+        <AlertCircle className="w-8 h-8 text-red-500 mb-3" />
+        <p className="text-sm text-red-600 dark:text-red-400 mb-4">{error}</p>
         <button
-          // Not `onClick={loadSchema}`: that handed the click event to the
-          // forceRefresh parameter, which broke the dts build (and only
-          // happened to do the right thing because an event object is truthy).
           onClick={() => loadSchema(true)}
-          className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-medium"
+          className="flex items-center gap-2 px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-md text-sm font-medium"
         >
           <RefreshCw className="w-4 h-4" />
           {t('common.retry')}
@@ -902,152 +801,146 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
     )
   }
 
-  const currentTableSelection = selectedTable
-    ? selectedSchema[selectedTable.full_name]
-    : null
-  const selectedColumnNames = currentTableSelection?.columns || []
-  const headerCheckboxState = getHeaderCheckboxState()
+  const selectedColumnNames = selectedTable ? selectedSchema[selectedTable.full_name]?.columns || [] : []
+  const headerCheckboxState: SelectionState = selectedTable ? selectionStateOf(selectedTable) : 'none'
+  const selectedKind = selectedTable ? kindOf(selectedTable) : 'TABLE'
+  const SelectedKindIcon = KIND_ICONS[selectedKind]
+  const canEditSelected =
+    Boolean(onEditVirtualObject) && (selectedKind === 'PROCEDURE' || selectedKind === 'QUERY')
 
   return (
-    <div className="flex flex-col h-full">
-      {/* Header — the actions live up here rather than under the lists, which
-          on a wide schema meant scrolling past hundreds of rows to save. */}
-      <div className="mb-4 flex items-start justify-between gap-4">
-        <div>
-          <p className="text-sm text-gray-500 dark:text-gray-400 mb-1">
+    <div className="flex flex-col flex-1 h-full min-h-0 text-gray-800 dark:text-gray-200">
+      {/* Title bar */}
+      <div className="flex items-center gap-3 px-1 pb-2">
+        <button
+          onClick={onBack}
+          className="p-1.5 rounded-md text-gray-500 hover:text-gray-800 hover:bg-gray-100 dark:hover:bg-gray-700 dark:hover:text-white"
+          title={t('common.back')}
+        >
+          <ArrowLeft className="w-4 h-4" />
+        </button>
+        <div className="min-w-0">
+          <p className="text-[11px] uppercase tracking-wide text-gray-500 dark:text-gray-400 leading-none">
             {labels?.eyebrow ?? t('tableSelector.eyebrow')}
           </p>
-          <h2 className="text-xl font-semibold text-gray-900 dark:text-white">
+          <h2 className="text-base font-semibold text-gray-900 dark:text-white truncate">
             {t('tableSelector.title')}
+            <span className="ml-2 font-normal text-gray-400">· {connectionName}</span>
           </h2>
         </div>
-        <div className="flex items-center gap-3 shrink-0">
-          <button
-            onClick={onBack}
-            className="flex items-center gap-2 px-3 py-2 text-blue-600 hover:text-blue-700 dark:text-blue-400 dark:hover:text-blue-300 text-sm font-medium transition-colors"
-          >
-            <ArrowLeft className="w-4 h-4" />
-            {t('common.back')}
-          </button>
-          <button
-            onClick={handleConfirm}
-            disabled={
-              (selectionStats.selectedColumns === 0 && !hadInitialSelection) ||
-              externalLoading
-            }
-            className="flex items-center gap-2 px-5 py-2.5 bg-blue-600 hover:bg-blue-700 rounded-lg text-sm font-medium text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            {externalLoading ? (
-              <Loader2 className="w-4 h-4 animate-spin" />
-            ) : (
-              <Check className="w-4 h-4" />
-            )}
-            {t('tableSelector.saveSelection')}
-          </button>
-        </div>
+        <span className="ml-auto text-xs text-gray-500 dark:text-gray-400 tabular-nums">
+          {selectionStats.selectedTables}/{selectionStats.totalTables}
+        </span>
+        <button
+          onClick={handleConfirm}
+          disabled={(selectionStats.selectedColumns === 0 && !hadInitialSelection) || externalLoading}
+          className="flex items-center gap-1.5 px-4 py-1.5 bg-blue-600 hover:bg-blue-700 rounded-md text-sm font-medium text-white disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {externalLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}
+          {t('tableSelector.saveSelection')}
+        </button>
       </div>
 
-      {/* Main Content - Two Column Layout */}
-      <div className="flex-1 flex gap-4 min-h-0 overflow-hidden">
-        {/* Left Sidebar - Tree View */}
-        <div className="w-72 flex flex-col border border-gray-200 dark:border-gray-700 rounded-xl bg-white dark:bg-gray-800 overflow-hidden">
-          {/* Connection Header */}
-          <div className="px-4 py-3 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900">
-            <div className="flex items-center gap-2">
-              <Database className="w-4 h-4 text-blue-600" />
-              <span className="font-medium text-gray-900 dark:text-white text-sm truncate flex-1">
-                {connectionName}
-              </span>
+      <div className="flex-1 flex min-h-0 border border-gray-200 dark:border-gray-700 rounded-lg overflow-hidden bg-white dark:bg-gray-900">
+        {/* ============ Object explorer ============ */}
+        <div className="w-[340px] xl:w-[380px] shrink-0 flex flex-col border-r border-gray-200 dark:border-gray-700 bg-gray-50/60 dark:bg-gray-900">
+          {/* Toolbar: search + filters */}
+          <div className="px-2 pt-2 pb-1.5 border-b border-gray-200 dark:border-gray-700 space-y-1.5">
+            <div className="flex items-center gap-1">
+              <div className="relative flex-1">
+                <Search className="absolute left-2 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-gray-400" />
+                <input
+                  type="text"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder={t('tableSelector.searchTables')}
+                  className="w-full h-7 pl-7 pr-6 text-[13px] bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded text-gray-900 dark:text-white placeholder-gray-400 focus:outline-none focus:border-blue-500"
+                />
+                {searchQuery && (
+                  <button
+                    onClick={() => setSearchQuery('')}
+                    className="absolute right-1.5 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                )}
+              </div>
               <button
                 onClick={() => loadSchema(true)}
                 disabled={refreshing}
-                className="p-1 hover:bg-gray-200 dark:hover:bg-gray-700 rounded transition-colors disabled:opacity-50"
+                className="h-7 w-7 flex items-center justify-center rounded text-gray-500 hover:bg-gray-200 dark:hover:bg-gray-700 disabled:opacity-50"
                 title={t('tableSelector.reloadSchema')}
               >
-                <RefreshCw className={`w-4 h-4 text-gray-500 hover:text-blue-600 ${refreshing ? 'animate-spin' : ''}`} />
+                <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin' : ''}`} />
               </button>
             </div>
-          </div>
 
-          {/* Tabs */}
-          <div className="flex border-b border-gray-200 dark:border-gray-700">
-            <button
-              onClick={() => setActiveTab('all')}
-              className={`flex-1 px-4 py-2 text-sm font-medium transition-colors ${
-                activeTab === 'all'
-                  ? 'text-blue-600 border-b-2 border-blue-600'
-                  : 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300'
-              }`}
-            >
-              {t('tableSelector.tabAll')}
-            </button>
-            <button
-              onClick={() => setActiveTab('selected')}
-              className={`flex-1 px-4 py-2 text-sm font-medium transition-colors flex items-center justify-center gap-1 ${
-                activeTab === 'selected'
-                  ? 'text-blue-600 border-b-2 border-blue-600'
-                  : 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300'
-              }`}
-            >
-              {t('tableSelector.tabSelected')}
-              {selectionStats.selectedTables > 0 && (
-                <span className="bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300 text-xs px-1.5 py-0.5 rounded-full">
-                  {selectionStats.selectedTables}
-                </span>
-              )}
-            </button>
-          </div>
-
-          {/* Search */}
-          <div className="p-3 border-b border-gray-200 dark:border-gray-700">
-            <div className="relative">
-              <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
-              <input
-                type="text"
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder={t('tableSelector.searchTables')}
-                className="w-full pl-9 pr-3 py-2 text-sm bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg text-gray-900 dark:text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-              />
-            </div>
-
-            {/* Bulk actions over the tables currently listed below */}
-            <div className="flex items-center gap-2 mt-2">
+            {/* Kind toggles + selected-only */}
+            <div className="flex flex-wrap items-center gap-1">
+              {TABLE_KINDS.map((kind) => {
+                const Icon = KIND_ICONS[kind]
+                const shown = !hiddenKinds.has(kind)
+                const count = kindTotals[kind]
+                if (count === 0 && !addHandler(kind)) return null
+                return (
+                  <button
+                    key={kind}
+                    type="button"
+                    onClick={() => toggleKindVisible(kind)}
+                    title={t(`tableSelector.kind.${kind}`)}
+                    className={`flex items-center gap-1 h-6 px-1.5 rounded border text-[11px] transition-colors ${
+                      shown
+                        ? 'bg-white dark:bg-gray-800 border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-200'
+                        : 'border-transparent text-gray-400 line-through opacity-70'
+                    }`}
+                  >
+                    <Icon className={`w-3 h-3 ${shown ? KIND_ICON_CLASS[kind] : 'text-gray-400'}`} />
+                    <span className="tabular-nums">{count}</span>
+                  </button>
+                )
+              })}
               <button
                 type="button"
-                onClick={handleSelectAllVisible}
-                disabled={visibleTables.length === 0 || visibleAllSelected}
-                className="px-2 py-1 text-xs font-medium text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 rounded transition-colors disabled:opacity-40 disabled:hover:bg-transparent"
+                onClick={() => setSelectedOnly((v) => !v)}
+                className={`ml-auto flex items-center gap-1 h-6 px-1.5 rounded border text-[11px] ${
+                  selectedOnly
+                    ? 'bg-blue-600 border-blue-600 text-white'
+                    : 'border-gray-300 dark:border-gray-600 text-gray-600 dark:text-gray-300 hover:bg-white dark:hover:bg-gray-800'
+                }`}
+                title={t('tableSelector.tabSelected')}
+              >
+                <ListChecks className="w-3 h-3" />
+                {t('tableSelector.tabSelected')}
+                <span className="tabular-nums">{selectionStats.selectedTables}</span>
+              </button>
+            </div>
+
+            <div className="flex items-center gap-2 text-[11px]">
+              <button
+                type="button"
+                onClick={() => void selectTables(visibleTables)}
+                disabled={visibleTables.length === 0 || groupState(visibleTables) === 'all'}
+                className="text-blue-600 dark:text-blue-400 hover:underline disabled:opacity-40 disabled:no-underline"
               >
                 {labels?.selectAll ?? t('tableSelector.selectAll')}
               </button>
               <button
                 type="button"
-                onClick={handleClearVisible}
-                disabled={visibleTables.length === 0 || !visibleAnySelected}
-                className="px-2 py-1 text-xs font-medium text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700 rounded transition-colors disabled:opacity-40 disabled:hover:bg-transparent"
+                onClick={() => clearTables(visibleTables)}
+                disabled={visibleTables.length === 0 || groupState(visibleTables) === 'none'}
+                className="text-gray-600 dark:text-gray-400 hover:underline disabled:opacity-40 disabled:no-underline"
               >
                 {labels?.clearSelection ?? t('tableSelector.clearSelection')}
               </button>
-              {/* Wordless on purpose: needs no translation */}
-              <span className="ml-auto text-xs text-gray-400 tabular-nums">
-                {selectionStats.selectedTables}/{selectionStats.totalTables}
-              </span>
             </div>
           </div>
 
-          {/* Still introspecting: the table list is already real (the catalog
-              phase lands first), the columns are not. A short title, a bar and
-              the counts — the long one-line sentence this replaced was clipped
-              with an ellipsis in the sidebar and said nothing about progress. */}
           {paginated && syncRunning && (
-            <div className="px-3 py-2.5 bg-blue-50 dark:bg-blue-900/20 border-b border-blue-100 dark:border-blue-900/40">
-              <div className="flex items-center gap-2">
-                <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-600 dark:text-blue-400 shrink-0" />
-                <span className="text-xs font-medium text-blue-800 dark:text-blue-200">
-                  {t('tableSelector.syncingSchema')}
-                </span>
-                <span className="ml-auto text-[11px] text-blue-700/80 dark:text-blue-300/80 tabular-nums shrink-0">
+            <div className="px-2.5 py-1.5 bg-blue-50 dark:bg-blue-900/20 border-b border-blue-100 dark:border-blue-900/40">
+              <div className="flex items-center gap-2 text-[11px] text-blue-800 dark:text-blue-200">
+                <Loader2 className="w-3 h-3 animate-spin shrink-0" />
+                <span className="font-medium">{t('tableSelector.syncingSchema')}</span>
+                <span className="ml-auto tabular-nums">
                   {syncProgress && syncProgress.total > 0
                     ? t('tableSelector.syncingTables')
                         .replace('{done}', String(syncProgress.done))
@@ -1055,59 +948,41 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
                     : t('tableSelector.syncingCounting')}
                 </span>
               </div>
-              <div className="mt-1.5 h-1 rounded-full bg-blue-100 dark:bg-blue-900/40 overflow-hidden">
-                <div
-                  className="h-full rounded-full bg-blue-500 transition-[width] duration-500"
-                  style={{
-                    width:
-                      syncProgress && syncProgress.total > 0
-                        ? `${Math.min(100, Math.round((syncProgress.done / syncProgress.total) * 100))}%`
-                        : '15%',
-                  }}
-                />
-              </div>
-              <p className="mt-1.5 text-[11px] leading-snug text-blue-700/80 dark:text-blue-300/80">
-                {t('tableSelector.syncingHint')}
-              </p>
             </div>
           )}
 
-          {/* Tree View */}
-          <div className="flex-1 overflow-y-auto">
-            {/* Selections whose table is gone from the database. Shown on both
-                tabs and above the tree: it is a problem to resolve, not a
-                branch to browse, and it vanishes once cleared. */}
+          {error && (
+            <div className="px-2.5 py-1.5 text-[11px] text-red-600 dark:text-red-400 border-b border-red-100 dark:border-red-900/40">
+              {error}
+            </div>
+          )}
+
+          {/* Tree */}
+          <div className="flex-1 overflow-y-auto py-1 select-none text-[13px]">
             {missingSelections.length > 0 && (
-              <div className="border-b border-amber-200 dark:border-amber-900/40 bg-amber-50 dark:bg-amber-900/10">
-                <div className="flex items-center gap-2 px-3 py-2">
-                  <AlertCircle className="w-4 h-4 text-amber-600 dark:text-amber-500 shrink-0" />
-                  <span className="text-xs font-medium text-amber-800 dark:text-amber-300 flex-1">
-                    {(
-                      labels?.missingTablesTitle ??
-                      t('tableSelector.missingTablesTitle')
-                    ).replace('{count}', String(missingSelections.length))}
+              <div className="mx-1 mb-1 rounded border border-amber-200 dark:border-amber-900/40 bg-amber-50 dark:bg-amber-900/10">
+                <div className="flex items-center gap-1.5 px-2 py-1">
+                  <AlertCircle className="w-3.5 h-3.5 text-amber-600 dark:text-amber-500 shrink-0" />
+                  <span className="text-[11px] font-medium text-amber-800 dark:text-amber-300 flex-1">
+                    {(labels?.missingTablesTitle ?? t('tableSelector.missingTablesTitle')).replace(
+                      '{count}',
+                      String(missingSelections.length)
+                    )}
                   </span>
                   <button
                     type="button"
                     onClick={() => setPendingRemoval(missingSelections)}
-                    className="text-xs font-medium text-amber-700 dark:text-amber-400 hover:underline shrink-0"
+                    className="text-[11px] font-medium text-amber-700 dark:text-amber-400 hover:underline shrink-0"
                   >
                     {labels?.removeAll ?? t('tableSelector.removeAll')}
                   </button>
                 </div>
-                <p className="px-3 pb-2 text-[11px] text-amber-700/80 dark:text-amber-400/70">
+                <p className="px-2 pb-1 text-[10px] text-amber-700/80 dark:text-amber-400/70">
                   {labels?.missingTablesHint ?? t('tableSelector.missingTablesHint')}
                 </p>
                 {missingSelections.map((tableKey) => (
-                  <div
-                    key={tableKey}
-                    className="flex items-center gap-2 px-3 py-1 pl-7 hover:bg-amber-100/60 dark:hover:bg-amber-900/20"
-                  >
-                    <Table2 className="w-3.5 h-3.5 text-amber-500 shrink-0" />
-                    <span
-                      className="text-xs text-amber-900 dark:text-amber-200 line-through truncate flex-1"
-                      title={tableKey}
-                    >
+                  <div key={tableKey} className="flex items-center gap-1.5 h-6 px-2 pl-6 hover:bg-amber-100/60 dark:hover:bg-amber-900/20">
+                    <span className="text-[12px] text-amber-900 dark:text-amber-200 line-through truncate flex-1" title={tableKey}>
                       {tableKey}
                     </span>
                     <button
@@ -1116,328 +991,299 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
                       title={labels?.remove ?? t('tableSelector.remove')}
                       className="p-0.5 rounded hover:bg-amber-200 dark:hover:bg-amber-800/40 shrink-0"
                     >
-                      <X className="w-3.5 h-3.5 text-amber-700 dark:text-amber-400" />
+                      <X className="w-3 h-3 text-amber-700 dark:text-amber-400" />
                     </button>
                   </div>
                 ))}
               </div>
             )}
 
-            {groupedTables.map((db) => (
-              <div key={db.databaseName}>
-                <div
-                  className="flex items-center gap-2 px-3 py-1.5 hover:bg-gray-50 dark:hover:bg-gray-700 cursor-pointer"
-                  onClick={() => toggleDatabase(db.databaseName)}
-                >
-                  {expandedDatabases.has(db.databaseName) ? (
-                    <ChevronDown className="w-4 h-4 text-gray-400" />
-                  ) : (
-                    <ChevronRight className="w-4 h-4 text-gray-400" />
-                  )}
-                  <Database className="w-4 h-4 text-gray-500" />
-                  <span className="text-sm text-gray-700 dark:text-gray-300 truncate">
-                    {db.databaseName}
-                  </span>
-                </div>
+            {/* Connection node */}
+            <div
+              className="flex items-center gap-1 h-6 px-1.5 cursor-pointer hover:bg-gray-200/60 dark:hover:bg-gray-800"
+              onClick={() => setExpandedDb((v) => !v)}
+            >
+              {expandedDb ? <ChevronDown className="w-3.5 h-3.5 text-gray-500" /> : <ChevronRight className="w-3.5 h-3.5 text-gray-500" />}
+              <Database className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
+              <span className="font-medium truncate">{connectionName}</span>
+            </div>
 
-                {expandedDatabases.has(db.databaseName) &&
-                  db.schemas.map((schemaGroup) => {
-                    const schemaKey = `${db.databaseName}.${schemaGroup.schemaName}`
-                    return (
-                      <div key={schemaKey}>
-                        <div
-                          className="flex items-center gap-2 px-3 py-1.5 pl-7 hover:bg-gray-50 dark:hover:bg-gray-700 cursor-pointer"
-                          onClick={() => toggleSchema(schemaKey)}
-                        >
-                          {expandedSchemas.has(schemaKey) ? (
-                            <ChevronDown className="w-4 h-4 text-gray-400" />
-                          ) : (
-                            <ChevronRight className="w-4 h-4 text-gray-400" />
-                          )}
-                          <Folder className="w-4 h-4 text-yellow-500" />
-                          <span className="text-sm text-gray-700 dark:text-gray-300 truncate">
-                            {schemaGroup.schemaName}
-                          </span>
-                        </div>
-
-                        {expandedSchemas.has(schemaKey) &&
-                          schemaGroup.tables
-                            .filter(
-                              (t) =>
-                                !renderedTableKeys ||
-                                renderedTableKeys.has(t.full_name)
-                            )
-                            .map((table) => {
-                            const isSelected =
-                              selectedTable?.full_name === table.full_name
-                            const selectionState =
-                              getTableSelectionState(table)
-
-                            return (
-                              <div
-                                key={table.full_name}
-                                className={`flex items-center gap-2 px-3 py-1 pl-12 cursor-pointer transition-colors ${
-                                  isSelected
-                                    ? 'bg-blue-50 dark:bg-blue-900/20 border-l-2 border-blue-600'
-                                    : 'hover:bg-gray-50 dark:hover:bg-gray-700'
-                                }`}
-                                onClick={() => openTable(table)}
-                              >
-                                <div
-                                  onClick={(e) =>
-                                    handleToggleTableColumns(table, e)
-                                  }
-                                  className="flex-shrink-0 hover:scale-110 transition-transform"
-                                >
-                                  {selectionState === 'all' && (
-                                    <CheckSquare className="w-3.5 h-3.5 text-blue-600" />
-                                  )}
-                                  {selectionState === 'some' && (
-                                    <MinusSquare className="w-3.5 h-3.5 text-blue-600" />
-                                  )}
-                                  {selectionState === 'none' && (
-                                    <Square className="w-3.5 h-3.5 text-gray-400 hover:text-blue-500" />
-                                  )}
-                                </div>
-                                <Table2 className="w-3.5 h-3.5 text-gray-500 flex-shrink-0" />
-                                <span
-                                  className={`text-xs truncate ${
-                                    isSelected
-                                      ? 'text-blue-700 dark:text-blue-300 font-medium'
-                                      : 'text-gray-700 dark:text-gray-300'
-                                  }`}
-                                  title={table.table_name}
-                                >
-                                  {table.table_name}
-                                </span>
-                              </div>
-                            )
-                          })}
-                      </div>
-                    )
-                  })}
-              </div>
-            ))}
-
-            {activeTab === 'selected' &&
-              tablesWithSelections.length === 0 && (
-                <div className="flex flex-col items-center justify-center py-8 text-center px-4">
-                  <Square className="w-8 h-8 text-gray-300 dark:text-gray-600 mb-2" />
-                  <p className="text-sm text-gray-500 dark:text-gray-400">
-                    {t('tableSelector.noTablesSelected')}
-                  </p>
-                  <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">
-                    {t('tableSelector.noTablesSelectedHint')}
-                  </p>
-                </div>
-              )}
-
-            {activeTab === 'all' &&
-              groupedTables[0]?.schemas.length === 0 && (
-                <div className="flex flex-col items-center justify-center py-8 text-center px-4">
-                  <Table2 className="w-8 h-8 text-gray-300 dark:text-gray-600 mb-2" />
-                  <p className="text-sm text-gray-500 dark:text-gray-400">
-                    {searchQuery
-                      ? t('tableSelector.noTablesMatch')
-                      : t('tableSelector.noTablesFound')}
-                  </p>
-                </div>
-              )}
-
-            {paginated ? (
-              // Each click fetches the next page, so this must not say "show
-              // all N" — it loads a page, and the user needs to see how far
-              // through the list they are.
-              serverTotal > 0 && (
-                <div className="border-t border-gray-100 dark:border-gray-700 px-3 py-2 sticky bottom-0 bg-white dark:bg-gray-800">
-                  {schema.length < serverTotal ? (
-                    <button
-                      type="button"
-                      disabled={loadingMore}
-                      onClick={() => loadTablePage(schema.length, false)}
-                      className="w-full flex items-center justify-center gap-2 px-3 py-1.5 rounded-lg border border-blue-200 dark:border-blue-900/50 text-xs font-medium text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 transition-colors disabled:opacity-50"
+            {expandedDb &&
+              visibleFolders.map((kind) => {
+                const Icon = KIND_ICONS[kind]
+                const open = expandedFolders.has(kind)
+                const meta = folders[kind]
+                const rows = folderRows(kind)
+                const total = folderTotal(kind)
+                const state = groupState(rowsByKind[kind])
+                const onAdd = addHandler(kind)
+                return (
+                  <div key={kind}>
+                    {/* Folder */}
+                    <div
+                      className="group flex items-center gap-1 h-6 pl-5 pr-1.5 cursor-pointer hover:bg-gray-200/60 dark:hover:bg-gray-800"
+                      onClick={() => toggleFolder(kind)}
                     >
-                      {loadingMore && <Loader2 className="w-3 h-3 animate-spin" />}
-                      {t('tableSelector.showMoreTables')}
-                    </button>
-                  ) : null}
-                  <p className="mt-1.5 text-center text-[11px] text-gray-400 dark:text-gray-500 tabular-nums">
-                    {schema.length < serverTotal
-                      ? t('tableSelector.tablesShown')
-                          .replace('{shown}', String(schema.length))
-                          .replace('{total}', String(serverTotal))
-                      : t('tableSelector.allTablesShown').replace(
-                          '{count}',
-                          String(serverTotal)
-                        )}
-                  </p>
-                </div>
-              )
-            ) : (
-              visibleTables.length > TABLE_PREVIEW_COUNT && (
-                <button
-                  type="button"
-                  onClick={() => setShowAllTables((v) => !v)}
-                  className="w-full px-3 py-2 text-xs font-medium text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 border-t border-gray-100 dark:border-gray-700 transition-colors"
-                >
-                  {showAllTables
-                    ? labels?.showFewerColumns ?? t('tableSelector.showFewer')
-                    : (labels?.showAllTables ?? t('tableSelector.showAllTables')).replace(
-                        '{count}',
-                        String(visibleTables.length)
+                      {open ? <ChevronDown className="w-3.5 h-3.5 text-gray-500" /> : <ChevronRight className="w-3.5 h-3.5 text-gray-500" />}
+                      <span
+                        className="shrink-0"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          if (rowsByKind[kind].length > 0) toggleGroup(rowsByKind[kind])
+                        }}
+                        title={labels?.selectAll ?? t('tableSelector.selectAll')}
+                      >
+                        <CheckIcon state={state} className="w-3.5 h-3.5" />
+                      </span>
+                      <Icon className={`w-3.5 h-3.5 ${KIND_ICON_CLASS[kind]}`} />
+                      <span className="font-medium">{t(`tableSelector.kind.${kind}`)}</span>
+                      <span className="text-[11px] text-gray-400 tabular-nums">{total}</span>
+                      {meta.loading && <Loader2 className="w-3 h-3 animate-spin text-gray-400" />}
+                      {onAdd && (
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            onAdd()
+                          }}
+                          title={t(kind === 'PROCEDURE' ? 'tableSelector.addProcedure' : 'tableSelector.addCustomQuery')}
+                          className="ml-auto p-0.5 rounded text-gray-400 hover:text-blue-600 hover:bg-gray-300/60 dark:hover:bg-gray-700 opacity-70 group-hover:opacity-100"
+                        >
+                          <Plus className="w-3.5 h-3.5" />
+                        </button>
                       )}
-                </button>
-              )
+                    </div>
+
+                    {/* Rows */}
+                    {open && (
+                      <div className="relative">
+                        <div className="absolute left-[27px] top-0 bottom-0 border-l border-gray-200 dark:border-gray-700" />
+                        {rows.length === 0 && !meta.loading && (
+                          <div className="h-6 pl-10 flex items-center text-[12px] text-gray-400 italic">
+                            {searchQuery ? t('tableSelector.noTablesMatch') : t('tableSelector.noTablesFound')}
+                          </div>
+                        )}
+                        {rows.map((table) => {
+                          const active = selectedTable?.full_name === table.full_name
+                          return (
+                            <div
+                              key={table.full_name}
+                              onClick={() => openTable(table)}
+                              className={`flex items-center gap-1.5 h-6 pl-9 pr-2 cursor-pointer ${
+                                active
+                                  ? 'bg-blue-100 dark:bg-blue-900/40 text-blue-900 dark:text-blue-100'
+                                  : 'hover:bg-gray-200/60 dark:hover:bg-gray-800'
+                              }`}
+                              title={table.full_name}
+                            >
+                              <span onClick={(e) => handleToggleTable(table, e)} className="shrink-0">
+                                <CheckIcon state={selectionStateOf(table)} />
+                              </span>
+                              <Icon className={`w-3.5 h-3.5 shrink-0 ${KIND_ICON_CLASS[kind]}`} />
+                              <span className="truncate">
+                                <span className="text-gray-400">{table.schema_name}.</span>
+                                {table.table_name}
+                              </span>
+                              {columnTotal(table) > 0 && (
+                                <span className="ml-auto pl-2 text-[11px] text-gray-400 tabular-nums shrink-0">
+                                  {columnTotal(table)}
+                                </span>
+                              )}
+                            </div>
+                          )
+                        })}
+                        {paginated && meta.loaded && rows.length < meta.total && (
+                          <button
+                            type="button"
+                            disabled={meta.loading}
+                            onClick={() => void loadFolder(kind, rows.length)}
+                            className="h-6 pl-9 text-[12px] text-blue-600 dark:text-blue-400 hover:underline disabled:opacity-50"
+                          >
+                            {t('tableSelector.tablesShown')
+                              .replace('{shown}', String(rows.length))
+                              .replace('{total}', String(meta.total))}
+                            {' · '}
+                            {t('tableSelector.showMoreTables')}
+                          </button>
+                        )}
+                        {!paginated && rowsByKind[kind].length > FOLDER_PAGE && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setExpandedFolderLimits((prev) => {
+                                const next = new Set(prev)
+                                if (next.has(kind)) next.delete(kind)
+                                else next.add(kind)
+                                return next
+                              })
+                            }
+                            className="h-6 pl-9 text-[12px] text-blue-600 dark:text-blue-400 hover:underline"
+                          >
+                            {expandedFolderLimits.has(kind)
+                              ? labels?.showFewerColumns ?? t('tableSelector.showFewer')
+                              : (labels?.showAllTables ?? t('tableSelector.showAllTables')).replace(
+                                  '{count}',
+                                  String(rowsByKind[kind].length)
+                                )}
+                          </button>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )
+              })}
+
+            {expandedDb && visibleFolders.length === 0 && (
+              <div className="px-4 py-6 text-center text-[12px] text-gray-400">
+                {selectedOnly ? t('tableSelector.noTablesSelected') : t('tableSelector.noTablesFound')}
+              </div>
             )}
           </div>
         </div>
 
-        {/* Right Panel - Column Details */}
-        <div className="flex-1 flex flex-col border border-gray-200 dark:border-gray-700 rounded-xl bg-white dark:bg-gray-800 overflow-hidden">
+        {/* ============ Details ============ */}
+        <div className="flex-1 min-w-0 flex flex-col">
           {selectedTable ? (
             <>
-              <div className="px-4 py-3 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900">
-                <h3 className="font-semibold text-gray-900 dark:text-white">
+              <div className="flex items-center gap-2 px-3 h-10 border-b border-gray-200 dark:border-gray-700 bg-gray-50/60 dark:bg-gray-900">
+                <SelectedKindIcon className={`w-4 h-4 shrink-0 ${KIND_ICON_CLASS[selectedKind]}`} />
+                <h3 className="text-sm font-semibold text-gray-900 dark:text-white truncate">
+                  <span className="font-normal text-gray-400">{selectedTable.schema_name}.</span>
                   {selectedTable.table_name}
                 </h3>
-                <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                <span className="px-1.5 py-0.5 rounded text-[10px] font-medium uppercase tracking-wide bg-gray-200/70 dark:bg-gray-800 text-gray-600 dark:text-gray-300 shrink-0">
+                  {t(`tableSelector.kindBadge.${selectedKind}`)}
+                </span>
+                <span className="text-[11px] text-gray-500 dark:text-gray-400 tabular-nums shrink-0">
                   {t('tableSelector.columnsSelected')
                     .replace('{selected}', String(selectedColumnNames.length))
-                    .replace('{total}', String(selectedTable.columns.length))}
-                </p>
-              </div>
-
-              <div className="px-4 py-3 border-b border-gray-200 dark:border-gray-700">
-                <div className="relative">
-                  <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
+                    .replace('{total}', String(columnTotal(selectedTable)))}
+                </span>
+                {canEditSelected && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      onEditVirtualObject?.({
+                        schemaName: selectedTable.schema_name,
+                        tableName: selectedTable.table_name,
+                        fullName: selectedTable.full_name,
+                        kind: selectedKind,
+                      })
+                    }
+                    className="ml-auto flex items-center gap-1 px-2 py-1 text-xs font-medium text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 rounded shrink-0"
+                  >
+                    <Pencil className="w-3 h-3" />
+                    {t('tableSelector.editDefinition')}
+                  </button>
+                )}
+                <div className={`relative w-56 shrink-0 ${canEditSelected ? '' : 'ml-auto'}`}>
+                  <Search className="absolute left-2 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-gray-400" />
                   <input
                     type="text"
                     value={columnSearchQuery}
                     onChange={(e) => setColumnSearchQuery(e.target.value)}
                     placeholder={t('tableSelector.searchColumns')}
-                    className="w-full pl-9 pr-3 py-2 text-sm bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg text-gray-900 dark:text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                    className="w-full h-7 pl-7 pr-2 text-[13px] bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded text-gray-900 dark:text-white placeholder-gray-400 focus:outline-none focus:border-blue-500"
                   />
                 </div>
               </div>
 
-              <div className="grid grid-cols-12 gap-2 px-4 py-2 border-b border-gray-200 dark:border-gray-700 text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider bg-gray-50 dark:bg-gray-900">
-                <div
-                  className="col-span-1 flex items-center cursor-pointer"
-                  onClick={handleToggleAllColumns}
-                >
-                  {headerCheckboxState === 'all' && (
-                    <CheckSquare className="w-4 h-4 text-blue-600" />
-                  )}
-                  {headerCheckboxState === 'some' && (
-                    <MinusSquare className="w-4 h-4 text-blue-600" />
-                  )}
-                  {headerCheckboxState === 'none' && (
-                    <Square className="w-4 h-4 text-gray-400 hover:text-gray-600" />
-                  )}
-                </div>
-                <div className="col-span-5">
-                  {t('tableSelector.colColumnName')
-                    .replace('{selected}', String(selectedColumnNames.length))
-                    .replace('{total}', String(selectedTable.columns.length))}
-                </div>
-                <div className="col-span-3">{t('tableSelector.colDataType')}</div>
-                <div className="col-span-3">{t('tableSelector.colNullable')}</div>
-              </div>
-
-              <div className="flex-1 overflow-y-auto">
-                {loadingColumns.has(selectedTable.full_name) &&
-                  selectedTable.columns.length === 0 && (
-                    <div className="flex items-center justify-center gap-2 py-10 text-sm text-gray-500 dark:text-gray-400">
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                      {t('tableSelector.loadingSchema')}
-                    </div>
-                  )}
-                {visibleColumns.map((column) => {
-                  const isSelected = selectedColumnNames.includes(column.name)
-                  return (
-                    <div
-                      key={column.name}
-                      className={`grid grid-cols-12 gap-2 px-4 py-1 border-b border-gray-100 dark:border-gray-700 cursor-pointer transition-colors ${
-                        isSelected
-                          ? 'bg-blue-50 dark:bg-blue-900/10'
-                          : 'hover:bg-gray-50 dark:hover:bg-gray-700'
-                      }`}
-                      onClick={() => handleToggleColumn(column.name)}
-                    >
-                      <div className="col-span-1 flex items-center">
-                        {isSelected ? (
-                          <CheckSquare className="w-3.5 h-3.5 text-blue-600" />
-                        ) : (
-                          <Square className="w-3.5 h-3.5 text-gray-400" />
-                        )}
-                      </div>
-                      <div className="col-span-5 flex items-center gap-2 min-w-0">
-                        <span
-                          className={`text-xs truncate ${
-                            isSelected
-                              ? 'text-gray-900 dark:text-white font-medium'
-                              : 'text-gray-600 dark:text-gray-400'
+              <div className="flex-1 overflow-auto">
+                <table className="w-full table-fixed text-[13px]">
+                  <thead className="sticky top-0 z-10 bg-gray-50 dark:bg-gray-900 text-[11px] uppercase tracking-wide text-gray-500 dark:text-gray-400">
+                    <tr className="border-b border-gray-200 dark:border-gray-700">
+                      <th className="w-9 px-3 py-1.5 text-left">
+                        <span className="cursor-pointer" onClick={handleToggleAllColumns}>
+                          <CheckIcon state={headerCheckboxState} />
+                        </span>
+                      </th>
+                      <th className="px-2 py-1.5 text-left font-medium">
+                        {t('tableSelector.colColumnName')
+                          .replace('{selected}', String(selectedColumnNames.length))
+                          .replace('{total}', String(selectedTable.columns.length))}
+                      </th>
+                      <th className="px-2 py-1.5 text-left font-medium w-48">{t('tableSelector.colDataType')}</th>
+                      <th className="px-2 py-1.5 text-left font-medium w-24">{t('tableSelector.colNullable')}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {loadingColumns.has(selectedTable.full_name) && selectedTable.columns.length === 0 && (
+                      <tr>
+                        <td colSpan={4} className="py-10 text-center text-sm text-gray-500">
+                          <Loader2 className="inline w-4 h-4 animate-spin mr-2" />
+                          {t('tableSelector.loadingSchema')}
+                        </td>
+                      </tr>
+                    )}
+                    {visibleColumns.map((column) => {
+                      const checked = selectedColumnNames.includes(column.name)
+                      return (
+                        <tr
+                          key={column.name}
+                          onClick={() => handleToggleColumn(column.name)}
+                          className={`h-7 cursor-pointer border-b border-gray-100 dark:border-gray-800 ${
+                            checked ? 'bg-blue-50/60 dark:bg-blue-900/10' : 'hover:bg-gray-50 dark:hover:bg-gray-800/60'
                           }`}
-                          title={column.name}
                         >
-                          {column.name}
-                        </span>
-                      </div>
-                      <div className="col-span-3 flex items-center min-w-0">
-                        <span className="text-[11px] font-mono px-1.5 py-0 bg-gray-200 dark:bg-gray-700 rounded text-gray-600 dark:text-gray-400 uppercase truncate">
-                          {column.data_type}
-                        </span>
-                      </div>
-                      <div className="col-span-3 flex items-center">
-                        <span
-                          className={`text-xs ${column.nullable ? 'text-green-600 dark:text-green-400' : 'text-gray-400'}`}
-                        >
-                          {column.nullable ? t('common.yes') : t('common.no')}
-                        </span>
-                      </div>
-                    </div>
-                  )
-                })}
+                          <td className="px-3">
+                            {checked ? (
+                              <CheckSquare className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
+                            ) : (
+                              <Square className="w-3.5 h-3.5 text-gray-400" />
+                            )}
+                          </td>
+                          <td
+                            className={`px-2 truncate ${checked ? 'text-gray-900 dark:text-white' : 'text-gray-600 dark:text-gray-400'}`}
+                            title={column.name}
+                          >
+                            {column.name}
+                          </td>
+                          <td className="px-2 truncate">
+                            <span className="font-mono text-[11px] text-gray-500 dark:text-gray-400 uppercase">{column.data_type}</span>
+                          </td>
+                          <td className="px-2 text-[12px] text-gray-500">
+                            {column.nullable ? t('common.yes') : t('common.no')}
+                          </td>
+                        </tr>
+                      )
+                    })}
+                  </tbody>
+                </table>
 
-                {(hiddenColumnCount > 0 || showAllColumns) &&
-                  filteredColumns.length > COLUMN_PREVIEW_COUNT && (
-                    <button
-                      type="button"
-                      onClick={() => setShowAllColumns((v) => !v)}
-                      className="w-full px-4 py-2 text-xs font-medium text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 transition-colors"
-                    >
-                      {showAllColumns
-                        ? labels?.showFewerColumns ?? t('tableSelector.showFewer')
-                        : (
-                            labels?.showAllColumns ?? t('tableSelector.showAllColumns')
-                          ).replace('{count}', String(filteredColumns.length))}
-                    </button>
-                  )}
+                {(hiddenColumnCount > 0 || showAllColumns) && filteredColumns.length > COLUMN_PREVIEW_COUNT && (
+                  <button
+                    type="button"
+                    onClick={() => setShowAllColumns((v) => !v)}
+                    className="w-full py-2 text-xs font-medium text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20"
+                  >
+                    {showAllColumns
+                      ? labels?.showFewerColumns ?? t('tableSelector.showFewer')
+                      : (labels?.showAllColumns ?? t('tableSelector.showAllColumns')).replace(
+                          '{count}',
+                          String(filteredColumns.length)
+                        )}
+                  </button>
+                )}
 
                 {filteredColumns.length === 0 && columnSearchQuery && (
-                  <div className="flex flex-col items-center justify-center py-8 text-center">
-                    <p className="text-sm text-gray-500 dark:text-gray-400">
-                      {t('tableSelector.noColumnsMatch')}
-                    </p>
-                  </div>
+                  <p className="py-8 text-center text-sm text-gray-500 dark:text-gray-400">
+                    {t('tableSelector.noColumnsMatch')}
+                  </p>
                 )}
               </div>
             </>
           ) : (
-            <div className="flex-1 flex items-center justify-center">
-              <div className="text-center">
-                <Table2 className="w-12 h-12 text-gray-300 dark:text-gray-600 mx-auto mb-3" />
-                <p className="text-gray-500 dark:text-gray-400">
-                  {t('tableSelector.selectTableHint')}
-                </p>
+            <div className="flex-1 flex items-center justify-center text-center">
+              <div>
+                <Table2 className="w-10 h-10 text-gray-300 dark:text-gray-600 mx-auto mb-2" />
+                <p className="text-sm text-gray-500 dark:text-gray-400">{t('tableSelector.selectTableHint')}</p>
               </div>
             </div>
           )}
         </div>
       </div>
 
-      {/* Confirm removing selections whose table is gone. Destructive and
-          applied immediately, so it asks first. */}
+      {/* Confirm removing selections whose table is gone. */}
       {pendingRemoval && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
@@ -1451,14 +1297,13 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
               <AlertCircle className="w-5 h-5 text-amber-500 shrink-0 mt-0.5" />
               <div className="min-w-0">
                 <h3 className="text-base font-semibold text-gray-900 dark:text-white">
-                  {labels?.removeMissingConfirmTitle ??
-                    t('tableSelector.removeMissingConfirmTitle')}
+                  {labels?.removeMissingConfirmTitle ?? t('tableSelector.removeMissingConfirmTitle')}
                 </h3>
                 <p className="mt-1 text-sm text-gray-600 dark:text-gray-400">
-                  {(
-                    labels?.removeMissingConfirmBody ??
-                    t('tableSelector.removeMissingConfirmBody')
-                  ).replace('{count}', String(pendingRemoval.length))}
+                  {(labels?.removeMissingConfirmBody ?? t('tableSelector.removeMissingConfirmBody')).replace(
+                    '{count}',
+                    String(pendingRemoval.length)
+                  )}
                 </p>
                 <ul className="mt-2 max-h-32 overflow-y-auto text-xs text-gray-500 dark:text-gray-400 space-y-0.5">
                   {pendingRemoval.map((key) => (
@@ -1467,11 +1312,7 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
                     </li>
                   ))}
                 </ul>
-                {removeError && (
-                  <p className="mt-2 text-xs text-red-600 dark:text-red-400">
-                    {removeError}
-                  </p>
-                )}
+                {removeError && <p className="mt-2 text-xs text-red-600 dark:text-red-400">{removeError}</p>}
               </div>
             </div>
             <div className="mt-5 flex justify-end gap-2">
@@ -1479,7 +1320,7 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
                 type="button"
                 onClick={() => setPendingRemoval(null)}
                 disabled={removing}
-                className="px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors disabled:opacity-50"
+                className="px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg disabled:opacity-50"
               >
                 {labels?.cancel ?? t('common.cancel')}
               </button>
@@ -1487,7 +1328,7 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
                 type="button"
                 onClick={confirmRemoval}
                 disabled={removing}
-                className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-red-600 hover:bg-red-700 rounded-lg transition-colors disabled:opacity-50"
+                className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-red-600 hover:bg-red-700 rounded-lg disabled:opacity-50"
               >
                 {removing && <Loader2 className="w-4 h-4 animate-spin" />}
                 {labels?.remove ?? t('tableSelector.remove')}
