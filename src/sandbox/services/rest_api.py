@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import os
 import secrets
+import threading
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, date, time, timedelta, timezone
@@ -42,6 +43,36 @@ from sandbox.execution.python_executor import PythonExecutor
 from sandbox.visualization.generator import VisualizationGenerator, ChartType
 
 logger = get_logger(__name__)
+
+# ── Shared faster-whisper model ──────────────────────────────────────────────
+# Media transcription runs on worker threads (asyncio.to_thread), so building a
+# WhisperModel inside the request path meant every concurrent audio/video upload
+# loaded its OWN copy of the weights. A batch of media files therefore held
+# several models at once and blew the container's memory ceiling — the kernel
+# OOM-killed the uvicorn worker mid-transcription and the service went dark.
+# The model is read-only once loaded and faster-whisper is thread-safe for
+# transcribe(), so one process-wide instance is both correct and far cheaper.
+_WHISPER_MODEL = None
+_WHISPER_MODEL_LOCK = threading.Lock()
+
+
+def _get_whisper_model():
+    """Return the process-wide faster-whisper model, loading it once."""
+    global _WHISPER_MODEL
+    if _WHISPER_MODEL is None:
+        with _WHISPER_MODEL_LOCK:
+            if _WHISPER_MODEL is None:
+                from faster_whisper import WhisperModel
+
+                whisper_path = os.environ.get("WHISPER_MODEL_PATH", "")
+                size = os.environ.get("WHISPER_MODEL_SIZE", "small")
+                logger.info("whisper_model_loading", size=size)
+                _WHISPER_MODEL = WhisperModel(
+                    size, device="cpu", compute_type="int8",
+                    download_root=whisper_path or None,
+                )
+                logger.info("whisper_model_loaded", size=size)
+    return _WHISPER_MODEL
 
 
 # Arabic Presentation Forms: U+FB50–U+FDFF (A) and U+FE70–U+FEFF (B). Many
@@ -4192,14 +4223,10 @@ def register_routes(app: FastAPI) -> None:
 
                 _update_prog(10)
 
-                # Transcribe with faster-whisper (small model, CPU)
-                from faster_whisper import WhisperModel
-                # Use pre-downloaded model to avoid runtime download + lock contention
-                whisper_path = os.environ.get("WHISPER_MODEL_PATH", "")
-                model = WhisperModel(
-                    "small", device="cpu", compute_type="int8",
-                    download_root=whisper_path or None,
-                )
+                # Transcribe with faster-whisper on the shared, process-wide
+                # model (see _get_whisper_model — one copy of the weights for
+                # the whole service, not one per concurrent upload).
+                model = _get_whisper_model()
                 segments, info = model.transcribe(audio_path, beam_size=5)
 
                 logger.info("whisper_transcribing", doc_id=doc_id,
