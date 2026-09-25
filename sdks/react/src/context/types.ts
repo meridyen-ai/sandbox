@@ -63,6 +63,22 @@ export interface AIGenerateQueryResponse {
   error?: string
 }
 
+/**
+ * What a listed relation is. Views, stored procedures and custom SQL queries
+ * all behave like tables (columns, samples, selection, SQL); the kind only
+ * decides how they are grouped and labelled.
+ */
+export type TableKind = 'TABLE' | 'VIEW' | 'PROCEDURE' | 'QUERY'
+
+export const TABLE_KINDS: TableKind[] = ['TABLE', 'VIEW', 'PROCEDURE', 'QUERY']
+
+/** Any reported table_type ('BASE TABLE', 'view', …) → a TableKind. */
+export function normalizeTableKind(tableType: string | null | undefined): TableKind {
+  const t = (tableType || 'TABLE').trim().toUpperCase()
+  if (t === 'VIEW' || t === 'PROCEDURE' || t === 'QUERY') return t
+  return 'TABLE'
+}
+
 /** A table as the paginated list reports it: identity and counts, no columns. */
 export interface TableSummary {
   schema_name: string
@@ -89,6 +105,8 @@ export interface TablePage {
   in_progress?: boolean
   /** Selections whose table the database no longer has, diffed server-side. */
   missing_selections?: string[]
+  /** How many relations of each kind match the search/tab (ignoring `types`). */
+  type_counts?: Partial<Record<TableKind, number>>
 }
 
 export interface SchemaSyncStatus {
@@ -126,7 +144,14 @@ export interface SandboxUIApi {
      */
     listTables?: (
       connectionId: string,
-      opts: { search?: string; offset?: number; limit?: number; selectedOnly?: boolean },
+      opts: {
+        search?: string
+        offset?: number
+        limit?: number
+        selectedOnly?: boolean
+        /** Only these kinds; omit for all. */
+        types?: TableKind[]
+      },
     ) => Promise<TablePage>
     /** Columns for the tables named — what `listTables` deliberately omits. */
     getTableColumns?: (

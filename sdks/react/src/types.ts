@@ -46,6 +46,8 @@ export interface TableSampleData {
 
 export interface Table {
   name: string
+  /** TABLE, VIEW, PROCEDURE or QUERY; absent means TABLE. */
+  type?: string
   columns: TableColumn[]
   sample_data?: TableSampleData | null
 }

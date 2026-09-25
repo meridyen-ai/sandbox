@@ -200,21 +200,30 @@ class MySQLConnector(BaseConnector[Connection]):
             )
 
     async def get_tables(self, conn: Connection, schema: str | None = None) -> list[str]:
-        """Get list of tables in the database."""
+        """Get list of tables and views in the database."""
+        return [e["name"] for e in await self.get_table_entries(conn, schema=schema)]
+
+    async def get_table_entries(
+        self, conn: Connection, schema: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Tables and views as ``[{"name", "type"}]`` (TABLE / VIEW)."""
         schema = schema or self.config.database
 
         query = """
-            SELECT table_name
+            SELECT table_name, table_type
             FROM information_schema.tables
             WHERE table_schema = %s
-              AND table_type = 'BASE TABLE'
+              AND table_type IN ('BASE TABLE', 'VIEW')
             ORDER BY table_name
         """
 
         async with conn.cursor() as cursor:
             await cursor.execute(query, (schema,))
             result = await cursor.fetchall()
-            return [r[0] for r in result]
+            return [
+                {"name": r[0], "type": "VIEW" if r[1] == "VIEW" else "TABLE"}
+                for r in result
+            ]
 
     async def get_columns(
         self, conn: Connection, table: str, schema: str | None = None

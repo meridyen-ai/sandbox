@@ -117,6 +117,20 @@ const translations: Record<string, string> = {
   'tableSelector.removeMissingConfirmTitle': 'Remove from selection?',
   'tableSelector.removeMissingConfirmBody':
     '{count} table(s) will be removed from this connection right away. This cannot be undone.',
+  // Kinds of relation. All of them behave like tables; these only label them.
+  'tableSelector.kind.ALL': 'All',
+  'tableSelector.kind.TABLE': 'Tables',
+  'tableSelector.kind.VIEW': 'Views',
+  'tableSelector.kind.PROCEDURE': 'Procedures',
+  'tableSelector.kind.QUERY': 'Custom queries',
+  'tableSelector.kindBadge.TABLE': 'Table',
+  'tableSelector.kindBadge.VIEW': 'View',
+  'tableSelector.kindBadge.PROCEDURE': 'Stored procedure',
+  'tableSelector.kindBadge.QUERY': 'Custom query',
+  'tableSelector.addCustomQuery': 'Custom query',
+  'tableSelector.addProcedure': 'Stored procedure',
+  'tableSelector.addObjectHint': 'Add a custom SQL query or a stored procedure that behaves like a table',
+  'tableSelector.editDefinition': 'Edit definition',
   'tableSelector.errors.schemaLoadFailed': 'Failed to load database schema',
   'tableSelector.errors.removeFailed': 'Could not remove the tables',
 

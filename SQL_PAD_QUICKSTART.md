@@ -28,6 +28,10 @@ Click **"Query Explorer"** in the top navigation menu
 - Write SQL in the editor
 - Press `Ctrl+Enter` to execute
 
+> **Note:** SQL Pad talks to the database directly, so the sandbox's
+> [virtual objects](docs/virtual-objects.md) (custom queries and stored
+> procedures exposed as tables) are not visible there.
+
 ## 📍 Service Ports
 
 | Service | Port | URL |

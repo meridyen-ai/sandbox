@@ -10,11 +10,14 @@ import asyncio
 from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any, AsyncGenerator, AsyncIterator, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, AsyncGenerator, AsyncIterator, Generic, TypeVar
 
 from sandbox.core.config import DatabaseConnectionConfig
-from sandbox.core.exceptions import ConnectionError
+from sandbox.core.exceptions import ConnectionError, SQLExecutionError
 from sandbox.core.logging import get_logger
+
+if TYPE_CHECKING:
+    from sandbox.execution.virtual_objects.models import ExpansionPlan
 
 logger = get_logger(__name__)
 
@@ -29,6 +32,8 @@ class QueryResult:
     rows: list[tuple[Any, ...]]
     row_count: int
     affected_rows: int = 0
+    # Stored procedures only: how many result sets the call produced in total.
+    result_set_count: int = 1
 
 
 class BaseConnector(ABC, Generic[T]):
@@ -119,6 +124,44 @@ class BaseConnector(ABC, Generic[T]):
             {"name": name, "type": "TABLE"}
             for name in await self.get_tables(conn, schema=schema)
         ]
+
+    # ------------------------------------------------------------------
+    # Virtual objects (custom queries / stored procedures as tables)
+    # ------------------------------------------------------------------
+
+    async def execute_plan(
+        self,
+        conn: T,
+        plan: "ExpansionPlan",
+        parameters: dict[str, Any] | None = None,
+    ) -> QueryResult:
+        """Run an expanded query.
+
+        Custom queries and Postgres functions expand to plain SQL, so the
+        default just executes it. Procedure materialization (temp tables) is
+        connector-specific and only offered where it is overridden.
+        """
+        if plan.steps:
+            raise SQLExecutionError(
+                f"{self.db_type} cannot materialize stored procedures",
+                query=plan.sql,
+            )
+        return await self.execute(conn, plan.sql, parameters)
+
+    async def describe_sql(self, conn: T, sql: str) -> list[dict[str, Any]] | None:
+        """Exact result columns of ``sql`` without running it.
+
+        ``[{"name", "sql_type", "nullable"}]``, or None when the database
+        offers no way to describe a statement; callers then run it with a
+        zero-row filter and read the cursor description instead.
+        """
+        return None
+
+    async def list_routines(
+        self, conn: T, schema: str | None = None, search: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Routines usable as a table source, with their parameters."""
+        raise NotImplementedError(f"{self.db_type} does not support stored procedures as tables")
 
     async def initialize_pool(self, min_size: int = 1, max_size: int = 10) -> None:
         """Initialize connection pool."""
