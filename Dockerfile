@@ -106,6 +106,16 @@ RUN --mount=type=cache,target=/root/.cache/huggingface,sharing=locked \
     python -c "from faster_whisper import WhisperModel; WhisperModel('small', device='cpu', compute_type='int8', download_root='/opt/whisper_models')"
 ENV WHISPER_MODEL_PATH=/opt/whisper_models
 
+# Pre-download the local text-embedding model document indexing runs (the same
+# one the Call Center KB and the Data Analyst backend use). Baked in so an
+# air-gapped sandbox indexes documents with no network and no API key.
+# Must match LOCAL_EMBEDDING_MODEL / LOCAL_EMBEDDING_ONNX_FILE in
+# sandbox/services/local_embedder.py.
+RUN python -c "\
+from huggingface_hub import hf_hub_download as get; \
+repo='perplexity-ai/pplx-embed-v1-0.6b'; \
+[get(repo, f, cache_dir='/opt/embedding_models') for f in ('tokenizer.json', 'onnx/model.onnx', 'onnx/model.onnx_data', 'onnx/model.onnx_data_1')]"
+
 # -----------------------------------------------------------------------------
 # Stage 2: Production Runtime
 # -----------------------------------------------------------------------------
@@ -164,6 +174,7 @@ RUN groupadd --gid ${APP_GID} sandbox && \
 COPY --from=builder /opt/venv /opt/venv
 # Copy pre-downloaded whisper models to avoid runtime download race conditions
 COPY --from=builder /opt/whisper_models /opt/whisper_models
+COPY --from=builder /opt/embedding_models /opt/embedding_models
 ENV WHISPER_MODEL_PATH=/opt/whisper_models
 ENV PATH="/opt/venv/bin:$PATH"
 

@@ -3071,10 +3071,17 @@ def register_routes(app: FastAPI) -> None:
         "hnsw_ef_search": _env_int("VECTOR_HNSW_EF_SEARCH", 40, lo=10, hi=512),
         "hnsw_dist_method": "vector_cosine_ops",
     }
-    # 128 chunks/request keeps each embedding call well under the API's 300k
-    # token cap while cutting round trips ~13x versus the library default of 10.
-    EMBED_BATCH_SIZE = _env_int("VECTOR_EMBED_BATCH_SIZE", 128, lo=1, hi=1024)
-    EMBED_NUM_WORKERS = _env_int("VECTOR_EMBED_WORKERS", 8, lo=1, hi=32)
+    # KBs were first indexed with OpenAI text-embedding-3-small (1536-dim) into
+    # llamaindex_kb_<id>. Indexing now runs the local model (1024-dim), whose
+    # vectors are a different space AND a different column width, so they live
+    # in their own table. The legacy table is kept: a caller still sending a
+    # 1536-dim query vector (older backend) keeps searching it unchanged.
+    LEGACY_EMBED_DIM = 1536
+
+    def _kb_vector_table(kb_id, embed_dim: int) -> str:
+        if embed_dim == LEGACY_EMBED_DIM:
+            return f"llamaindex_kb_{kb_id}"
+        return f"llamaindex_kb_{kb_id}_e{embed_dim}"
 
     def _get_doc_db_engine():
         """Reuse the sandbox's upload DB engine for document KB storage."""
@@ -3810,7 +3817,7 @@ def register_routes(app: FastAPI) -> None:
     @app.post("/api/v1/documents/process", tags=["Documents"])
     async def process_document(request: Request):
         """
-        Process a document using Unstructured (parsing) + OpenAI (embeddings).
+        Process a document using Unstructured (parsing) + the local model (embeddings).
         Supports OCR strategies: "local" (Tesseract) or "google_vision".
         """
         from sqlalchemy import text as sql_text
@@ -4705,25 +4712,15 @@ def register_routes(app: FastAPI) -> None:
             # ── Step 3: Build LlamaIndex VectorStoreIndex with PGVectorStore ──
             from llama_index.core import VectorStoreIndex, Settings, StorageContext
             from llama_index.core.node_parser import SentenceSplitter
-            from llama_index.embeddings.openai import OpenAIEmbedding
             from llama_index.vector_stores.postgres import PGVectorStore
+            from sandbox.services import local_embedder
 
-            openai_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENAI_KEY", "")
-
-            # Configure LlamaIndex settings.
-            #
-            # embed_batch_size defaults to 10, which meant one HTTP round trip
-            # per 10 chunks — ~500 serial requests for a 5k-chunk document set.
-            # 128 chunks x ~1024 tokens is ~131k tokens per request, comfortably
-            # under the embeddings API's 300k-token request cap, and num_workers
-            # lets batches overlap instead of running strictly one after another.
-            Settings.embed_model = OpenAIEmbedding(
-                model="text-embedding-3-small",
-                dimensions=1536,
-                api_key=openai_key,
-                embed_batch_size=EMBED_BATCH_SIZE,
-                num_workers=EMBED_NUM_WORKERS,
-            )
+            # Embeddings come from the local model (the one the Call Center KB
+            # and the Data Analyst backend use) — no API key, and document text
+            # never leaves the sandbox. The backend embeds the query side with
+            # the same model; see local_embedder for why the two must match.
+            Settings.embed_model = local_embedder.LocalEmbedding()
+            embed_dim = local_embedder.EMBEDDING_DIMENSIONS
             Settings.chunk_size = 1024
             Settings.chunk_overlap = 128
 
@@ -4735,7 +4732,7 @@ def register_routes(app: FastAPI) -> None:
             db_pass = os.environ.get("SANDBOX_UPLOAD_DB_PASSWORD", "sandbox_password")
 
             # Each KB gets its own table for isolation
-            table_name = f"llamaindex_kb_{kb_id}"
+            table_name = _kb_vector_table(kb_id, embed_dim)
 
             # hnsw_kwargs is what creates the ANN index. Omitting it (the
             # default) leaves the table with no vector index at all, so every
@@ -4752,7 +4749,7 @@ def register_routes(app: FastAPI) -> None:
                 user=db_user,
                 password=db_pass,
                 table_name=table_name,
-                embed_dim=1536,
+                embed_dim=embed_dim,
                 hnsw_kwargs=HNSW_KWARGS,
             )
 
@@ -4796,21 +4793,19 @@ def register_routes(app: FastAPI) -> None:
             # ── Step 4: Index documents — LlamaIndex handles chunking + embedding + storage ──
             # SentenceSplitter respects element boundaries better than character splitting.
             # 1024 tokens (~700 words, ~1 page) with 128 overlap: each chunk is usually
-            # self-contained enough to answer a question without needing neighbors, while
-            # still fitting ~8x inside text-embedding-3-small's 8192 token budget.
+            # self-contained enough to answer a question without needing neighbors.
             node_parser = SentenceSplitter(chunk_size=1024, chunk_overlap=128)
 
             logger.info("llamaindex_indexing_start", doc_id=doc_id, documents=len(li_documents))
 
-            # use_async overlaps embedding batches instead of awaiting each in
-            # turn. asyncio_run() underneath handles being called from this
-            # worker thread (no running loop) as well as from a live loop.
             index = VectorStoreIndex.from_documents(
                 li_documents,
                 storage_context=storage_context,
                 transformations=[node_parser],
                 show_progress=False,
-                use_async=True,
+                # Local CPU model: one forward pass already uses every embedding
+                # thread, so overlapping batches would only contend for cores.
+                use_async=False,
             )
 
             # Count the rows that actually landed in the vector table for this
@@ -4842,10 +4837,16 @@ def register_routes(app: FastAPI) -> None:
             _update_prog(85)
 
             # ── Step 5: Generate summary ──
-            import openai as _openai
-            client = _openai.OpenAI(api_key=openai_key)
+            # Optional: the document is searchable without it, so a sandbox with
+            # no OpenAI key (air-gapped, tenant pods) skips it rather than failing
+            # a fully indexed document at the last step.
+            openai_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENAI_KEY", "")
             summary = ""
             try:
+                if not openai_key:
+                    raise RuntimeError("no OpenAI key — summary skipped")
+                import openai as _openai
+                client = _openai.OpenAI(api_key=openai_key)
                 summary_resp = client.chat.completions.create(
                     model="gpt-4o-mini",
                     messages=[
@@ -4926,12 +4927,10 @@ def register_routes(app: FastAPI) -> None:
             FilterOperator,
         )
         from llama_index.vector_stores.postgres import PGVectorStore
-        from llama_index.embeddings.openai import OpenAIEmbedding
 
-        openai_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENAI_KEY", "")
-        Settings.embed_model = OpenAIEmbedding(
-            model="text-embedding-3-small", dimensions=1536, api_key=openai_key,
-        )
+        # The caller supplies the query vector; its width says which model made
+        # it and therefore which table holds comparable vectors.
+        embed_dim = len(query_embedding)
 
         db_host = os.environ.get("SANDBOX_UPLOAD_DB_HOST", "sandbox-postgres")
         db_port = os.environ.get("SANDBOX_UPLOAD_DB_PORT", "5432")
@@ -4942,7 +4941,7 @@ def register_routes(app: FastAPI) -> None:
         all_chunks = []
 
         for kb_id in kb_ids:
-            table_name = f"llamaindex_kb_{kb_id}"
+            table_name = _kb_vector_table(kb_id, embed_dim)
 
             try:
                 # Same hnsw_kwargs as the write path: this is what applies
@@ -4952,7 +4951,7 @@ def register_routes(app: FastAPI) -> None:
                 vector_store = PGVectorStore.from_params(
                     host=db_host, port=db_port, database=db_name,
                     user=db_user, password=db_pass,
-                    table_name=table_name, embed_dim=1536,
+                    table_name=table_name, embed_dim=embed_dim,
                     hnsw_kwargs=HNSW_KWARGS,
                 )
 
@@ -5051,31 +5050,43 @@ def register_routes(app: FastAPI) -> None:
         if not kb_id or not file_id:
             return {"chunks": []}
 
-        table_name = f"llamaindex_kb_{kb_id}"
+        from sandbox.services import local_embedder
+
+        # Text lookup only, so either table answers. The local-model table is the
+        # one search hits come from; a KB not re-embedded yet only has the legacy one.
         engine = _get_doc_db_engine()
+        rows = []
         try:
             with engine.connect() as c:
-                # Query vectors where file_id matches and chunk_index is in the window.
-                # chunk_index is stored as a JSON number in metadata_ so we cast to int.
-                result = c.execute(
-                    sql_text(
-                        f"""
-                        SELECT text, metadata_
-                        FROM data_{table_name}
-                        WHERE metadata_->>'file_id' = :fid
-                          AND (metadata_->>'chunk_index')::int BETWEEN :lo AND :hi
-                          AND (metadata_->>'chunk_index')::int != :current
-                        ORDER BY (metadata_->>'chunk_index')::int ASC
-                        """
-                    ),
-                    {
-                        "fid": file_id,
-                        "lo": chunk_index - window,
-                        "hi": chunk_index + window,
-                        "current": chunk_index,
-                    },
-                )
-                rows = result.fetchall()
+                for dim in (local_embedder.EMBEDDING_DIMENSIONS, LEGACY_EMBED_DIM):
+                    table_name = _kb_vector_table(kb_id, dim)
+                    if not c.execute(
+                        sql_text("SELECT to_regclass(:t)"), {"t": f"public.data_{table_name}"}
+                    ).scalar():
+                        continue
+                    # Query vectors where file_id matches and chunk_index is in the window.
+                    # chunk_index is stored as a JSON number in metadata_ so we cast to int.
+                    result = c.execute(
+                        sql_text(
+                            f"""
+                            SELECT text, metadata_
+                            FROM data_{table_name}
+                            WHERE metadata_->>'file_id' = :fid
+                              AND (metadata_->>'chunk_index')::int BETWEEN :lo AND :hi
+                              AND (metadata_->>'chunk_index')::int != :current
+                            ORDER BY (metadata_->>'chunk_index')::int ASC
+                            """
+                        ),
+                        {
+                            "fid": file_id,
+                            "lo": chunk_index - window,
+                            "hi": chunk_index + window,
+                            "current": chunk_index,
+                        },
+                    )
+                    rows = result.fetchall()
+                    if rows:
+                        break
         except Exception as e:
             import traceback
             logger.warning(
