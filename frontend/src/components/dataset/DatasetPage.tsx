@@ -4,7 +4,6 @@ import { useQuery } from '@tanstack/react-query'
 import {
   ArrowLeft,
   Database,
-  Loader2,
   Search,
   RefreshCw,
   Table2,
@@ -19,6 +18,7 @@ import {
   Check,
 } from 'lucide-react'
 import { connectionsApi, schemaApi } from '../../utils/api'
+import { LoadingState, Spinner } from '../ui/Spinner'
 import { useTranslation } from '../../hooks/useTranslation'
 import type { Table, SelectedSchema } from '../../types'
 
@@ -271,9 +271,7 @@ export function DatasetPage() {
 
   if (isLoading) {
     return (
-      <div className="flex items-center justify-center h-full">
-        <Loader2 className="w-8 h-8 animate-spin text-blue-500" />
-      </div>
+      <LoadingState size={32} className="h-full" />
     )
   }
 
@@ -344,7 +342,7 @@ export function DatasetPage() {
               }`}
             >
               {saving ? (
-                <Loader2 className="w-4 h-4 animate-spin" />
+                <Spinner size={16} />
               ) : saveSuccess ? (
                 <Check className="w-4 h-4" />
               ) : (
@@ -359,7 +357,7 @@ export function DatasetPage() {
               disabled={isRefetching}
               className="flex items-center gap-2 px-3 py-1.5 text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors"
             >
-              <RefreshCw className={`w-4 h-4 ${isRefetching ? 'animate-spin' : ''}`} />
+              {isRefetching ? <Spinner size={16} /> : <RefreshCw className="w-4 h-4" />}
             </button>
           </div>
         </div>
@@ -762,12 +760,12 @@ export function DatasetPage() {
                 return (
                   <div className="flex-1 overflow-auto">
                     {samplesLoading ? (
-                      <div className="flex items-center justify-center py-16">
-                        <Loader2 className="w-6 h-6 animate-spin text-blue-500 mr-2" />
-                        <span className="text-gray-500 dark:text-gray-400">
-                          Loading sample data...
-                        </span>
-                      </div>
+                      <LoadingState
+                        label="Loading sample data..."
+                        size={24}
+                        className="text-gray-500 dark:text-gray-400"
+                        style={{ padding: '64px 0' }}
+                      />
                     ) : selectedColumnNames.length === 0 ? (
                       <div className="flex flex-col items-center justify-center py-16">
                         <Square className="w-10 h-10 text-gray-300 dark:text-gray-600 mb-3" />

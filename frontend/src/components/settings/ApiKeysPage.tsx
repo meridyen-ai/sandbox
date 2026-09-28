@@ -3,6 +3,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Key, Copy, Check, Trash2, Shield, ExternalLink, Save } from 'lucide-react'
 import { apiKeyApi, type ApiKeyStatus } from '../../utils/api'
 import { useTranslation } from '../../hooks/useTranslation'
+import { LoadingState } from '../ui/Spinner'
 
 export function ApiKeysPage() {
   const { t } = useTranslation()
@@ -70,9 +71,7 @@ export function ApiKeysPage() {
       </div>
 
       {isLoading ? (
-        <div className="flex justify-center py-12">
-          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600" />
-        </div>
+        <LoadingState size={32} style={{ padding: '48px 0' }} />
       ) : (
         <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden">
           <div className="p-6">

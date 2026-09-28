@@ -5,8 +5,9 @@
  */
 
 import React, { useEffect, useState } from "react";
-import { Loader2, AlertCircle, Search, Database } from "lucide-react";
+import { AlertCircle, Search, Database } from "lucide-react";
 import { handlersApi } from "../../utils/api";
+import { LoadingState } from "../ui/Spinner";
 import type { HandlerInfo } from "../../types";
 import { useTranslation } from "../../hooks/useTranslation";
 
@@ -199,9 +200,7 @@ export const DataSourceSelector: React.FC<DataSourceSelectorProps> = ({
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center py-12">
-        <Loader2 className="w-8 h-8 animate-spin text-blue-500" />
-      </div>
+      <LoadingState size={32} style={{ padding: "48px 0" }} />
     );
   }
 

@@ -7,13 +7,13 @@ import React, { useState, useEffect } from "react";
 import {
   CheckCircle,
   XCircle,
-  Loader2,
   Eye,
   EyeOff,
   Database,
   ChevronRight,
 } from "lucide-react";
 import { connectionsApi } from "../../utils/api";
+import { Spinner } from "../ui/Spinner";
 import type { HandlerInfo, ConnectionArg } from "../../types";
 import { useTranslation } from "../../hooks/useTranslation";
 
@@ -402,7 +402,7 @@ export const ConnectionForm: React.FC<ConnectionFormProps> = ({
             className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg text-sm font-medium text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {loading ? (
-              <Loader2 className="w-4 h-4 animate-spin" />
+              <Spinner size={16} />
             ) : (
               <>
                 {t("dataSources.saveConnection") || "Save Connection"}

@@ -11,7 +11,6 @@ import {
   ChevronRight,
   Search,
   Check,
-  Loader2,
   Table2,
   Database,
   AlertCircle,
@@ -23,6 +22,7 @@ import {
   Folder,
 } from 'lucide-react'
 import { schemaApi } from '../../utils/api'
+import { LoadingState, Spinner } from '../ui/Spinner'
 import type { TableWithColumns, SelectedSchema, SchemaData } from '../../types'
 
 interface TableColumnSelectorProps {
@@ -327,12 +327,12 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
 
   if (loading) {
     return (
-      <div className="flex flex-col items-center justify-center py-20">
-        <Loader2 className="w-10 h-10 animate-spin text-blue-500 mb-4" />
-        <p className="text-gray-500 dark:text-gray-400">
-          Loading database schema...
-        </p>
-      </div>
+      <LoadingState
+        label="Loading database schema..."
+        size={40}
+        className="text-gray-500 dark:text-gray-400"
+        style={{ padding: '80px 0' }}
+      />
     )
   }
 
@@ -684,7 +684,7 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
           className="flex items-center gap-2 px-5 py-2.5 bg-blue-600 hover:bg-blue-700 rounded-lg text-sm font-medium text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
         >
           {externalLoading ? (
-            <Loader2 className="w-4 h-4 animate-spin" />
+            <Spinner size={16} />
           ) : (
             <Check className="w-4 h-4" />
           )}

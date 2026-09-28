@@ -7,13 +7,13 @@ import {
   Trash2,
   ArrowLeft,
   Search,
-  Loader2,
   CheckCircle,
   XCircle,
   RefreshCw,
   Settings2,
 } from 'lucide-react'
 import { connectionsApi } from '../../utils/api'
+import { LoadingState, Spinner } from '../ui/Spinner'
 import { DataSourceSelector } from './DataSourceSelector'
 import { ConnectionForm } from './ConnectionForm'
 import { TableColumnSelector } from './TableColumnSelector'
@@ -208,9 +208,7 @@ export function ConnectionsPage() {
 
   if (isLoading) {
     return (
-      <div className="flex items-center justify-center py-12">
-        <Loader2 className="w-8 h-8 animate-spin text-blue-500" />
-      </div>
+      <LoadingState size={32} style={{ padding: '48px 0' }} />
     )
   }
 
@@ -396,7 +394,7 @@ export function ConnectionsPage() {
                   <div className="col-span-2 flex items-center">
                     {isTesting ? (
                       <span className="inline-flex items-center gap-1 text-xs text-gray-500">
-                        <Loader2 className="w-3 h-3 animate-spin" />
+                        <Spinner size={12} label={null} />
                         Testing...
                       </span>
                     ) : status ? (
@@ -452,7 +450,7 @@ export function ConnectionsPage() {
                       className="p-1.5 text-gray-400 hover:text-blue-600 rounded opacity-0 group-hover:opacity-100 hover:bg-gray-100 dark:hover:bg-gray-600 transition-all"
                       title="Test connection"
                     >
-                      <RefreshCw className={`w-4 h-4 ${isTesting ? 'animate-spin' : ''}`} />
+                      {isTesting ? <Spinner size={16} /> : <RefreshCw className="w-4 h-4" />}
                     </button>
                     <button
                       onClick={(e) => {
@@ -464,7 +462,7 @@ export function ConnectionsPage() {
                       title={t('common.delete')}
                     >
                       {isDeleting ? (
-                        <Loader2 className="w-4 h-4 animate-spin" />
+                        <Spinner size={16} />
                       ) : (
                         <Trash2 className="w-4 h-4" />
                       )}
@@ -510,7 +508,7 @@ export function ConnectionsPage() {
                 className="px-4 py-2 text-sm text-white bg-red-600 hover:bg-red-700 rounded-lg transition-colors disabled:opacity-50"
               >
                 {deleteMutation.isPending ? (
-                  <Loader2 className="w-4 h-4 animate-spin inline mr-1" />
+                  <Spinner size={16} className="mr-1" />
                 ) : null}
                 Delete
               </button>
