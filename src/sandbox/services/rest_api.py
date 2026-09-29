@@ -4103,6 +4103,53 @@ def register_routes(app: FastAPI) -> None:
             logger.info("ocr_md_ok", filename=filename, pages=len(page_mds), chars=len(result))
         return result
 
+    def _summarize_document(text: str, filename: str, job_id: str = "") -> str:
+        """A 2-3 sentence summary of an indexed document, from the backend's
+        /internal/documents/summary endpoint.
+
+        The backend owns the model call: it runs through the LLM gateway on the
+        org virtual key of the user who started `job_id`, so the summary is
+        credit-checked and charged to that org. This service holds no provider
+        key for it and never calls a model directly. Returns "" when there is
+        no job to bill or the backend refuses — the summary is optional and the
+        document is fully searchable without it.
+        """
+        import httpx
+
+        if not job_id:
+            logger.info("document_summary_skipped", filename=filename, reason="no job_id")
+            return ""
+        backend_url = (
+            os.environ.get("MERIDYEN_BACKEND_URL")
+            or os.environ.get("BACKEND_URL")
+            or "http://backend_cloud_dev:8000"
+        )
+        internal_secret = (
+            os.environ.get("INTERNAL_BACKEND_SECRET")
+            or os.environ.get("SANDBOX_API_KEY")
+            or ""
+        )
+        try:
+            with httpx.Client(timeout=60.0) as client:
+                resp = client.post(
+                    f"{backend_url.rstrip('/')}/api/internal/documents/summary",
+                    headers={"Content-Type": "application/json",
+                             "X-Internal-Secret": internal_secret},
+                    json={"job_id": job_id, "filename": filename, "text": text[:8000]},
+                )
+        except Exception as e:
+            logger.warning("document_summary_request_failed", filename=filename, error=str(e))
+            return ""
+        if resp.status_code != 200:
+            logger.warning("document_summary_http_error", filename=filename,
+                           status=resp.status_code, body=resp.text[:200])
+            return ""
+        try:
+            return (resp.json().get("summary") or "").strip()
+        except Exception as e:
+            logger.warning("document_summary_parse_failed", filename=filename, error=str(e))
+            return ""
+
     def _html_table_to_markdown(html: str) -> str:
         """Convert a simple HTML <table> (as emitted by Unstructured's
         text_as_html) into a GitHub-flavored Markdown table. Best-effort:
@@ -4837,27 +4884,11 @@ def register_routes(app: FastAPI) -> None:
             _update_prog(85)
 
             # ── Step 5: Generate summary ──
-            # Optional: the document is searchable without it, so a sandbox with
-            # no OpenAI key (air-gapped, tenant pods) skips it rather than failing
-            # a fully indexed document at the last step.
-            openai_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENAI_KEY", "")
-            summary = ""
-            try:
-                if not openai_key:
-                    raise RuntimeError("no OpenAI key — summary skipped")
-                import openai as _openai
-                client = _openai.OpenAI(api_key=openai_key)
-                summary_resp = client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[
-                        {"role": "system", "content": "Summarize this document in 2-3 sentences."},
-                        {"role": "user", "content": extracted_text[:8000]},
-                    ],
-                    max_tokens=200,
-                )
-                summary = summary_resp.choices[0].message.content or ""
-            except Exception:
-                pass
+            # Optional: the document is searchable without it, so an unbillable
+            # job or an unreachable backend skips it rather than failing a fully
+            # indexed document at the last step. The backend makes the model
+            # call (gateway + the job's org key) — see _summarize_document.
+            summary = _summarize_document(extracted_text, filename, job_id)
 
             # ── Finalize ──
             with engine.connect() as c:
