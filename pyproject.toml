@@ -114,7 +114,10 @@ mysql = [
     "mysql-connector-python>=8.0.0",
     "aiomysql>=0.2.0",
 ]
-mssql = ["pymssql>=2.2.0"]
+# 2.4.0 and 2.4.1 deadlock the whole process on a dead connection: the error
+# handler re-takes the driver's own connection-list lock, after which no new
+# SQL Server connection can ever be opened until the process restarts.
+mssql = ["pymssql>=2.4.2"]
 oracle = ["oracledb>=3.0.0"]
 saphana = ["hdbcli>=2.20.0"]
 clickhouse = ["clickhouse-driver>=0.2.0"]
