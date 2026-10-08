@@ -22,6 +22,10 @@ export interface ConnectionConfig {
   password: string
   schema_name?: string
   ssl_enabled: boolean
+  /** The SSL mode chosen in the form (libpq `sslmode`), when the source has one. */
+  ssl_mode?: string
+  /** CA certificate (PEM) the verifying SSL modes check the server against. */
+  ssl_ca_cert?: string
 }
 
 export interface TableColumn {

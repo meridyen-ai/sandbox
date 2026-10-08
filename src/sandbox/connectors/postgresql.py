@@ -6,12 +6,14 @@ Provides async PostgreSQL connectivity using asyncpg.
 
 from __future__ import annotations
 
+import re
 from typing import Any, AsyncGenerator
 
 import asyncpg
 from asyncpg import Connection, Pool
 
 from sandbox.connectors.base import BaseConnector, QueryResult
+from sandbox.connectors.tls import build_ssl_context, resolve_ssl_mode
 from sandbox.core.config import DatabaseConnectionConfig
 from sandbox.core.exceptions import ConnectionError, SQLExecutionError
 from sandbox.core.logging import get_logger
@@ -33,6 +35,9 @@ _PG_TYPE_NAMES = {
     "timetz": "time with time zone",
 }
 
+# A schema name that may be written into SET search_path (see _search_path).
+_SCHEMA_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_$]{0,62}")
+
 
 class PostgreSQLConnector(BaseConnector[Connection]):
     """
@@ -45,30 +50,61 @@ class PostgreSQLConnector(BaseConnector[Connection]):
     - SSL/TLS support
     """
 
+    def _search_path(self, schema_name: str) -> str:
+        """The connection's schema(s) as quoted identifiers for SET search_path.
+
+        The value is whatever was typed into the connection form and SET takes
+        no bind parameters, so it is written into the statement. Each
+        comma-separated name must therefore be a plain identifier; it is
+        lowercased (what Postgres did with it unquoted) and quoted. Anything
+        else is refused before a connection is opened.
+        """
+        names = [name.strip() for name in schema_name.split(",")]
+        for name in names:
+            if not _SCHEMA_NAME.fullmatch(name):
+                raise ConnectionError(
+                    f"Schema name {name!r} is not a valid identifier: use letters, "
+                    "digits and underscores, starting with a letter or underscore",
+                    connection_id=self.connection_id,
+                    db_type=self.db_type,
+                )
+        return ", ".join(f'"{name.lower()}"' for name in names)
+
     async def connect(self) -> Connection:
         """Create a new PostgreSQL connection."""
         cfg = self.config
 
-        try:
-            # Build SSL context if enabled, explicitly disable if not
-            ssl_context = False  # Explicitly disable SSL negotiation
-            if cfg.ssl_enabled:
-                import ssl
-                ssl_context = ssl.create_default_context()
-                if cfg.ssl_ca_cert:
-                    ssl_context.load_verify_locations(cfg.ssl_ca_cert)
-                else:
-                    # Allow self-signed certs in development
-                    ssl_context.check_hostname = False
-                    ssl_context.verify_mode = ssl.CERT_NONE
+        # What asyncpg is told, per mode (see connectors/tls.py):
+        #   disable        False - no TLS negotiation at all
+        #   allow, prefer  the mode name - asyncpg's own opportunistic handling
+        #   require        a context that encrypts and verifies nothing
+        #   verify-*       a context that verifies, or this raises
+        # Passing a context makes TLS mandatory in asyncpg: a server that
+        # refuses the upgrade fails the connection instead of going plaintext.
+        ssl_mode = resolve_ssl_mode(cfg)
+        ssl_param: Any
+        if ssl_mode == "disable":
+            ssl_param = False
+        elif ssl_mode in ("allow", "prefer"):
+            ssl_param = ssl_mode
+        else:
+            ssl_param = build_ssl_context(
+                ssl_mode,
+                cfg.ssl_ca_cert,
+                connection_id=self.connection_id,
+                db_type=self.db_type,
+            )
 
+        search_path = self._search_path(cfg.schema_name) if cfg.schema_name else None
+
+        try:
             conn = await asyncpg.connect(
                 host=cfg.host,
                 port=cfg.port,
                 database=cfg.database,
                 user=cfg.username,
                 password=cfg.password.get_secret_value(),
-                ssl=ssl_context,
+                ssl=ssl_param,
                 timeout=cfg.connection_timeout,
                 command_timeout=cfg.query_timeout,
             )
@@ -86,8 +122,8 @@ class PostgreSQLConnector(BaseConnector[Connection]):
             self._enable_tcp_keepalive(conn)
 
             # Set search path if schema specified
-            if cfg.schema_name:
-                await conn.execute(f"SET search_path TO {cfg.schema_name}, public")
+            if search_path:
+                await conn.execute(f"SET search_path TO {search_path}, public")
 
             self._logger.debug(
                 "connection_created",

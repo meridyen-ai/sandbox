@@ -15,6 +15,66 @@ import {
 import { useSandboxUI } from '../context/SandboxUIContext'
 import type { HandlerInfo, ConnectionArg } from '../types'
 
+/**
+ * A host is a hostname, an IPv4/IPv6 address, a URL to one (some warehouses)
+ * or SQL Server's `server\instance` / `server,port`.
+ */
+const CONNECTION_HOST_RE = /^[A-Za-z0-9._\-:[\]/\\,]{1,255}$/
+
+/** libpq `sslmode` values and whether each one insists on an encrypted link. */
+const SSL_MODE_ENCRYPTS: Record<string, boolean> = {
+  disable: false,
+  allow: false,
+  prefer: false,
+  require: true,
+  'verify-ca': true,
+  'verify-full': true,
+}
+
+/**
+ * What each mode does and does not protect against. The i18n key is the mode
+ * in camelCase; the text here is the English fallback.
+ */
+const SSL_MODE_HINTS: Record<string, { key: string; text: string }> = {
+  disable: {
+    key: 'disable',
+    text: 'Not encrypted. Anyone on the network path can read or change the traffic.',
+  },
+  allow: {
+    key: 'allow',
+    text: 'Encrypted only if the server insists on it. Does not protect against eavesdropping or impersonation.',
+  },
+  prefer: {
+    key: 'prefer',
+    text: 'Encrypted when the server supports it, unencrypted otherwise. Someone on the network path can force it off, and the server is not verified.',
+  },
+  require: {
+    key: 'require',
+    text: 'Always encrypted, so the traffic cannot be read in passing. The server certificate is not verified: this does not protect against someone impersonating the server.',
+  },
+  'verify-ca': {
+    key: 'verifyCa',
+    text: 'Always encrypted, and the server certificate must come from a trusted certificate authority. The host name is not checked, so another server holding a certificate from the same authority would be accepted.',
+  },
+  'verify-full': {
+    key: 'verifyFull',
+    text: 'Always encrypted; the server certificate must come from a trusted certificate authority and match the host name. Protects against eavesdropping and impersonation.',
+  },
+}
+
+/** Modes that verify the server certificate, and so take a CA certificate. */
+const SSL_MODE_VERIFIES = ['verify-ca', 'verify-full']
+
+/** One or more PEM certificate blocks and nothing else. */
+const CA_CERTIFICATE_RE =
+  /^(\s*-----BEGIN CERTIFICATE-----[A-Za-z0-9+/=\s]+?-----END CERTIFICATE-----\s*)+$/
+/** A CA bundle is a handful of certificates; the service refuses more. */
+const CA_CERTIFICATE_MAX_LENGTH = 64 * 1024
+
+const INPUT_OK =
+  'border-slate-200 dark:border-dashboard-border focus:ring-blue-500'
+const INPUT_INVALID = 'border-red-400 dark:border-red-500 focus:ring-red-500'
+
 interface ConnectionFormProps {
   handler: HandlerInfo
   onBack: () => void
@@ -44,6 +104,9 @@ export const ConnectionForm: React.FC<ConnectionFormProps> = ({
   } | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [connectionArgs, setConnectionArgs] = useState<ConnectionArg[]>([])
+  // Fields the person has been in: a problem is named beside a field once
+  // they have typed in it or left it, not while the form is still untouched.
+  const [touched, setTouched] = useState<Record<string, boolean>>({})
 
   useEffect(() => {
     const args = handler.connection_args || []
@@ -51,26 +114,33 @@ export const ConnectionForm: React.FC<ConnectionFormProps> = ({
 
     const initialValues: Record<string, string | number | boolean> = {}
     args.forEach((arg) => {
-      if (arg.default !== undefined && arg.default !== null) {
+      if (arg.type === 'boolean') {
+        // A switch holds a boolean: the text "false" would read as on.
+        initialValues[arg.name] = arg.default === true || arg.default === 'true'
+      } else if (arg.default !== undefined && arg.default !== null) {
         initialValues[arg.name] = String(arg.default)
       } else if (arg.type === 'integer') {
         initialValues[arg.name] = ''
-      } else if (arg.type === 'boolean') {
-        initialValues[arg.name] = false
       } else {
         initialValues[arg.name] = ''
       }
     })
     setFormValues(initialValues)
+    setTouched({})
     setTestResult(null)
     setError(null)
   }, [handler])
+
+  const markTouched = (name: string) => {
+    setTouched((prev) => (prev[name] ? prev : { ...prev, [name]: true }))
+  }
 
   const handleInputChange = (
     name: string,
     value: string | number | boolean
   ) => {
     setFormValues((prev) => ({ ...prev, [name]: value }))
+    markTouched(name)
     setTestResult(null)
     setError(null)
   }
@@ -86,28 +156,92 @@ export const ConnectionForm: React.FC<ConnectionFormProps> = ({
     return values.includes(currentValue as string)
   }
 
-  const validateForm = (): boolean => {
-    if (!connectionName.trim()) {
-      setError(
-        t('dataSources.errors.nameRequired') || 'Connection name is required'
-      )
-      return false
+  /** What is wrong with one field as it stands, or null. */
+  const fieldError = (arg: ConnectionArg): string | null => {
+    if (!isFieldVisible(arg)) return null
+    const raw = formValues[arg.name]
+    const value = typeof raw === 'string' ? raw.trim() : raw
+    if (value === undefined || value === '' || value === null) {
+      return arg.required
+        ? t('dataSources.errors.fieldRequired', { field: arg.label }) ||
+            `${arg.label} is required`
+        : null
     }
-
-    for (const arg of connectionArgs) {
-      if (arg.required && isFieldVisible(arg)) {
-        const value = formValues[arg.name]
-        if (value === undefined || value === '' || value === null) {
-          setError(
-            t('dataSources.errors.fieldRequired', { field: arg.label }) ||
-              `${arg.label} is required`
-          )
-          return false
-        }
+    if (arg.name === 'host' && !CONNECTION_HOST_RE.test(String(value))) {
+      return (
+        t('dataSources.errors.invalidHost') ||
+        'Host must be a valid hostname or IP address'
+      )
+    }
+    if (arg.name === 'ssl_ca_cert') {
+      const pem = String(value)
+      if (pem.length > CA_CERTIFICATE_MAX_LENGTH) {
+        return (
+          t('dataSources.errors.caCertificateTooLarge') ||
+          'The CA certificate is too large (limit 64 KB)'
+        )
+      }
+      if (pem.includes('PRIVATE KEY') || !CA_CERTIFICATE_RE.test(pem)) {
+        return (
+          t('dataSources.errors.invalidCaCertificate') ||
+          'Paste the certificate in PEM format: from -----BEGIN CERTIFICATE----- to -----END CERTIFICATE-----, and nothing else'
+        )
       }
     }
+    if (arg.type === 'integer') {
+      const number = Number(value)
+      if (arg.name === 'port') {
+        if (!Number.isInteger(number) || number < 1 || number > 65535) {
+          return (
+            t('dataSources.errors.invalidPort') ||
+            'Port must be a whole number between 1 and 65535'
+          )
+        }
+      } else if (!Number.isInteger(number)) {
+        return (
+          t('dataSources.errors.invalidNumber', { field: arg.label }) ||
+          `${arg.label} must be a whole number`
+        )
+      }
+    }
+    return null
+  }
 
-    return true
+  const nameError = connectionName.trim()
+    ? null
+    : t('dataSources.errors.nameRequired') || 'Connection name is required'
+  const fieldErrors: Record<string, string> = {}
+  connectionArgs.forEach((arg) => {
+    const problem = fieldError(arg)
+    if (problem) fieldErrors[arg.name] = problem
+  })
+  const isValid = !nameError && Object.keys(fieldErrors).length === 0
+
+  const shownError = (name: string): string | undefined =>
+    touched[name] ? fieldErrors[name] : undefined
+
+  const renderFieldError = (name: string) => {
+    const problem = shownError(name)
+    return problem ? (
+      <p
+        id={`connection-field-${name}-error`}
+        role="alert"
+        className="text-xs text-red-600 dark:text-red-400"
+      >
+        {problem}
+      </p>
+    ) : null
+  }
+
+  const validateForm = (): boolean => {
+    if (isValid) return true
+    // Name every remaining problem beside its field.
+    const all: Record<string, boolean> = { __name: true }
+    connectionArgs.forEach((arg) => {
+      all[arg.name] = true
+    })
+    setTouched(all)
+    return false
   }
 
   const buildConnectionArgs = (): Record<string, unknown> => {
@@ -119,6 +253,9 @@ export const ConnectionForm: React.FC<ConnectionFormProps> = ({
       if (value !== undefined && value !== '' && value !== null) {
         if (arg.type === 'integer') {
           args[arg.name] = parseInt(value as string, 10)
+        } else if (typeof value === 'string' && !arg.secret) {
+          // A pasted address or name often carries a stray space.
+          args[arg.name] = value.trim()
         } else {
           args[arg.name] = value
         }
@@ -160,8 +297,28 @@ export const ConnectionForm: React.FC<ConnectionFormProps> = ({
         return
       }
 
+      // The SSL mode the person chose travels with the connection. Services
+      // that only know "SSL on/off" get the switch that mode implies. A
+      // source with an Encrypt switch instead of modes means: on = require.
+      const sslMode =
+        typeof connArgs.ssl_mode === 'string' &&
+        connArgs.ssl_mode in SSL_MODE_ENCRYPTS
+          ? connArgs.ssl_mode
+          : typeof connArgs.encrypt === 'boolean'
+            ? connArgs.encrypt
+              ? 'require'
+              : 'disable'
+            : undefined
+      // The CA certificate is only used, and only sent, by a verifying mode.
+      const caCertificate =
+        sslMode !== undefined &&
+        SSL_MODE_VERIFIES.includes(sslMode) &&
+        typeof connArgs.ssl_ca_cert === 'string' &&
+        connArgs.ssl_ca_cert
+          ? connArgs.ssl_ca_cert
+          : undefined
       const connectionConfig = {
-        name: connectionName,
+        name: connectionName.trim(),
         db_type: handler.name,
         host: (connArgs.host as string) || '',
         port: parseInt((connArgs.port as string) || '5432'),
@@ -171,7 +328,12 @@ export const ConnectionForm: React.FC<ConnectionFormProps> = ({
         password: (connArgs.password as string) || '',
         schema_name:
           (connArgs.schema as string) || (connArgs.schema_name as string),
-        ssl_enabled: (connArgs.ssl_enabled as boolean) ?? true,
+        ssl_enabled:
+          (connArgs.ssl_enabled as boolean) ??
+          (sslMode !== undefined ? SSL_MODE_ENCRYPTS[sslMode] : undefined) ??
+          false,
+        ssl_mode: sslMode,
+        ssl_ca_cert: caCertificate,
       }
 
       // Test the connection before creating it
@@ -213,6 +375,8 @@ export const ConnectionForm: React.FC<ConnectionFormProps> = ({
     const value = formValues[arg.name] ?? ''
     const isSecret = arg.secret
     const showSecret = showSecrets[arg.name]
+    const invalid = Boolean(shownError(arg.name))
+    const errorId = `connection-field-${arg.name}-error`
 
     // Handle select type (dropdown)
     if (arg.type === 'select' && arg.options) {
@@ -225,7 +389,10 @@ export const ConnectionForm: React.FC<ConnectionFormProps> = ({
           <select
             value={value as string}
             onChange={(e) => handleInputChange(arg.name, e.target.value)}
-            className="w-full px-3 py-2.5 bg-white dark:bg-dashboard-elevated border border-slate-200 dark:border-dashboard-border rounded-lg text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+            onBlur={() => markTouched(arg.name)}
+            aria-invalid={invalid}
+            aria-describedby={invalid ? errorId : undefined}
+            className={`w-full px-3 py-2.5 bg-white dark:bg-dashboard-elevated border rounded-lg text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:border-transparent ${invalid ? INPUT_INVALID : INPUT_OK}`}
           >
             {arg.options.map((option) => (
               <option key={option.value} value={option.value}>
@@ -233,6 +400,14 @@ export const ConnectionForm: React.FC<ConnectionFormProps> = ({
               </option>
             ))}
           </select>
+          {arg.name === 'ssl_mode' && SSL_MODE_HINTS[value as string] ? (
+            <p className="text-xs text-slate-500 dark:text-slate-400">
+              {t(
+                `dataSources.sslModeHint.${SSL_MODE_HINTS[value as string].key}`
+              ) || SSL_MODE_HINTS[value as string].text}
+            </p>
+          ) : null}
+          {renderFieldError(arg.name)}
         </div>
       )
     }
@@ -272,19 +447,30 @@ export const ConnectionForm: React.FC<ConnectionFormProps> = ({
       arg.name.includes('credentials') ||
       arg.name.includes('private_key')
     ) {
+      const isCaCertificate = arg.name === 'ssl_ca_cert'
       return (
         <div key={arg.name} className="space-y-1.5">
           <label className="block text-sm font-medium text-slate-700 dark:text-slate-300">
-            {arg.label}
+            {isCaCertificate
+              ? t('dataSources.caCertificate') || arg.label
+              : arg.label}
             {arg.required && <span className="text-red-500 ml-1">*</span>}
           </label>
           <textarea
             value={value as string}
             onChange={(e) => handleInputChange(arg.name, e.target.value)}
-            placeholder={arg.description}
+            onBlur={() => markTouched(arg.name)}
+            aria-invalid={invalid}
+            aria-describedby={invalid ? errorId : undefined}
+            placeholder={
+              isCaCertificate
+                ? t('dataSources.caCertificatePlaceholder') || arg.description
+                : arg.description
+            }
             rows={4}
-            className="w-full px-3 py-2.5 bg-white dark:bg-dashboard-elevated border border-slate-200 dark:border-dashboard-border rounded-lg text-slate-900 dark:text-white placeholder-slate-400 font-mono text-sm resize-none focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+            className={`w-full px-3 py-2.5 bg-white dark:bg-dashboard-elevated border rounded-lg text-slate-900 dark:text-white placeholder-slate-400 font-mono text-sm resize-none focus:outline-none focus:ring-2 focus:border-transparent ${invalid ? INPUT_INVALID : INPUT_OK}`}
           />
+          {renderFieldError(arg.name)}
         </div>
       )
     }
@@ -306,8 +492,11 @@ export const ConnectionForm: React.FC<ConnectionFormProps> = ({
             }
             value={value as string}
             onChange={(e) => handleInputChange(arg.name, e.target.value)}
+            onBlur={() => markTouched(arg.name)}
+            aria-invalid={invalid}
+            aria-describedby={invalid ? errorId : undefined}
             placeholder={arg.description}
-            className="w-full px-3 py-2.5 bg-white dark:bg-dashboard-elevated border border-slate-200 dark:border-dashboard-border rounded-lg text-slate-900 dark:text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent pr-10"
+            className={`w-full px-3 py-2.5 bg-white dark:bg-dashboard-elevated border rounded-lg text-slate-900 dark:text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:border-transparent pr-10 ${invalid ? INPUT_INVALID : INPUT_OK}`}
           />
           {isSecret && (
             <button
@@ -323,6 +512,7 @@ export const ConnectionForm: React.FC<ConnectionFormProps> = ({
             </button>
           )}
         </div>
+        {renderFieldError(arg.name)}
       </div>
     )
   }
@@ -391,14 +581,31 @@ export const ConnectionForm: React.FC<ConnectionFormProps> = ({
                 value={connectionName}
                 onChange={(e) => {
                   setConnectionName(e.target.value)
+                  markTouched('__name')
                   setError(null)
                 }}
+                onBlur={() => markTouched('__name')}
+                aria-invalid={Boolean(touched.__name && nameError)}
+                aria-describedby={
+                  touched.__name && nameError
+                    ? 'connection-field-__name-error'
+                    : undefined
+                }
                 placeholder={
                   t('dataSources.connectionNamePlaceholder') ||
                   'e.g., production-db, analytics-warehouse'
                 }
-                className="w-full px-3 py-2.5 bg-white dark:bg-dashboard-elevated border border-slate-200 dark:border-dashboard-border rounded-lg text-slate-900 dark:text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                className={`w-full px-3 py-2.5 bg-white dark:bg-dashboard-elevated border rounded-lg text-slate-900 dark:text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:border-transparent ${touched.__name && nameError ? INPUT_INVALID : INPUT_OK}`}
               />
+              {touched.__name && nameError ? (
+                <p
+                  id="connection-field-__name-error"
+                  role="alert"
+                  className="text-xs text-red-600 dark:text-red-400"
+                >
+                  {nameError}
+                </p>
+              ) : null}
             </div>
             <div className="space-y-1.5">
               <label className="block text-sm font-medium text-slate-700 dark:text-slate-300">
@@ -468,7 +675,7 @@ export const ConnectionForm: React.FC<ConnectionFormProps> = ({
           </button>
           <button
             onClick={handleSave}
-            disabled={loading}
+            disabled={loading || !isValid}
             className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg text-sm font-medium text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {loading ? (

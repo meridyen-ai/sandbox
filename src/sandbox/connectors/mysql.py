@@ -10,13 +10,36 @@ from typing import Any, AsyncGenerator
 
 import aiomysql
 from aiomysql import Connection, Cursor
+from pymysql.constants import CLIENT
 
 from sandbox.connectors.base import BaseConnector, QueryResult
+from sandbox.connectors.tls import build_ssl_context, resolve_ssl_mode
 from sandbox.core.config import DatabaseConnectionConfig
 from sandbox.core.exceptions import ConnectionError, SQLExecutionError
 from sandbox.core.logging import get_logger
 
 logger = get_logger(__name__)
+
+# Modes that must never run in plaintext.
+_TLS_REQUIRED_MODES = ("require", "verify-ca", "verify-full")
+
+
+class _TLSNotEstablished(Exception):
+    """The server did not offer TLS to a connection that insists on it."""
+
+
+class _TLSRequiredConnection(Connection):
+    """A connection that stops before signing in when the server has no TLS.
+
+    aiomysql sends the credentials in plaintext when the server's greeting does
+    not advertise TLS, even with an SSL context set. Anyone on the path can
+    strip that flag, so the check has to happen before authentication.
+    """
+
+    async def _request_authentication(self) -> None:
+        if not self.server_capabilities & CLIENT.SSL:
+            raise _TLSNotEstablished()
+        await super()._request_authentication()
 
 
 class MySQLConnector(BaseConnector[Connection]):
@@ -34,19 +57,22 @@ class MySQLConnector(BaseConnector[Connection]):
         """Create a new MySQL connection."""
         cfg = self.config
 
-        try:
-            # Build SSL context if enabled
-            ssl_context = None
-            if cfg.ssl_enabled:
-                import ssl
-                ssl_context = ssl.create_default_context()
-                if cfg.ssl_ca_cert:
-                    ssl_context.load_verify_locations(cfg.ssl_ca_cert)
-                else:
-                    ssl_context.check_hostname = False
-                    ssl_context.verify_mode = ssl.CERT_NONE
+        # MySQL's own names for the modes (see connectors/tls.py):
+        #   disable            DISABLED
+        #   allow, prefer      PREFERRED - TLS when the server offers it
+        #   require            REQUIRED  - TLS or no connection, unverified
+        #   verify-ca / -full  VERIFY_CA / VERIFY_IDENTITY
+        ssl_mode = resolve_ssl_mode(cfg)
+        ssl_context = build_ssl_context(
+            ssl_mode,
+            cfg.ssl_ca_cert,
+            connection_id=self.connection_id,
+            db_type=self.db_type,
+        )
+        tls_required = ssl_mode in _TLS_REQUIRED_MODES
 
-            conn = await aiomysql.connect(
+        try:
+            connect_args: dict[str, Any] = dict(
                 host=cfg.host,
                 port=cfg.port,
                 db=cfg.database,
@@ -57,6 +83,20 @@ class MySQLConnector(BaseConnector[Connection]):
                 autocommit=True,
                 charset="utf8mb4",
             )
+            if tls_required:
+                # What aiomysql.connect() does, with the class that refuses
+                # to sign in over plaintext.
+                conn = _TLSRequiredConnection(**connect_args)
+                await conn._connect()
+            else:
+                conn = await aiomysql.connect(**connect_args)
+
+            # aiomysql only upgrades to TLS when the server advertises it and
+            # otherwise carries on in plaintext. For a mode that insists on
+            # TLS the session must really be encrypted, whatever the driver did.
+            if tls_required and not getattr(conn, "_secure", False):
+                conn.close()
+                raise _TLSNotEstablished()
 
             self._logger.debug(
                 "connection_created",
@@ -67,6 +107,13 @@ class MySQLConnector(BaseConnector[Connection]):
 
             return conn
 
+        except _TLSNotEstablished:
+            raise ConnectionError(
+                f"SSL mode '{ssl_mode}' needs an encrypted link, but the MySQL server at "
+                f"{cfg.host}:{cfg.port} does not offer TLS. Not connecting.",
+                connection_id=self.connection_id,
+                db_type=self.db_type,
+            )
         except aiomysql.OperationalError as e:
             error_code = e.args[0] if e.args else 0
 

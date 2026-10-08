@@ -47,8 +47,29 @@ const translations: Record<string, string> = {
   'dataSources.optionalSettings': 'Optional Settings',
   'dataSources.saveConnection': 'Save Connection',
   'dataSources.connectionSuccess': 'Connection successful!',
+  'dataSources.caCertificate': 'CA Certificate',
+  'dataSources.caCertificatePlaceholder':
+    'Paste the CA certificate (PEM). Leave empty to trust the public certificate authorities.',
+  'dataSources.sslModeHint.disable':
+    'Not encrypted. Anyone on the network path can read or change the traffic.',
+  'dataSources.sslModeHint.allow':
+    'Encrypted only if the server insists on it. Does not protect against eavesdropping or impersonation.',
+  'dataSources.sslModeHint.prefer':
+    'Encrypted when the server supports it, unencrypted otherwise. Someone on the network path can force it off, and the server is not verified.',
+  'dataSources.sslModeHint.require':
+    'Always encrypted, so the traffic cannot be read in passing. The server certificate is not verified: this does not protect against someone impersonating the server.',
+  'dataSources.sslModeHint.verifyCa':
+    'Always encrypted, and the server certificate must come from a trusted certificate authority. The host name is not checked, so another server holding a certificate from the same authority would be accepted.',
+  'dataSources.sslModeHint.verifyFull':
+    'Always encrypted; the server certificate must come from a trusted certificate authority and match the host name. Protects against eavesdropping and impersonation.',
   'dataSources.errors.nameRequired': 'Connection name is required',
   'dataSources.errors.fieldRequired': '{{field}} is required',
+  'dataSources.errors.invalidHost': 'Host must be a valid hostname or IP address',
+  'dataSources.errors.invalidPort': 'Port must be a whole number between 1 and 65535',
+  'dataSources.errors.invalidNumber': '{{field}} must be a whole number',
+  'dataSources.errors.invalidCaCertificate':
+    'Paste the certificate in PEM format: from -----BEGIN CERTIFICATE----- to -----END CERTIFICATE-----, and nothing else',
+  'dataSources.errors.caCertificateTooLarge': 'The CA certificate is too large (limit 64 KB)',
   'dataSources.errors.saveFailed': 'Failed to save connection',
   'dataSources.errors.loadFailed': 'Failed to load connections',
   'dataSources.errors.deleteFailed': 'Failed to delete connection',

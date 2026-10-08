@@ -24,6 +24,7 @@ from sandbox.connectors.mssql_tds import (
     repair_row,
     repair_text,
 )
+from sandbox.connectors.tls import normalize_ssl_mode, refuse_unverifiable
 from sandbox.core.exceptions import ConnectionError, SQLExecutionError
 from sandbox.core.logging import get_logger
 from sandbox.execution.virtual_objects.models import (
@@ -37,6 +38,29 @@ logger = get_logger(__name__)
 
 # Fallback pool for work not tied to one physical connection.
 _executor = ThreadPoolExecutor(max_workers=10)
+
+
+def mssql_encryption(
+    ssl_mode: str | None,
+    *,
+    connection_id: str | None = None,
+    db_type: str | None = None,
+) -> str | None:
+    """FreeTDS's ``encryption`` setting for an SSL mode (see connectors/tls.py).
+
+    None leaves the driver's default in place, which is what every connection
+    saved without an ``ssl_mode`` has always used (FreeTDS asks for TLS and
+    carries on without it when the server has none); the old on/off switch
+    never reached this driver.
+
+    pymssql cannot hand FreeTDS a CA certificate, so the server certificate is
+    never verified here and the verifying modes are refused.
+    """
+    mode = normalize_ssl_mode(ssl_mode)
+    if mode is None:
+        return None
+    refuse_unverifiable(mode, "SQL Server", connection_id=connection_id, db_type=db_type)
+    return {"disable": "off", "allow": "request", "prefer": "request", "require": "require"}[mode]
 
 # Every open pymssql connection gets its own single worker thread, keyed by
 # id(conn).
@@ -118,6 +142,10 @@ class MSSQLConnector(BaseConnector[Any]):
     async def connect(self) -> Any:
         """Create a new SQL Server connection."""
         cfg = self.config
+        encryption = mssql_encryption(
+            cfg.ssl_mode, connection_id=self.connection_id, db_type=self.db_type
+        )
+        tls_args = {"encryption": encryption} if encryption else {}
 
         def _connect() -> Any:
             import pymssql
@@ -141,10 +169,23 @@ class MSSQLConnector(BaseConnector[Any]):
                     timeout=max(1, int(cfg.query_timeout)),
                     as_dict=False,
                     charset="UTF-8",
+                    **tls_args,
                 )
+                if encryption == "require" and negotiated == "7.0":
+                    # TDS 7.0 has no encryption at all, so this session is
+                    # plaintext whatever was asked for.
+                    conn.close()
+                    raise ConnectionError(
+                        "SSL mode 'require' needs an encrypted link, but the server only "
+                        "accepts TDS 7.0, which cannot encrypt. Not connecting.",
+                        connection_id=cfg.id,
+                        db_type="mssql",
+                    )
                 # Remember it on the in-memory config so reconnects skip the probe.
                 cfg.extra_params["tds_version"] = negotiated
                 return conn
+            except ConnectionError:
+                raise
             except pymssql.OperationalError as e:
                 raise ConnectionError(
                     f"Failed to connect to SQL Server: {e}",

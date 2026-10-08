@@ -11,12 +11,61 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, AsyncGenerator
 
 from sandbox.connectors.base import BaseConnector, QueryResult
+from sandbox.connectors.tls import resolve_ssl_mode, system_ca_file
 from sandbox.core.exceptions import ConnectionError, SQLExecutionError
 from sandbox.core.logging import get_logger
 
 logger = get_logger(__name__)
 
 _executor = ThreadPoolExecutor(max_workers=10)
+
+
+def hana_tls_params(
+    mode: str,
+    ca_cert: str | None,
+    *,
+    connection_id: str | None = None,
+    db_type: str | None = None,
+) -> dict[str, Any]:
+    """hdbcli connect properties for an SSL mode (see connectors/tls.py).
+
+    hdbcli has no "TLS if available": a connection is encrypted or it is not,
+    so ``allow``/``prefer`` cannot be honoured and are refused rather than
+    quietly run as something else.
+    """
+    if mode == "disable":
+        return {}
+    if mode in ("allow", "prefer"):
+        raise ConnectionError(
+            f"SSL mode '{mode}' is not available for SAP HANA: the driver either "
+            "encrypts or does not. Use 'disable' or 'require'. Not connecting.",
+            connection_id=connection_id,
+            db_type=db_type,
+        )
+    if mode == "require":
+        return {"encrypt": True, "sslValidateCertificate": False}
+
+    # verify-ca / verify-full: the chain is checked against the given CA, or
+    # the system trust store. hdbcli takes PEM text or a file path here.
+    trust_store = ca_cert or system_ca_file()
+    if not trust_store:
+        raise ConnectionError(
+            f"SSL mode '{mode}' needs to verify the server certificate, but no CA "
+            "certificate was given and this sandbox has no system trust store. "
+            "Add the CA certificate to the connection. Not connecting.",
+            connection_id=connection_id,
+            db_type=db_type,
+        )
+    params: dict[str, Any] = {
+        "encrypt": True,
+        "sslValidateCertificate": True,
+        "sslCryptoProvider": "openssl",
+        "sslTrustStore": trust_store,
+    }
+    if mode == "verify-ca":
+        # "*" accepts any host name; the chain is still verified.
+        params["sslHostNameInCertificate"] = "*"
+    return params
 
 
 class SAPHANAConnector(BaseConnector[Any]):
@@ -30,6 +79,12 @@ class SAPHANAConnector(BaseConnector[Any]):
     async def connect(self) -> Any:
         """Create a new SAP HANA connection."""
         cfg = self.config
+        tls_params = hana_tls_params(
+            resolve_ssl_mode(cfg),
+            cfg.ssl_ca_cert,
+            connection_id=self.connection_id,
+            db_type=self.db_type,
+        )
 
         def _connect() -> Any:
             from hdbcli import dbapi
@@ -44,9 +99,7 @@ class SAPHANAConnector(BaseConnector[Any]):
                     conn_params["databaseName"] = cfg.database
                 if cfg.schema_name:
                     conn_params["currentSchema"] = cfg.schema_name
-                if cfg.ssl_enabled:
-                    conn_params["encrypt"] = True
-                    conn_params["sslValidateCertificate"] = False
+                conn_params.update(tls_params)
 
                 return dbapi.connect(**conn_params)
             except Exception as e:

@@ -50,6 +50,13 @@ def initialize_auth_provider(config) -> AuthProvider:
             headers=auth_config.remote_headers,
         )
     elif provider_type == "noop":
+        # noop authenticates every key, so it only ever runs where the
+        # deployment says it is a development one.
+        if config.environment != "development":
+            raise ValueError(
+                f"Auth provider 'noop' accepts every API key and is refused in the "
+                f"'{config.environment}' environment; use 'static' or 'remote'"
+            )
         _provider = NoopAuthProvider()
     else:
         raise ValueError(

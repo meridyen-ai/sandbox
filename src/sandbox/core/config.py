@@ -90,7 +90,8 @@ class DatabaseConnectionConfig(BaseModel):
     password: SecretStr = Field(..., description="Database password")
     schema_name: str | None = Field(None, description="Default schema")
     ssl_enabled: bool = Field(False, description="Enable SSL/TLS (opt-in; internal Docker Postgres runs ssl=off and rejects upgrades)")
-    ssl_ca_cert: str | None = Field(None, description="SSL CA certificate path")
+    ssl_mode: str | None = Field(None, description="SSL mode (disable, allow, prefer, require, verify-ca, verify-full); unset = decided by ssl_enabled")
+    ssl_ca_cert: str | None = Field(None, description="CA certificate for the verifying SSL modes: PEM text, or a path to a PEM file")
     connection_timeout: int = Field(30, description="Connection timeout in seconds")
     query_timeout: int = Field(300, description="Query timeout in seconds")
     max_pool_size: int = Field(10, description="Maximum connection pool size")
@@ -464,6 +465,7 @@ def save_persisted_connections(config: SandboxConfig) -> None:
                 "password": conn.password.get_secret_value(),
                 "schema_name": conn.schema_name,
                 "ssl_enabled": conn.ssl_enabled,
+                "ssl_mode": conn.ssl_mode,
                 "ssl_ca_cert": conn.ssl_ca_cert,
                 "connection_timeout": conn.connection_timeout,
                 "query_timeout": conn.query_timeout,

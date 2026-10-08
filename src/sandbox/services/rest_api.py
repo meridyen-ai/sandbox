@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import os
+import re
 import secrets
 import threading
 import uuid
@@ -26,7 +28,7 @@ from fastapi import FastAPI, Cookie, File, Form, HTTPException, Depends, Header,
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 import jwt
 
 from sandbox.core.config import get_config
@@ -337,6 +339,20 @@ def _rebuild_li_documents_from_text(text: str, prior: list, *, filename: str,
     return out
 
 
+_FILE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+
+
+def _stored_file_id(file_id: Any) -> str:
+    """A stored document's id, safe to look up on disk.
+
+    The id becomes part of a filesystem glob, so anything but a plain token
+    (path separators, wildcards) is refused instead of being matched."""
+    value = str(file_id or "")
+    if not _FILE_ID_RE.match(value):
+        raise HTTPException(status_code=400, detail="Invalid file id")
+    return value
+
+
 def _make_json_safe(value: Any) -> Any:
     """Convert any database value to a JSON-serializable type.
 
@@ -448,6 +464,47 @@ class ConnectionConfig(BaseModel):
     # Defaulting True caused "rejected SSL upgrade" on every query for sources
     # saved without an explicit ssl flag. Callers that need SSL set it explicitly.
     ssl_enabled: bool = False
+    # The SSL mode the person chose (disable, allow, prefer, require, verify-ca,
+    # verify-full). When given it decides and ssl_enabled is ignored; callers
+    # that only know the switch leave it out and get what the switch always did.
+    ssl_mode: str | None = None
+    # CA certificate (PEM) the verifying modes check the server against.
+    # Configuration, not a secret.
+    ssl_ca_cert: str | None = None
+
+    @field_validator("ssl_mode")
+    @classmethod
+    def _valid_ssl_mode(cls, value: str | None) -> str | None:
+        from sandbox.connectors.tls import normalize_ssl_mode
+        return normalize_ssl_mode(value)
+
+    @field_validator("ssl_ca_cert")
+    @classmethod
+    def _valid_ssl_ca_cert(cls, value: str | None) -> str | None:
+        from sandbox.connectors.tls import validate_ca_certificate
+        return validate_ca_certificate(value)
+
+    @model_validator(mode="after")
+    def _ca_cert_has_a_use(self) -> "ConnectionConfig":
+        from sandbox.connectors.tls import VERIFYING_SSL_MODES, resolve_ssl_mode
+        if self.ssl_ca_cert and resolve_ssl_mode(self) not in VERIFYING_SSL_MODES:
+            raise ValueError(
+                "A CA certificate is only used by the SSL modes that verify the "
+                "server (verify-ca, verify-full)"
+            )
+        return self
+
+    @property
+    def effective_ssl_mode(self) -> str:
+        """The mode this connection runs with (see connectors/tls.py)."""
+        from sandbox.connectors.tls import resolve_ssl_mode
+        return resolve_ssl_mode(self)
+
+    @property
+    def stored_ssl_enabled(self) -> bool:
+        """The on/off switch to store beside the mode: on exactly when the
+        connection insists on TLS."""
+        return self.effective_ssl_mode in ("require", "verify-ca", "verify-full")
 
     @property
     def normalized_db_type(self) -> str:
@@ -505,6 +562,9 @@ class CapabilitiesResponse(BaseModel):
     supports_streaming: bool
     supports_visualization: bool
     has_local_llm: bool
+    # SSL modes this sandbox applies as named. Callers must not ask a sandbox
+    # that does not list a mode to honour it.
+    ssl_modes: list[str] = []
 
 
 # =============================================================================
@@ -512,18 +572,27 @@ class CapabilitiesResponse(BaseModel):
 # =============================================================================
 
 
-def _get_user_jwt_secret() -> str:
-    """Get the JWT secret for user session tokens."""
-    return os.environ.get("SANDBOX_AUTH_JWT_SECRET", "sandbox-jwt-secret-change-me-to-something-secure")
+# How long a user session lasts: the cookie's max-age and the token's own expiry.
+_USER_SESSION_SECONDS = 86400 * 7
 
 
-def _create_user_token(username: str) -> str:
+def _get_user_jwt_secret() -> str | None:
+    """The secret that signs user session tokens, or None when none is configured.
+
+    There is no built-in value: without SANDBOX_AUTH_JWT_SECRET no session
+    token is issued and none is accepted.
+    """
+    return os.environ.get("SANDBOX_AUTH_JWT_SECRET") or None
+
+
+def _create_user_token(username: str, secret: str) -> str:
     """Create a JWT token for an authenticated user."""
-    secret = _get_user_jwt_secret()
+    now = int(datetime.now(timezone.utc).timestamp())
     payload = {
         "sub": username,
         "type": "user_session",
-        "iat": int(datetime.now(timezone.utc).timestamp()),
+        "iat": now,
+        "exp": now + _USER_SESSION_SECONDS,
     }
     return jwt.encode(payload, secret, algorithm="HS256")
 
@@ -531,8 +600,10 @@ def _create_user_token(username: str) -> str:
 def _verify_user_token(token: str) -> dict[str, Any] | None:
     """Verify a user session JWT token. Returns claims or None."""
     secret = _get_user_jwt_secret()
+    if not secret:
+        return None
     try:
-        return jwt.decode(token, secret, algorithms=["HS256"])
+        return jwt.decode(token, secret, algorithms=["HS256"], options={"require": ["exp"]})
     except jwt.InvalidTokenError:
         return None
 
@@ -690,25 +761,21 @@ async def verify_sandbox_token(
         }
 
     # 3. Otherwise, try to decode as JWT (legacy method for platform communication)
+    secret = config.platform.registration_token
+    if not secret:
+        # Nothing to verify the token against, so it proves nothing.
+        raise AuthenticationError(
+            "Invalid token: this sandbox accepts a sandbox API key (sb_...) or a login session"
+        )
     try:
-        secret = config.platform.registration_token
-        if secret:
-            payload = jwt.decode(
-                api_key,
-                secret.get_secret_value(),
-                algorithms=["HS256"],
-                audience="sandbox-executor",
-            )
-            payload["auth_type"] = "jwt"
-            return payload
-        else:
-            # Development mode - accept any token
-            logger.warning("Development mode: accepting token without verification")
-            return {
-                "auth_type": "dev",
-                "space_id": "dev",
-                "permissions": {}
-            }
+        payload = jwt.decode(
+            api_key,
+            secret.get_secret_value(),
+            algorithms=["HS256"],
+            audience="sandbox-executor",
+        )
+        payload["auth_type"] = "jwt"
+        return payload
 
     except jwt.ExpiredSignatureError:
         raise AuthenticationError("Token expired")
@@ -886,6 +953,7 @@ def register_routes(app: FastAPI) -> None:
     async def get_capabilities() -> CapabilitiesResponse:
         """Get sandbox capabilities."""
         from sandbox.connectors.factory import get_available_connectors
+        from sandbox.connectors.tls import SSL_MODES
 
         config = get_config()
 
@@ -905,6 +973,7 @@ def register_routes(app: FastAPI) -> None:
             supports_streaming=True,
             supports_visualization=True,
             has_local_llm=config.local_llm.enabled,
+            ssl_modes=list(SSL_MODES),
         )
 
     # ==========================================================================
@@ -914,14 +983,24 @@ def register_routes(app: FastAPI) -> None:
     @app.post("/api/v1/auth/login", tags=["Auth"])
     async def auth_login(payload: LoginRequest, response: Response) -> JSONResponse:
         """Authenticate with username and password defined in .env."""
-        expected_username = os.environ.get("SANDBOX_AUTH_USERNAME", "admin")
-        expected_password = os.environ.get("SANDBOX_AUTH_PASSWORD", "admin123")
+        expected_username = os.environ.get("SANDBOX_AUTH_USERNAME")
+        expected_password = os.environ.get("SANDBOX_AUTH_PASSWORD")
+        secret = _get_user_jwt_secret()
+        if not (expected_username and expected_password and secret):
+            raise HTTPException(
+                status_code=503,
+                detail="Login is not configured on this sandbox: set SANDBOX_AUTH_USERNAME, "
+                       "SANDBOX_AUTH_PASSWORD and SANDBOX_AUTH_JWT_SECRET",
+            )
 
-        if (
-            payload.username.lower() == expected_username.lower()
-            and payload.password == expected_password
-        ):
-            token = _create_user_token(payload.username)
+        username_ok = hmac.compare_digest(
+            payload.username.lower().encode(), expected_username.lower().encode()
+        )
+        password_ok = hmac.compare_digest(
+            payload.password.encode(), expected_password.encode()
+        )
+        if username_ok and password_ok:
+            token = _create_user_token(payload.username, secret)
             response = JSONResponse(
                 content={
                     "username": payload.username,
@@ -934,7 +1013,7 @@ def register_routes(app: FastAPI) -> None:
                 httponly=True,
                 secure=os.environ.get("SANDBOX_ENVIRONMENT", "") in ("production", "preprod"),
                 samesite="lax",
-                max_age=86400 * 7,  # 7 days
+                max_age=_USER_SESSION_SECONDS,
                 path="/",
             )
             return response
@@ -1282,6 +1361,7 @@ def register_routes(app: FastAPI) -> None:
                 "port": row["port"],
                 "database": row["database"],
                 "schema": row.get("schema_name"),
+                "ssl_mode": row.get("ssl_mode"),
                 "is_default": False,
                 "created_at": row.get("created_at"),
                 "updated_at": row.get("updated_at"),
@@ -1318,6 +1398,8 @@ def register_routes(app: FastAPI) -> None:
                 "password": row["password"],
                 "schema_name": row.get("schema_name"),
                 "ssl_enabled": row.get("ssl_enabled", False),
+                "ssl_mode": row.get("ssl_mode"),
+                "ssl_ca_cert": row.get("ssl_ca_cert"),
             }
         )
 
@@ -1344,7 +1426,9 @@ def register_routes(app: FastAPI) -> None:
             "username": connection.username,
             "password": connection.password,
             "schema_name": connection.schema_name,
-            "ssl_enabled": connection.ssl_enabled,
+            "ssl_enabled": connection.stored_ssl_enabled,
+            "ssl_mode": connection.ssl_mode,
+            "ssl_ca_cert": connection.ssl_ca_cert,
         })
 
         # Also add to in-memory config so queries work immediately
@@ -1359,7 +1443,9 @@ def register_routes(app: FastAPI) -> None:
             username=connection.username,
             password=SecretStr(connection.password),
             schema_name=connection.schema_name,
-            ssl_enabled=connection.ssl_enabled,
+            ssl_enabled=connection.stored_ssl_enabled,
+            ssl_mode=connection.ssl_mode,
+            ssl_ca_cert=connection.ssl_ca_cert,
             created_at=row["created_at"] if row else None,
             updated_at=row["updated_at"] if row else None,
         )
@@ -1372,6 +1458,7 @@ def register_routes(app: FastAPI) -> None:
             content={
                 "id": conn_id,
                 "name": connection.name,
+                "ssl_mode": connection.effective_ssl_mode,
                 "message": "Connection created successfully"
             }
         )
@@ -1387,7 +1474,7 @@ def register_routes(app: FastAPI) -> None:
         from sandbox.core.config import DatabaseConnectionConfig, DatabaseType, get_config
         from pydantic import SecretStr
 
-        row = db_update_connection(connection_id, {
+        changes = {
             "name": connection.name,
             "db_type": connection.normalized_db_type,
             "host": connection.host,
@@ -1396,8 +1483,28 @@ def register_routes(app: FastAPI) -> None:
             "username": connection.username,
             "password": connection.password,
             "schema_name": connection.schema_name,
-            "ssl_enabled": connection.ssl_enabled,
-        })
+        }
+        if "ssl_mode" in connection.model_fields_set:
+            changes["ssl_enabled"] = connection.stored_ssl_enabled
+            changes["ssl_mode"] = connection.ssl_mode
+            changes["ssl_ca_cert"] = connection.ssl_ca_cert
+        else:
+            # A caller that only knows the on/off switch. It must not undo an
+            # SSL mode someone chose for this connection, so the stored mode
+            # and CA stay - unless the stored mode does not insist on TLS and
+            # the caller turns SSL on, which then means what it always meant.
+            from sandbox.core.connection_store import get_connection as db_get_connection
+            stored = db_get_connection(connection_id) or {}
+            if not stored.get("ssl_mode"):
+                changes["ssl_enabled"] = connection.ssl_enabled
+                if "ssl_ca_cert" in connection.model_fields_set:
+                    changes["ssl_ca_cert"] = connection.ssl_ca_cert
+            elif connection.ssl_enabled and stored["ssl_mode"] in ("disable", "allow", "prefer"):
+                changes["ssl_enabled"] = True
+                changes["ssl_mode"] = None
+                changes["ssl_ca_cert"] = connection.ssl_ca_cert
+
+        row = db_update_connection(connection_id, changes)
 
         if not row:
             raise HTTPException(status_code=404, detail="Connection not found")
@@ -1416,7 +1523,9 @@ def register_routes(app: FastAPI) -> None:
                     username=connection.username,
                     password=SecretStr(connection.password),
                     schema_name=connection.schema_name,
-                    ssl_enabled=connection.ssl_enabled,
+                    ssl_enabled=row.get("ssl_enabled", False),
+                    ssl_mode=row.get("ssl_mode"),
+                    ssl_ca_cert=row.get("ssl_ca_cert"),
                     created_at=row.get("created_at"),
                     updated_at=row.get("updated_at"),
                 )
@@ -1540,7 +1649,9 @@ def register_routes(app: FastAPI) -> None:
                 username=connection.username,
                 password=SecretStr(connection.password),
                 schema_name=connection.schema_name,
-                ssl_enabled=connection.ssl_enabled,
+                ssl_enabled=connection.stored_ssl_enabled,
+                ssl_mode=connection.ssl_mode,
+                ssl_ca_cert=connection.ssl_ca_cert,
             )
 
             # Get connector and test
@@ -1553,6 +1664,7 @@ def register_routes(app: FastAPI) -> None:
                 content={
                     "success": is_valid,
                     "message": "Connection successful" if is_valid else "Connection test failed",
+                    "ssl_mode": connection.effective_ssl_mode,
                 }
             )
 
@@ -3269,7 +3381,10 @@ def register_routes(app: FastAPI) -> None:
 
     # --- Load Spreadsheet into PostgreSQL tables ---
     @app.post("/api/v1/documents/load-spreadsheet", tags=["Documents"])
-    async def load_spreadsheet_document(request: Request):
+    async def load_spreadsheet_document(
+        request: Request,
+        token_data: dict = Depends(verify_sandbox_token),
+    ):
         """
         Load an already-uploaded Excel/CSV document into PostgreSQL tables.
 
@@ -3316,7 +3431,7 @@ def register_routes(app: FastAPI) -> None:
         # search recursively (same strategy as /documents/process).
         data_dir = Path("/app/data/documents")
         file_path = None
-        for p in data_dir.rglob(f"{file_id}*"):
+        for p in data_dir.rglob(f"{_stored_file_id(file_id)}*"):
             if p.is_file():
                 file_path = str(p)
                 break
@@ -3450,7 +3565,10 @@ def register_routes(app: FastAPI) -> None:
 
     # --- Create Knowledge Base ---
     @app.post("/api/v1/documents/create-kb", tags=["Documents"])
-    async def create_knowledge_base(request: Request):
+    async def create_knowledge_base(
+        request: Request,
+        token_data: dict = Depends(verify_sandbox_token),
+    ):
         """Create a new knowledge base."""
         from sqlalchemy import text as sql_text
         body = await request.json()
@@ -3492,6 +3610,7 @@ def register_routes(app: FastAPI) -> None:
         file: UploadFile = File(...),
         space_id: str = Form(""),
         folder_path: str = Form(""),
+        token_data: dict = Depends(verify_sandbox_token),
     ):
         """
         Upload a document file to the sandbox filesystem.
@@ -3535,7 +3654,10 @@ def register_routes(app: FastAPI) -> None:
 
     # --- Load Spreadsheet (Excel/CSV) into PostgreSQL ---
     @app.post("/api/v1/documents/load-spreadsheet", tags=["Documents"])
-    async def load_spreadsheet(request: Request):
+    async def load_spreadsheet(
+        request: Request,
+        token_data: dict = Depends(verify_sandbox_token),
+    ):
         """
         Load an uploaded Excel/CSV file into PostgreSQL tables.
 
@@ -3564,7 +3686,7 @@ def register_routes(app: FastAPI) -> None:
         # Find the uploaded file on disk
         data_dir = Path("/app/data/documents")
         file_path = None
-        for p in data_dir.rglob(f"{file_id}*"):
+        for p in data_dir.rglob(f"{_stored_file_id(file_id)}*"):
             if p.is_file():
                 file_path = p
                 break
@@ -3815,7 +3937,10 @@ def register_routes(app: FastAPI) -> None:
 
     # --- Process Document ---
     @app.post("/api/v1/documents/process", tags=["Documents"])
-    async def process_document(request: Request):
+    async def process_document(
+        request: Request,
+        token_data: dict = Depends(verify_sandbox_token),
+    ):
         """
         Process a document using Unstructured (parsing) + the local model (embeddings).
         Supports OCR strategies: "local" (Tesseract) or "google_vision".
@@ -3840,7 +3965,7 @@ def register_routes(app: FastAPI) -> None:
         # at /app/data/documents/{space_id}/{folder_path}/{file_id}.ext
         data_dir = Path("/app/data/documents")
         file_path = None
-        for p in data_dir.rglob(f"{file_id}*"):
+        for p in data_dir.rglob(f"{_stored_file_id(file_id)}*"):
             if p.is_file():
                 file_path = p
                 break
@@ -4926,7 +5051,10 @@ def register_routes(app: FastAPI) -> None:
 
     # --- Query KB Vectors ---
     @app.post("/api/v1/documents/query", tags=["Documents"])
-    async def query_kb_vectors(request: Request):
+    async def query_kb_vectors(
+        request: Request,
+        token_data: dict = Depends(verify_sandbox_token),
+    ):
         """
         Search for similar document chunks using LlamaIndex's VectorStoreIndex.
         Supports path-based filtering (search within specific directories).
@@ -5062,7 +5190,10 @@ def register_routes(app: FastAPI) -> None:
     # Returns chunks immediately before/after a given chunk within the same file.
     # Lets the agent request surrounding context on demand ("small-to-big" retrieval).
     @app.post("/api/v1/documents/chunks/neighbors", tags=["Documents"])
-    async def get_chunk_neighbors(request: Request):
+    async def get_chunk_neighbors(
+        request: Request,
+        token_data: dict = Depends(verify_sandbox_token),
+    ):
         """
         Fetch chunks surrounding a target chunk by (kb_id, file_id, chunk_index).
         Body: {"kb_id": 2, "file_id": "abc-...", "chunk_index": 12, "window": 2}
@@ -5145,7 +5276,11 @@ def register_routes(app: FastAPI) -> None:
 
     # --- KB Status ---
     @app.get("/api/v1/documents/kb-status", tags=["Documents"])
-    async def get_kb_status(kb_id: str, space_id: str = ""):
+    async def get_kb_status(
+        kb_id: str,
+        space_id: str = "",
+        token_data: dict = Depends(verify_sandbox_token),
+    ):
         """Get knowledge base processing status."""
         from sqlalchemy import text as sql_text
 
@@ -5176,7 +5311,11 @@ def register_routes(app: FastAPI) -> None:
 
     # --- List KB Documents ---
     @app.get("/api/v1/documents/list", tags=["Documents"])
-    async def list_kb_documents(kb_id: str, space_id: str = ""):
+    async def list_kb_documents(
+        kb_id: str,
+        space_id: str = "",
+        token_data: dict = Depends(verify_sandbox_token),
+    ):
         """List all documents in a knowledge base."""
         from sqlalchemy import text as sql_text
 
@@ -5211,7 +5350,10 @@ def register_routes(app: FastAPI) -> None:
         return {"documents": docs}
 
     @app.get("/api/v1/documents/by-file/{file_id}/status", tags=["Documents"])
-    async def get_document_status(file_id: str):
+    async def get_document_status(
+        file_id: str,
+        token_data: dict = Depends(verify_sandbox_token),
+    ):
         """Return the current processing status/progress for a single document by
         file_id. The backend polls this while a long index (e.g. video whisper
         transcription) runs, so it can mirror live progress into its own DB instead
@@ -5240,7 +5382,11 @@ def register_routes(app: FastAPI) -> None:
         }
 
     @app.get("/api/v1/documents/by-file/{file_id}/transcript", tags=["Documents"])
-    async def get_document_transcript(file_id: str, format: str = "text"):
+    async def get_document_transcript(
+        file_id: str,
+        format: str = "text",
+        token_data: dict = Depends(verify_sandbox_token),
+    ):
         """Return the full extracted body of a document, looked up by its stable
         file_id. `format=text` (default) returns the plain extracted_text;
         `format=md` returns the Markdown rendition (headings/lists/tables
@@ -5492,14 +5638,18 @@ def register_routes(app: FastAPI) -> None:
 
     # --- Serve Document File ---
     @app.get("/api/v1/documents/file/{file_id}", tags=["Documents"])
-    async def get_document_file(file_id: str, space_id: str = ""):
+    async def get_document_file(
+        file_id: str,
+        space_id: str = "",
+        token_data: dict = Depends(verify_sandbox_token),
+    ):
         """Serve a document file from sandbox storage."""
         # Find the file by matching the stem (filename without extensions)
         # Use strict matching: filename must START with file_id and have ONE extension after
         # This prevents matching side-files like "{uuid}.mp4.wav" when looking for "{uuid}.mp4"
         data_dir = Path("/app/data/documents")
         best_match = None
-        for p in data_dir.rglob(f"{file_id}*"):
+        for p in data_dir.rglob(f"{_stored_file_id(file_id)}*"):
             if not p.is_file():
                 continue
             # Strict: filename is exactly "{file_id}.{ext}" (no extra extensions like .mp4.wav)
@@ -5531,7 +5681,11 @@ def register_routes(app: FastAPI) -> None:
 
     # --- Serve Spreadsheet as JSON ---
     @app.get("/api/v1/documents/file/{file_id}/sheets", tags=["Documents"])
-    async def get_spreadsheet_sheets(file_id: str, space_id: str = ""):
+    async def get_spreadsheet_sheets(
+        file_id: str,
+        space_id: str = "",
+        token_data: dict = Depends(verify_sandbox_token),
+    ):
         """Parse a spreadsheet file server-side and return all sheets as JSON.
 
         Much faster than client-side parsing for large files.
@@ -5541,7 +5695,7 @@ def register_routes(app: FastAPI) -> None:
 
         data_dir = Path("/app/data/documents")
         file_path = None
-        for p in data_dir.rglob(f"{file_id}*"):
+        for p in data_dir.rglob(f"{_stored_file_id(file_id)}*"):
             if p.is_file():
                 ext = p.suffix.lower()
                 if ext in (".xlsx", ".xls", ".xlsb", ".csv"):
@@ -5583,7 +5737,12 @@ def register_routes(app: FastAPI) -> None:
 
     # --- Delete Document ---
     @app.delete("/api/v1/documents/{doc_id}", tags=["Documents"])
-    async def delete_kb_document(doc_id: str, kb_id: str = "", space_id: str = ""):
+    async def delete_kb_document(
+        doc_id: str,
+        kb_id: str = "",
+        space_id: str = "",
+        token_data: dict = Depends(verify_sandbox_token),
+    ):
         """Delete a document and its chunks from the knowledge base."""
         from sqlalchemy import text as sql_text
 

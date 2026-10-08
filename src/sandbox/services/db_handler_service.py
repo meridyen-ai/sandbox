@@ -138,6 +138,31 @@ class BaseDBHandler(ABC):
         pass
 
 
+def _ssl_args(modes: tuple, default: str) -> List[ConnectionArg]:
+    """The SSL Mode choice and the CA certificate box that goes with it.
+
+    Only modes the engine's connector really applies are offered; the CA box
+    shows for the modes that verify the server certificate.
+    """
+    return [
+        ConnectionArg(
+            "ssl_mode", "select", "SSL Mode", "SSL connection mode", required=False,
+            default=default, options=[{"value": m, "label": m} for m in modes],
+        ),
+        ConnectionArg(
+            "ssl_ca_cert", "text", "CA Certificate",
+            "Paste the CA certificate (PEM). Leave empty to trust the public certificate authorities.",
+            required=False, depends_on={"field": "ssl_mode", "values": ["verify-ca", "verify-full"]},
+        ),
+    ]
+
+
+# sslmode values as PostgreSQL defines them.
+_LIBPQ_SSL_MODES = ("disable", "allow", "prefer", "require", "verify-ca", "verify-full")
+# MySQL has no "allow"; the rest map to DISABLED, PREFERRED, REQUIRED, VERIFY_CA, VERIFY_IDENTITY.
+_MYSQL_SSL_MODES = ("disable", "prefer", "require", "verify-ca", "verify-full")
+
+
 class PostgresHandler(BaseDBHandler):
     """PostgreSQL database handler."""
 
@@ -152,7 +177,7 @@ class PostgresHandler(BaseDBHandler):
         ConnectionArg("database", "string", "Database", "Database name", required=True),
         ConnectionArg("username", "string", "Username", "Database username", required=True),
         ConnectionArg("password", "password", "Password", "Database password", required=True, secret=True),
-        ConnectionArg("ssl_mode", "string", "SSL Mode", "SSL connection mode (disable, require, verify-ca, verify-full)", required=False),
+        *_ssl_args(_LIBPQ_SSL_MODES, "prefer"),
     ]
 
     @classmethod
@@ -272,7 +297,7 @@ class MySQLHandler(BaseDBHandler):
         ConnectionArg("database", "string", "Database", "Database name", required=True),
         ConnectionArg("username", "string", "Username", "Database username", required=True),
         ConnectionArg("password", "password", "Password", "Database password", required=True, secret=True),
-        ConnectionArg("ssl_mode", "string", "SSL Mode", "Use SSL (true/false)", required=False),
+        *_ssl_args(_MYSQL_SSL_MODES, "prefer"),
     ]
 
     @classmethod
@@ -760,7 +785,7 @@ class RedshiftHandler(BaseDBHandler):
         ConnectionArg("user", "string", "User", "Database username", required=True),
         ConnectionArg("password", "password", "Password", "Database password", required=True, secret=True),
         ConnectionArg("database", "string", "Database", "Database name", required=True),
-        ConnectionArg("ssl_mode", "string", "SSL Mode", "SSL connection mode (optional)", required=False, default="require"),
+        *_ssl_args(_LIBPQ_SSL_MODES, "require"),
     ]
 
     @classmethod
@@ -1061,7 +1086,7 @@ class SAPHANAHandler(BaseDBHandler):
         ConnectionArg("password", "password", "Password", "The password for the SAP HANA database", required=True, secret=True),
         ConnectionArg("database", "string", "Database", "The name of the database to connect to", required=False),
         ConnectionArg("schema", "string", "Schema", "The database schema to use", required=False),
-        ConnectionArg("encrypt", "boolean", "Encrypt", "Enable/disable encryption (default: True)", required=False, default=True),
+        ConnectionArg("encrypt", "boolean", "Encrypt", "Encrypt the link to the database. The server certificate is not verified.", required=False, default=True),
     ]
 
     @classmethod

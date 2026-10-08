@@ -74,6 +74,11 @@ def ensure_connections_table() -> None:
                 updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
         """))
+        # The SSL mode the person chose. NULL on every row saved before the
+        # column existed: those keep running on ssl_enabled, unchanged.
+        conn.execute(text(
+            "ALTER TABLE connections ADD COLUMN IF NOT EXISTS ssl_mode TEXT"
+        ))
     logger.info("connections_table_ensured")
 
 
@@ -91,6 +96,7 @@ def _row_to_dict(row: Any) -> dict:
         "password": mapping["password"],
         "schema_name": mapping["schema_name"],
         "ssl_enabled": mapping["ssl_enabled"],
+        "ssl_mode": mapping["ssl_mode"],
         "ssl_ca_cert": mapping["ssl_ca_cert"],
         "connection_timeout": mapping["connection_timeout"],
         "query_timeout": mapping["query_timeout"],
@@ -133,12 +139,12 @@ def create_connection(data: dict) -> dict:
         conn.execute(text("""
             INSERT INTO connections
                 (id, name, db_type, host, port, database, username, password,
-                 schema_name, ssl_enabled, ssl_ca_cert,
+                 schema_name, ssl_enabled, ssl_mode, ssl_ca_cert,
                  connection_timeout, query_timeout, max_pool_size,
                  extra_params, selected_tables, created_at, updated_at)
             VALUES
                 (:id, :name, :db_type, :host, :port, :database, :username, :password,
-                 :schema_name, :ssl_enabled, :ssl_ca_cert,
+                 :schema_name, :ssl_enabled, :ssl_mode, :ssl_ca_cert,
                  :connection_timeout, :query_timeout, :max_pool_size,
                  :extra_params, :selected_tables, :created_at, :updated_at)
             ON CONFLICT (id) DO UPDATE SET
@@ -151,6 +157,7 @@ def create_connection(data: dict) -> dict:
                 password = EXCLUDED.password,
                 schema_name = EXCLUDED.schema_name,
                 ssl_enabled = EXCLUDED.ssl_enabled,
+                ssl_mode = EXCLUDED.ssl_mode,
                 ssl_ca_cert = EXCLUDED.ssl_ca_cert,
                 connection_timeout = EXCLUDED.connection_timeout,
                 query_timeout = EXCLUDED.query_timeout,
@@ -169,6 +176,7 @@ def create_connection(data: dict) -> dict:
             "password": data.get("password", ""),
             "schema_name": data.get("schema_name"),
             "ssl_enabled": data.get("ssl_enabled", False),
+            "ssl_mode": data.get("ssl_mode"),
             "ssl_ca_cert": data.get("ssl_ca_cert"),
             "connection_timeout": data.get("connection_timeout", 30),
             "query_timeout": data.get("query_timeout", 300),
@@ -200,6 +208,7 @@ def update_connection(connection_id: str, data: dict) -> dict | None:
                 password = :password,
                 schema_name = :schema_name,
                 ssl_enabled = :ssl_enabled,
+                ssl_mode = :ssl_mode,
                 ssl_ca_cert = :ssl_ca_cert,
                 connection_timeout = :connection_timeout,
                 query_timeout = :query_timeout,
@@ -219,6 +228,7 @@ def update_connection(connection_id: str, data: dict) -> dict | None:
             "password": data.get("password", existing["password"]),
             "schema_name": data.get("schema_name", existing["schema_name"]),
             "ssl_enabled": data.get("ssl_enabled", existing["ssl_enabled"]),
+            "ssl_mode": data.get("ssl_mode", existing["ssl_mode"]),
             "ssl_ca_cert": data.get("ssl_ca_cert", existing["ssl_ca_cert"]),
             "connection_timeout": data.get("connection_timeout", existing["connection_timeout"]),
             "query_timeout": data.get("query_timeout", existing["query_timeout"]),
