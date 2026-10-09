@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import re
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -141,13 +142,44 @@ def sanitize_db_name(name: str) -> str:
     return db_name[:63]
 
 
-def create_upload_database(upload_name: str) -> tuple[Engine, dict[str, Any]]:
+# Room kept at the end of a database name for the per-upload suffix ("_" + 12 hex).
+_UPLOAD_DB_SUFFIX_LEN = 13
+_UPLOAD_DB_NAME_RE = re.compile(r"upload_[a-z0-9_]{1,56}")
+
+
+def unique_upload_db_name(upload_name: str) -> str:
+    """A database name for ONE upload: the readable name plus a random suffix.
+
+    The name alone is not an identity: two people, or two spaces, may call their
+    upload the same thing, and they must never land in the same database.
+    """
+    base = sanitize_db_name(upload_name)[: 63 - _UPLOAD_DB_SUFFIX_LEN].rstrip("_")
+    return f"{base}_{uuid.uuid4().hex[:12]}"
+
+
+def is_upload_server(host: Any, port: Any) -> bool:
+    """True when host and port are the server the per-upload databases live on."""
+    try:
+        same_port = int(port or 0) == _UPLOAD_DB_PORT
+    except (TypeError, ValueError):
+        return False
+    return same_port and str(host or "").strip().lower() == _UPLOAD_DB_HOST.strip().lower()
+
+
+def create_upload_database(upload_name: str, reuse: str | None = None) -> tuple[Engine, dict[str, Any]]:
     """Create a new PostgreSQL database for this upload and return engine + config.
+
+    Every call makes a database of its own. ``reuse`` names an upload database
+    that already holds this source's earlier files (the files of one document
+    connection share one database); it is used when it exists, otherwise a new
+    one is made.
 
     Uses the default upload database connection to issue CREATE DATABASE,
     then returns an engine connected to the new database.
     """
-    db_name = sanitize_db_name(upload_name)
+    reuse = reuse.strip() if isinstance(reuse, str) else ""
+    if not _UPLOAD_DB_NAME_RE.fullmatch(reuse):
+        reuse = ""
 
     # Connect to the default database to create the new one
     # We need autocommit because CREATE DATABASE cannot run inside a transaction
@@ -159,16 +191,17 @@ def create_upload_database(upload_name: str) -> tuple[Engine, dict[str, Any]]:
 
     try:
         with admin_engine.connect() as conn:
-            # Check if database already exists
-            result = conn.execute(
+            exists = bool(reuse) and conn.execute(
                 text("SELECT 1 FROM pg_database WHERE datname = :name"),
-                {"name": db_name},
-            )
-            if not result.fetchone():
+                {"name": reuse},
+            ).fetchone() is not None
+            if exists:
+                db_name = reuse
+                logger.info("upload_database_reused", database=db_name)
+            else:
+                db_name = unique_upload_db_name(upload_name)
                 conn.execute(text(f'CREATE DATABASE "{db_name}"'))
                 logger.info("upload_database_created", database=db_name)
-            else:
-                logger.info("upload_database_exists", database=db_name)
     finally:
         admin_engine.dispose()
 

@@ -61,9 +61,14 @@ class HandlerInfo:
     icon: Optional[str] = None
     connection_args: List[ConnectionArg] = None
     available: bool = True
+    # False for a type this sandbox has no connector code for: it can never
+    # connect, whatever is installed. (available=False with supported=True is a
+    # known type whose driver is missing.)
+    supported: bool = True
 
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "supported": self.supported,
             "name": self.name,
             "type": self.type,
             "title": self.title,
@@ -103,6 +108,19 @@ class BaseDBHandler(ABC):
         cfg = get_config()
         mark_all = cfg.handlers_catalog_mark_all_available or cfg.is_airgapped()
         available = True if mark_all else cls.is_available()
+        # A database type is only offered when this sandbox has a connector for
+        # it: connections are tested, stored and queried through the connectors,
+        # so a type without one fails on its first test whatever was typed in
+        # its form. File sources are loaded by the upload routes instead.
+        if available and cls.type != "file":
+            from sandbox.connectors.factory import has_connector
+
+            available = has_connector(cls.name)
+        supported = True
+        if cls.type != "file":
+            from sandbox.connectors.factory import is_supported
+
+            supported = is_supported(cls.name)
         return HandlerInfo(
             name=cls.name,
             type=cls.type,
@@ -111,6 +129,7 @@ class BaseDBHandler(ABC):
             icon=cls.icon,
             connection_args=cls.connection_args,
             available=available,
+            supported=supported,
         )
 
     @classmethod

@@ -841,9 +841,9 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
         </button>
       </div>
 
-      <div className="flex-1 flex min-h-0 border border-gray-200 dark:border-gray-700 rounded-lg overflow-hidden bg-white dark:bg-gray-900">
-        {/* ============ Object explorer ============ */}
-        <div className="w-[340px] xl:w-[380px] shrink-0 flex flex-col border-r border-gray-200 dark:border-gray-700 bg-gray-50/60 dark:bg-gray-900">
+      <div className="flex-1 flex max-md:flex-col min-h-0 border border-gray-200 dark:border-gray-700 rounded-lg overflow-hidden bg-white dark:bg-gray-900">
+        {/* ============ Object explorer ============ (on a phone it sits above the details, not beside them) */}
+        <div className="w-[340px] xl:w-[380px] max-md:w-full max-md:max-h-[45%] max-md:min-h-0 shrink-0 flex flex-col border-r max-md:border-r-0 max-md:border-b border-gray-200 dark:border-gray-700 bg-gray-50/60 dark:bg-gray-900">
           {/* Toolbar: search + filters */}
           <div className="px-2 pt-2 pb-1.5 border-b border-gray-200 dark:border-gray-700 space-y-1.5">
             <div className="flex items-center gap-1">
@@ -1142,7 +1142,7 @@ export const TableColumnSelector: React.FC<TableColumnSelectorProps> = ({
         </div>
 
         {/* ============ Details ============ */}
-        <div className="flex-1 min-w-0 flex flex-col">
+        <div className="flex-1 min-w-0 max-md:min-h-0 flex flex-col">
           {selectedTable ? (
             <>
               <div className="flex items-center gap-2 px-3 h-10 border-b border-gray-200 dark:border-gray-700 bg-gray-50/60 dark:bg-gray-900">

@@ -353,6 +353,35 @@ def _stored_file_id(file_id: Any) -> str:
     return value
 
 
+_DOCUMENTS_DIR = Path("/app/data/documents")
+_SPACE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+
+
+def _document_space(space_id: Any, *, required: bool = True) -> str | None:
+    """The space a document call is made for.
+
+    Stored documents live under ``/app/data/documents/{space_id}/`` and every
+    knowledge base records its space, so a call that names its space reaches
+    that space's documents and no other's. The id becomes a directory name, so
+    anything but a plain token is refused. None when no space was given and
+    the route does not insist on one."""
+    value = "" if space_id is None else str(space_id).strip()
+    if not value:
+        if required:
+            raise HTTPException(status_code=400, detail="space_id is required")
+        return None
+    if not _SPACE_ID_RE.match(value):
+        raise HTTPException(status_code=400, detail="Invalid space id")
+    return value
+
+
+def _stored_documents(file_id: Any, space: str | None) -> list[Path]:
+    """Stored files whose name starts with ``file_id``, inside ``space``'s
+    directory (anywhere in the store when no space is given)."""
+    root = _DOCUMENTS_DIR / space if space else _DOCUMENTS_DIR
+    return [p for p in root.rglob(f"{_stored_file_id(file_id)}*") if p.is_file()]
+
+
 def _make_json_safe(value: Any) -> Any:
     """Convert any database value to a JSON-serializable type.
 
@@ -457,7 +486,8 @@ class ConnectionConfig(BaseModel):
     port: int
     database: str
     username: str
-    password: str
+    # Left out (or empty) on an update: the stored password is kept.
+    password: str = ""
     schema_name: str | None = None
     # SSL must be opt-in: internal Docker-network Postgres (postgres, os-postgres,
     # sandbox-postgres, shared-postgres) run with ssl=off and reject the upgrade.
@@ -511,6 +541,15 @@ class ConnectionConfig(BaseModel):
         """Normalize common db_type aliases to canonical enum values."""
         from sandbox.core.config import normalize_db_type
         return normalize_db_type(self.db_type)
+
+
+def _unsupported_db_type(db_type: str) -> str | None:
+    """Why this sandbox cannot connect to a database type, or None if it can."""
+    from sandbox.connectors.factory import has_connector
+
+    if has_connector(db_type):
+        return None
+    return f"This sandbox cannot connect to '{db_type}' databases"
 
 
 class AIGenerateQueryRequest(BaseModel):
@@ -844,11 +883,14 @@ def create_rest_app() -> FastAPI:
         redoc_url="/redoc" if config.debug else None,
     )
 
-    # CORS middleware — allow all origins for sandbox (API key or cookie auth handles security)
+    # CORS middleware — any origin may call with an API key it holds, but no
+    # origin may ride on a browser's credentials: with a wildcard origin and
+    # credentials allowed, any website could use a signed-in user's session
+    # cookie. The sandbox's own UI is served from this origin and needs no CORS.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
-        allow_credentials=True,
+        allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
     )
@@ -950,8 +992,11 @@ def register_routes(app: FastAPI) -> None:
         return response
 
     @app.get("/capabilities", response_model=CapabilitiesResponse, tags=["Health"])
-    async def get_capabilities() -> CapabilitiesResponse:
-        """Get sandbox capabilities."""
+    async def get_capabilities(
+        token_data: dict = Depends(verify_sandbox_token),
+    ) -> CapabilitiesResponse:
+        """Get sandbox capabilities (drivers, limits, TLS modes) for a caller
+        that holds the sandbox's key; /health is the open probe."""
         from sandbox.connectors.factory import get_available_connectors
         from sandbox.connectors.tls import SSL_MODES
 
@@ -1325,7 +1370,9 @@ def register_routes(app: FastAPI) -> None:
     # ==========================================================================
 
     @app.get("/api/v1/handlers", tags=["Handlers"])
-    async def list_handlers() -> JSONResponse:
+    async def list_handlers(
+        token_data: dict = Depends(verify_sandbox_token),
+    ) -> JSONResponse:
         """
         List all available database handlers.
 
@@ -1414,6 +1461,12 @@ def register_routes(app: FastAPI) -> None:
         from pydantic import SecretStr
         import uuid
 
+        # Refused before anything is stored: a connection of a type with no
+        # connector could never be queried.
+        unsupported = _unsupported_db_type(connection.db_type)
+        if unsupported:
+            raise HTTPException(status_code=400, detail=unsupported)
+
         conn_id = connection.id or str(uuid.uuid4())
 
         row = db_create_connection({
@@ -1470,9 +1523,41 @@ def register_routes(app: FastAPI) -> None:
         token_data: dict = Depends(verify_sandbox_token),
     ) -> JSONResponse:
         """Update an existing database connection."""
+        from sandbox.core.connection_store import get_connection as db_get_connection
         from sandbox.core.connection_store import update_connection as db_update_connection
         from sandbox.core.config import DatabaseConnectionConfig, DatabaseType, get_config
         from pydantic import SecretStr
+
+        stored = db_get_connection(connection_id)
+        if not stored:
+            raise HTTPException(status_code=404, detail="Connection not found")
+
+        unsupported = _unsupported_db_type(connection.db_type)
+        if unsupported:
+            raise HTTPException(status_code=400, detail=unsupported)
+
+        # No password sent means "keep the one that is stored" (a caller never
+        # gets it back to send it again). The stored one is only ever kept for
+        # the account it was entered for: pointing the connection at another
+        # server would hand the password to that address, and another database
+        # or user on the same server is not what it was entered to open.
+        password = connection.password
+        if not password:
+            same_account = (
+                connection.host.strip().lower() == (stored.get("host") or "").strip().lower()
+                and connection.port == stored.get("port")
+                and connection.database == stored.get("database")
+                and connection.username == stored.get("username")
+            )
+            if stored.get("password") and not same_account:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Enter the password again to change this connection's "
+                        "host, port, database or user"
+                    ),
+                )
+            password = stored.get("password") or ""
 
         changes = {
             "name": connection.name,
@@ -1481,7 +1566,7 @@ def register_routes(app: FastAPI) -> None:
             "port": connection.port,
             "database": connection.database,
             "username": connection.username,
-            "password": connection.password,
+            "password": password,
             "schema_name": connection.schema_name,
         }
         if "ssl_mode" in connection.model_fields_set:
@@ -1493,8 +1578,6 @@ def register_routes(app: FastAPI) -> None:
             # SSL mode someone chose for this connection, so the stored mode
             # and CA stay - unless the stored mode does not insist on TLS and
             # the caller turns SSL on, which then means what it always meant.
-            from sandbox.core.connection_store import get_connection as db_get_connection
-            stored = db_get_connection(connection_id) or {}
             if not stored.get("ssl_mode"):
                 changes["ssl_enabled"] = connection.ssl_enabled
                 if "ssl_ca_cert" in connection.model_fields_set:
@@ -1521,7 +1604,7 @@ def register_routes(app: FastAPI) -> None:
                     port=connection.port,
                     database=connection.database,
                     username=connection.username,
-                    password=SecretStr(connection.password),
+                    password=SecretStr(password),
                     schema_name=connection.schema_name,
                     ssl_enabled=row.get("ssl_enabled", False),
                     ssl_mode=row.get("ssl_mode"),
@@ -1551,11 +1634,30 @@ def register_routes(app: FastAPI) -> None:
             delete_connection as db_delete_connection,
             get_connection as db_get_connection,
         )
-        from sandbox.services.file_loader import drop_upload_database_by_name
+        from sandbox.core.connection_store import list_connections as db_list_connections
+        from sandbox.services.file_loader import drop_upload_database_by_name, is_upload_server
 
-        # Capture the upload database name before the record is removed.
-        existing = db_get_connection(connection_id)
-        upload_db_name = (existing or {}).get("database")
+        # Capture the upload database name before the record is removed. The name
+        # alone proves nothing — an ordinary connection may point at a database
+        # called "upload_…" on its own server — so the connection must also be on
+        # the upload server. A database another stored connection still reads
+        # (uploads made before names were unique shared one per upload name) stays.
+        existing = db_get_connection(connection_id) or {}
+        upload_db_name = None
+        if is_upload_server(existing.get("host"), existing.get("port")):
+            upload_db_name = existing.get("database")
+        if upload_db_name and any(
+            other.get("id") != connection_id
+            and other.get("database") == upload_db_name
+            and is_upload_server(other.get("host"), other.get("port"))
+            for other in db_list_connections()
+        ):
+            logger.info(
+                "upload_database_kept_still_in_use",
+                connection_id=connection_id,
+                database=upload_db_name,
+            )
+            upload_db_name = None
 
         deleted = db_delete_connection(connection_id)
         if not deleted:
@@ -1636,6 +1738,10 @@ def register_routes(app: FastAPI) -> None:
         from sandbox.connectors.factory import get_connector
         from sandbox.core.config import DatabaseConnectionConfig, DatabaseType
         from pydantic import SecretStr
+
+        unsupported = _unsupported_db_type(connection.db_type)
+        if unsupported:
+            return JSONResponse(content={"success": False, "message": unsupported})
 
         try:
             # Build config
@@ -3199,6 +3305,32 @@ def register_routes(app: FastAPI) -> None:
         """Reuse the sandbox's upload DB engine for document KB storage."""
         return _get_api_key_engine()
 
+    def _kb_ids_in_space(kb_ids: Any, space: str) -> list[int]:
+        """Of ``kb_ids``, the knowledge bases that belong to ``space``."""
+        from sqlalchemy import text as sql_text
+
+        wanted: list[int] = []
+        for kb_id in kb_ids or []:
+            try:
+                wanted.append(int(kb_id))
+            except (TypeError, ValueError):
+                continue
+        if not wanted:
+            return []
+        with _get_doc_db_engine().connect() as conn:
+            rows = conn.execute(
+                sql_text(
+                    "SELECT id FROM document_knowledge_bases "
+                    "WHERE space_id = :space AND id = ANY(:ids)"
+                ),
+                {"space": space, "ids": wanted},
+            ).fetchall()
+        owned = {row[0] for row in rows}
+        refused = [kb_id for kb_id in wanted if kb_id not in owned]
+        if refused:
+            logger.warning("kb_not_in_space", kb_ids=refused, space_id=space)
+        return [kb_id for kb_id in wanted if kb_id in owned]
+
     def _ensure_vector_indexes() -> int:
         """Create the HNSW index on any KB table that predates it.
 
@@ -3428,21 +3560,20 @@ def register_routes(app: FastAPI) -> None:
 
         # Locate the uploaded file by file_id — documents are stored at
         # /app/data/documents/{space_id}/{folder_path}/{file_id}.ext, so we
-        # search recursively (same strategy as /documents/process).
-        data_dir = Path("/app/data/documents")
-        file_path = None
-        for p in data_dir.rglob(f"{_stored_file_id(file_id)}*"):
-            if p.is_file():
-                file_path = str(p)
-                break
+        # search recursively (same strategy as /documents/process), inside the
+        # caller's space only.
+        stored = _stored_documents(file_id, _document_space(body.get("space_id")))
+        file_path = str(stored[0]) if stored else None
         if not file_path or not os.path.exists(file_path):
             raise HTTPException(status_code=404, detail=f"File {file_id} not found in sandbox storage")
 
         config = get_config()
         now = datetime.now(timezone.utc).isoformat()
 
-        # Dedicated upload database for this spreadsheet's tables.
-        sql_engine, db_config = create_upload_database(connection_name)
+        # Upload database for this spreadsheet's tables: the one the caller says
+        # this source already has (earlier files of the same document connection),
+        # otherwise a new one of its own.
+        sql_engine, db_config = create_upload_database(connection_name, reuse=body.get("database"))
 
         try:
             is_excel = file_ext in (".xlsx", ".xls")
@@ -3626,8 +3757,9 @@ def register_routes(app: FastAPI) -> None:
 
         # Build storage path preserving directory structure
         base_dir = Path("/app/data/documents")
-        if space_id:
-            base_dir = base_dir / space_id
+        space = _document_space(space_id, required=False)
+        if space:
+            base_dir = base_dir / space
         if folder_path:
             # Sanitize folder_path to prevent path traversal
             safe_folder = Path(folder_path.replace("..", "").strip("/"))
@@ -3683,13 +3815,9 @@ def register_routes(app: FastAPI) -> None:
         connection_name = body.get("connection_name", filename)
         space_id = body.get("space_id", "")
 
-        # Find the uploaded file on disk
-        data_dir = Path("/app/data/documents")
-        file_path = None
-        for p in data_dir.rglob(f"{_stored_file_id(file_id)}*"):
-            if p.is_file():
-                file_path = p
-                break
+        # Find the uploaded file on disk, inside the caller's space only
+        stored = _stored_documents(file_id, _document_space(space_id))
+        file_path = stored[0] if stored else None
 
         if not file_path or not file_path.exists():
             raise HTTPException(status_code=404, detail=f"File {file_id} not found")
@@ -3962,16 +4090,17 @@ def register_routes(app: FastAPI) -> None:
         job_id = body.get("job_id", "") or ""
 
         # Find the uploaded file — search recursively because files are stored
-        # at /app/data/documents/{space_id}/{folder_path}/{file_id}.ext
-        data_dir = Path("/app/data/documents")
-        file_path = None
-        for p in data_dir.rglob(f"{_stored_file_id(file_id)}*"):
-            if p.is_file():
-                file_path = p
-                break
+        # at /app/data/documents/{space_id}/{folder_path}/{file_id}.ext. Only
+        # the caller's space is searched, and the file is indexed only into a
+        # knowledge base of that same space.
+        space = _document_space(space_id)
+        stored = _stored_documents(file_id, space)
+        file_path = stored[0] if stored else None
 
         if not file_path or not file_path.exists():
             raise HTTPException(status_code=404, detail=f"File {file_id} not found")
+        if not _kb_ids_in_space([kb_id], space):
+            raise HTTPException(status_code=404, detail="Knowledge base not found")
 
         file_size = file_path.stat().st_size
         # Compute storage_path relative to /app/data/documents
@@ -5071,6 +5200,9 @@ def register_routes(app: FastAPI) -> None:
         # caller selected no files at all, so nothing can match.
         file_ids = body.get("file_ids")
 
+        # Only knowledge bases of the caller's space are searched.
+        kb_ids = _kb_ids_in_space(kb_ids, _document_space(body.get("space_id")))
+
         if not query_embedding or not kb_ids:
             return {"chunks": []}
 
@@ -5196,12 +5328,15 @@ def register_routes(app: FastAPI) -> None:
     ):
         """
         Fetch chunks surrounding a target chunk by (kb_id, file_id, chunk_index).
-        Body: {"kb_id": 2, "file_id": "abc-...", "chunk_index": 12, "window": 2}
+        Body: {"kb_id": 2, "file_id": "abc-...", "chunk_index": 12, "window": 2,
+        "space_id": "7"}
         Returns up to 2*window neighbors, ordered by chunk_index.
         """
         from sqlalchemy import text as sql_text
 
         body = await request.json()
+        # The call names its space and only reads that space's knowledge bases.
+        space = _document_space(body.get("space_id"))
         kb_id = int(body.get("kb_id", 0))
         file_id = body.get("file_id", "")
         chunk_index = int(body.get("chunk_index", 0))
@@ -5210,6 +5345,9 @@ def register_routes(app: FastAPI) -> None:
         window = max(1, min(window, 10))
 
         if not kb_id or not file_id:
+            return {"chunks": []}
+
+        if not _kb_ids_in_space([kb_id], space):
             return {"chunks": []}
 
         from sandbox.services import local_embedder
@@ -5284,6 +5422,10 @@ def register_routes(app: FastAPI) -> None:
         """Get knowledge base processing status."""
         from sqlalchemy import text as sql_text
 
+        # A knowledge base of another space reads as one with nothing in it.
+        if not _kb_ids_in_space([kb_id], _document_space(space_id)):
+            return {"total": 0, "ready": 0, "processing": 0, "failed": 0, "pending": 0, "total_chunks": 0}
+
         engine = _get_doc_db_engine()
         with engine.connect() as conn:
             result = conn.execute(
@@ -5319,6 +5461,10 @@ def register_routes(app: FastAPI) -> None:
         """List all documents in a knowledge base."""
         from sqlalchemy import text as sql_text
 
+        # A knowledge base of another space reads as one with nothing in it.
+        if not _kb_ids_in_space([kb_id], _document_space(space_id)):
+            return {"documents": []}
+
         engine = _get_doc_db_engine()
         with engine.connect() as conn:
             result = conn.execute(
@@ -5352,6 +5498,7 @@ def register_routes(app: FastAPI) -> None:
     @app.get("/api/v1/documents/by-file/{file_id}/status", tags=["Documents"])
     async def get_document_status(
         file_id: str,
+        space_id: str = "",
         token_data: dict = Depends(verify_sandbox_token),
     ):
         """Return the current processing status/progress for a single document by
@@ -5360,15 +5507,20 @@ def register_routes(app: FastAPI) -> None:
         of blocking on one long process_document call."""
         from sqlalchemy import text as sql_text
 
+        # The call names its space and only reads that space's documents.
+        space = _document_space(space_id)
         engine = _get_doc_db_engine()
         with engine.connect() as conn:
             row = conn.execute(
                 sql_text(
-                    "SELECT status, progress, chunk_count, error_message "
-                    "FROM document_kb_documents WHERE file_id = :fid "
-                    "ORDER BY updated_at DESC NULLS LAST LIMIT 1"
+                    "SELECT d.status, d.progress, d.chunk_count, d.error_message "
+                    "FROM document_kb_documents d "
+                    "JOIN document_knowledge_bases kb ON kb.id = d.knowledge_base_id "
+                    "WHERE d.file_id = :fid "
+                    "AND kb.space_id = CAST(:space AS TEXT) "
+                    "ORDER BY d.updated_at DESC NULLS LAST LIMIT 1"
                 ),
-                {"fid": file_id},
+                {"fid": file_id, "space": space},
             ).fetchone()
 
         if not row:
@@ -5385,6 +5537,7 @@ def register_routes(app: FastAPI) -> None:
     async def get_document_transcript(
         file_id: str,
         format: str = "text",
+        space_id: str = "",
         token_data: dict = Depends(verify_sandbox_token),
     ):
         """Return the full extracted body of a document, looked up by its stable
@@ -5396,15 +5549,21 @@ def register_routes(app: FastAPI) -> None:
         from sqlalchemy import text as sql_text
 
         want_md = (format or "text").lower() in ("md", "markdown")
+        # The call names its space and only reads that space's documents.
+        space = _document_space(space_id)
         engine = _get_doc_db_engine()
         with engine.connect() as conn:
             row = conn.execute(
                 sql_text(
-                    "SELECT id, filename, extracted_text, extracted_markdown, storage_path, file_type "
-                    "FROM document_kb_documents "
-                    "WHERE file_id = :fid ORDER BY updated_at DESC NULLS LAST LIMIT 1"
+                    "SELECT d.id, d.filename, d.extracted_text, d.extracted_markdown, "
+                    "d.storage_path, d.file_type "
+                    "FROM document_kb_documents d "
+                    "JOIN document_knowledge_bases kb ON kb.id = d.knowledge_base_id "
+                    "WHERE d.file_id = :fid "
+                    "AND kb.space_id = CAST(:space AS TEXT) "
+                    "ORDER BY d.updated_at DESC NULLS LAST LIMIT 1"
                 ),
-                {"fid": file_id},
+                {"fid": file_id, "space": space},
             ).fetchone()
 
         if not row:
@@ -5647,11 +5806,10 @@ def register_routes(app: FastAPI) -> None:
         # Find the file by matching the stem (filename without extensions)
         # Use strict matching: filename must START with file_id and have ONE extension after
         # This prevents matching side-files like "{uuid}.mp4.wav" when looking for "{uuid}.mp4"
-        data_dir = Path("/app/data/documents")
+        # Only the caller's space is searched: a file of another space is not found.
+        space = _document_space(space_id)
         best_match = None
-        for p in data_dir.rglob(f"{_stored_file_id(file_id)}*"):
-            if not p.is_file():
-                continue
+        for p in _stored_documents(file_id, space):
             # Strict: filename is exactly "{file_id}.{ext}" (no extra extensions like .mp4.wav)
             name_after_id = p.name[len(file_id):]
             if name_after_id.count(".") == 1:  # exactly one dot → single extension
@@ -5673,8 +5831,8 @@ def register_routes(app: FastAPI) -> None:
                 {"id": int(file_id) if file_id.isdigit() else 0},
             ).fetchone()
             if result and result[0]:
-                stored_file = Path("/app/data/documents") / result[0]
-                if stored_file.exists():
+                stored_file = (_DOCUMENTS_DIR / result[0]).resolve()
+                if stored_file.is_relative_to(_DOCUMENTS_DIR / space) and stored_file.is_file():
                     return _serve_file_with_viewer_conversion(stored_file, original_filename=result[1])
 
         raise HTTPException(status_code=404, detail="File not found")
@@ -5693,14 +5851,13 @@ def register_routes(app: FastAPI) -> None:
         """
         import pandas as pd
 
-        data_dir = Path("/app/data/documents")
+        # Only the caller's space is searched: a file of another space is not found.
         file_path = None
-        for p in data_dir.rglob(f"{_stored_file_id(file_id)}*"):
-            if p.is_file():
-                ext = p.suffix.lower()
-                if ext in (".xlsx", ".xls", ".xlsb", ".csv"):
-                    file_path = p
-                    break
+        for p in _stored_documents(file_id, _document_space(space_id)):
+            ext = p.suffix.lower()
+            if ext in (".xlsx", ".xls", ".xlsb", ".csv"):
+                file_path = p
+                break
 
         if not file_path:
             raise HTTPException(status_code=404, detail="Spreadsheet file not found")
@@ -5746,8 +5903,22 @@ def register_routes(app: FastAPI) -> None:
         """Delete a document and its chunks from the knowledge base."""
         from sqlalchemy import text as sql_text
 
+        # Only a document of the caller's space is deleted. One that does not
+        # exist at all is still answered as deleted, as it always has been.
+        space = _document_space(space_id)
         engine = _get_doc_db_engine()
         with engine.connect() as conn:
+            owner = conn.execute(
+                sql_text(
+                    "SELECT kb.space_id FROM document_kb_documents d "
+                    "JOIN document_knowledge_bases kb ON kb.id = d.knowledge_base_id "
+                    "WHERE d.id = :id"
+                ),
+                {"id": int(doc_id)},
+            ).fetchone()
+            if owner is not None and str(owner[0] or "") != space:
+                logger.warning("document_not_in_space", doc_id=doc_id, space_id=space)
+                raise HTTPException(status_code=404, detail="Document not found")
             conn.execute(sql_text("DELETE FROM document_kb_chunks WHERE document_id = :id"), {"id": int(doc_id)})
             conn.execute(sql_text("DELETE FROM document_kb_documents WHERE id = :id"), {"id": int(doc_id)})
             conn.commit()
@@ -5759,7 +5930,9 @@ def register_routes(app: FastAPI) -> None:
     # ==========================================================================
 
     @app.get("/metrics", tags=["Monitoring"])
-    async def prometheus_metrics() -> str:
+    async def prometheus_metrics(
+        token_data: dict = Depends(verify_sandbox_token),
+    ) -> str:
         """Prometheus metrics endpoint."""
         from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
         from starlette.responses import Response
