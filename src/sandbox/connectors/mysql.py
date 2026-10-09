@@ -6,6 +6,7 @@ Provides async MySQL connectivity using aiomysql.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, AsyncGenerator
 
 import aiomysql
@@ -13,6 +14,7 @@ from aiomysql import Connection, Cursor
 from pymysql.constants import CLIENT
 
 from sandbox.connectors.base import BaseConnector, QueryResult
+from sandbox.connectors.host_policy import verify_peer, vet_destination
 from sandbox.connectors.tls import build_ssl_context, resolve_ssl_mode
 from sandbox.core.config import DatabaseConnectionConfig
 from sandbox.core.exceptions import ConnectionError, SQLExecutionError
@@ -71,6 +73,16 @@ class MySQLConnector(BaseConnector[Connection]):
         )
         tls_required = ssl_mode in _TLS_REQUIRED_MODES
 
+        # Where this may point is decided in connectors/host_policy.py. Without
+        # TLS nothing needs the host name again, so the checked addresses are
+        # dialled in order. With TLS the name is needed for the certificate
+        # check, so the name is dialled and the address that answered is
+        # checked below.
+        vetted = await vet_destination(cfg)
+        dial_hosts = (
+            list(vetted.addresses) if vetted.enforced and ssl_context is None else [cfg.host]
+        )
+
         try:
             connect_args: dict[str, Any] = dict(
                 host=cfg.host,
@@ -89,7 +101,23 @@ class MySQLConnector(BaseConnector[Connection]):
                 conn = _TLSRequiredConnection(**connect_args)
                 await conn._connect()
             else:
-                conn = await aiomysql.connect(**connect_args)
+                for attempt, dial_host in enumerate(dial_hosts, start=1):
+                    try:
+                        conn = await aiomysql.connect(**{**connect_args, "host": dial_host})
+                        break
+                    except aiomysql.OperationalError as e:
+                        # 2003: nothing answered at this address; the next may.
+                        if attempt == len(dial_hosts) or (e.args[0] if e.args else 0) != 2003:
+                            raise
+
+            writer = getattr(conn, "_writer", None)  # aiomysql's asyncio stream
+            try:
+                verify_peer(
+                    cfg, vetted, writer.transport.get_extra_info("peername") if writer else None
+                )
+            except ConnectionError:
+                conn.close()
+                raise
 
             # aiomysql only upgrades to TLS when the server advertises it and
             # otherwise carries on in plaintext. For a mode that insists on
@@ -107,6 +135,8 @@ class MySQLConnector(BaseConnector[Connection]):
 
             return conn
 
+        except ConnectionError:
+            raise
         except _TLSNotEstablished:
             raise ConnectionError(
                 f"SSL mode '{ssl_mode}' needs an encrypted link, but the MySQL server at "
@@ -215,6 +245,87 @@ class MySQLConnector(BaseConnector[Connection]):
                 query=query,
                 cause=e,
             )
+
+    # Set once a server has answered START TRANSACTION READ ONLY with "no such
+    # syntax": a MySQL-compatible engine without read-only transactions.
+    _read_only_unsupported: bool = False
+    # How long ending the transaction may take before the connection is dropped.
+    _END_TRANSACTION_TIMEOUT_S = 5.0
+
+    async def _end_transaction(self, conn: Connection, statement: str) -> None:
+        async with conn.cursor() as cursor:
+            await cursor.execute(statement)
+
+    async def execute_read_only(
+        self,
+        conn: Connection,
+        query: str,
+        parameters: dict[str, Any] | None = None,
+    ) -> QueryResult:
+        """Execute a caller's query inside a READ ONLY transaction.
+
+        The server then refuses every change to a table the SQL validator did
+        not recognise, including inside a function the query calls. The
+        connection is reused, so the transaction is always ended here; when
+        that cannot be done (the caller's timeout cancelled the query, or the
+        server no longer answers) the connection is dropped and the next query
+        opens a new one.
+        """
+        if self._read_only_unsupported:
+            return await self.execute(conn, query, parameters)
+
+        try:
+            async with conn.cursor() as cursor:
+                await cursor.execute("START TRANSACTION READ ONLY")
+        except (aiomysql.ProgrammingError, aiomysql.NotSupportedError) as e:
+            self._read_only_unsupported = True
+            self._logger.warning(
+                "read_only_transaction_unsupported",
+                connection_id=self.connection_id,
+                error=str(e),
+            )
+            return await self.execute(conn, query, parameters)
+        except Exception as e:
+            raise SQLExecutionError(
+                f"Query execution failed: {e}",
+                query=query,
+                cause=e,
+            )
+
+        try:
+            result = await self.execute(conn, query, parameters)
+        except Exception:
+            try:
+                await asyncio.wait_for(
+                    self._end_transaction(conn, "ROLLBACK"),
+                    timeout=self._END_TRANSACTION_TIMEOUT_S,
+                )
+            except Exception:
+                conn.close()
+            except BaseException:
+                conn.close()
+                raise
+            raise
+        except BaseException:
+            conn.close()
+            raise
+
+        try:
+            await asyncio.wait_for(
+                self._end_transaction(conn, "COMMIT"),
+                timeout=self._END_TRANSACTION_TIMEOUT_S,
+            )
+        except Exception as e:
+            conn.close()
+            raise SQLExecutionError(
+                f"Query execution failed: {e}",
+                query=query,
+                cause=e,
+            )
+        except BaseException:
+            conn.close()
+            raise
+        return result
 
     async def execute_streaming(
         self,

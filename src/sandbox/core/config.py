@@ -182,13 +182,32 @@ class SecurityConfig(BaseModel):
         ],
         description="Patterns for sensitive columns to mask (segment-aware)"
     )
-    mask_sensitive_data: bool = Field(True, description="Enable data masking")
+    # Off unless an install turns it on (security.mask_sensitive_data in its
+    # YAML, or SANDBOX_SECURITY__MASK_SENSITIVE_DATA). The masking decides by
+    # the NAME of each result column, and a query names its own result
+    # columns: `SELECT password AS p` comes back in clear, `SELECT label AS
+    # key` comes back masked. Until it follows the source column a value is
+    # read from, it protects nothing and garbles ordinary results, so it is
+    # not the default. What a person may read is enforced before the query
+    # runs (table, column and row permissions in the calling app).
+    mask_sensitive_data: bool = Field(
+        False,
+        description="Mask result values by result-column name (off by default; see the note above)",
+    )
 
     # Network security
     enable_network_isolation: bool = Field(True, description="Isolate sandbox from network")
     allowed_outbound_hosts: list[str] = Field(
         default_factory=list,
         description="Allowed outbound hosts (if network not isolated)"
+    )
+    allow_local_destinations: bool = Field(
+        False,
+        description=(
+            "Let a connection point at this machine or at a network the sandbox itself is "
+            "attached to (see connectors/host_policy.py). Only for a sandbox that runs "
+            "next to the one database it serves, e.g. on a developer machine."
+        ),
     )
 
 
@@ -405,10 +424,19 @@ def get_config() -> SandboxConfig:
         init_connection_store()
 
         for row in list_connections():
-            conn_data = dict(row)
-            conn_data["password"] = _SecretStr(conn_data.get("password", ""))
-            conn_data["db_type"] = DatabaseType(normalize_db_type(conn_data["db_type"]))
-            conn = DatabaseConnectionConfig(**conn_data)
+            # One stored row this build cannot read (a database type it does not
+            # know, a missing field) must not cost the sandbox every other connection.
+            try:
+                conn_data = dict(row)
+                conn_data["password"] = _SecretStr(conn_data.get("password", ""))
+                conn_data["db_type"] = DatabaseType(normalize_db_type(conn_data["db_type"]))
+                conn = DatabaseConnectionConfig(**conn_data)
+            except Exception as row_error:
+                logger.error(
+                    "Skipped stored connection %s (%s): %s",
+                    row.get("id"), row.get("name"), row_error,
+                )
+                continue
             if not any(c.id == conn.id for c in config.database_connections):
                 config.database_connections.append(conn)
 

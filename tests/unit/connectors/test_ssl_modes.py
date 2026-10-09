@@ -52,6 +52,19 @@ def ca_pem() -> str:
     return _self_signed_pem()
 
 
+@pytest.fixture(autouse=True)
+def host_policy_not_applied(monkeypatch):
+    """These tests drive fake drivers: nothing is resolved or dialled, so the
+    destination check (connectors/host_policy.py) is out of the picture."""
+    from sandbox.connectors.host_policy import VettedHost
+
+    async def not_applied(_cfg):
+        return VettedHost()
+
+    for module in (postgresql_module, mysql_module, mssql_module, saphana_module):
+        monkeypatch.setattr(module, "vet_destination", not_applied)
+
+
 def cfg(db_type: DatabaseType = DatabaseType.POSTGRESQL, **kw) -> DatabaseConnectionConfig:
     return DatabaseConnectionConfig(
         id="c1",

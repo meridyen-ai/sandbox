@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, AsyncGenerator
 
 from sandbox.connectors.base import BaseConnector, QueryResult
+from sandbox.connectors.host_policy import vet_destination
 from sandbox.connectors.tls import resolve_ssl_mode, system_ca_file
 from sandbox.core.exceptions import ConnectionError, SQLExecutionError
 from sandbox.core.logging import get_logger
@@ -85,6 +86,11 @@ class SAPHANAConnector(BaseConnector[Any]):
             connection_id=self.connection_id,
             db_type=self.db_type,
         )
+
+        # Where this may point is decided in connectors/host_policy.py. The
+        # host is still dialled by name: HANA Cloud routes on it, and hdbcli
+        # exposes no socket to check.
+        await vet_destination(cfg)
 
         def _connect() -> Any:
             from hdbcli import dbapi

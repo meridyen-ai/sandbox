@@ -17,6 +17,7 @@ from decimal import Decimal
 from typing import Any, AsyncGenerator
 
 from sandbox.connectors.base import BaseConnector, QueryResult
+from sandbox.connectors.host_policy import vet_destination
 from sandbox.connectors.mssql_tds import (
     connect_mssql,
     detect_codepage,
@@ -146,6 +147,11 @@ class MSSQLConnector(BaseConnector[Any]):
             cfg.ssl_mode, connection_id=self.connection_id, db_type=self.db_type
         )
         tls_args = {"encryption": encryption} if encryption else {}
+
+        # Where this may point is decided in connectors/host_policy.py. The
+        # host is still dialled by name: the name travels in the TDS login
+        # (Azure SQL routes on it), and FreeTDS exposes no socket to check.
+        await vet_destination(cfg)
 
         def _connect() -> Any:
             import pymssql

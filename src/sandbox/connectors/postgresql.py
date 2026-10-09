@@ -6,6 +6,7 @@ Provides async PostgreSQL connectivity using asyncpg.
 
 from __future__ import annotations
 
+import asyncio
 import re
 from typing import Any, AsyncGenerator
 
@@ -13,6 +14,7 @@ import asyncpg
 from asyncpg import Connection, Pool
 
 from sandbox.connectors.base import BaseConnector, QueryResult
+from sandbox.connectors.host_policy import verify_peer, vet_destination
 from sandbox.connectors.tls import build_ssl_context, resolve_ssl_mode
 from sandbox.core.config import DatabaseConnectionConfig
 from sandbox.core.exceptions import ConnectionError, SQLExecutionError
@@ -97,9 +99,19 @@ class PostgreSQLConnector(BaseConnector[Connection]):
 
         search_path = self._search_path(cfg.schema_name) if cfg.schema_name else None
 
+        # Where this may point is decided in connectors/host_policy.py. Without
+        # TLS nothing needs the host name again, so the checked addresses are
+        # dialled (asyncpg tries them in order). With TLS the name is needed
+        # for SNI and certificate checks, so the name is dialled and the
+        # address that answered is checked below.
+        vetted = await vet_destination(cfg)
+        dial_host: Any = cfg.host
+        if vetted.enforced and ssl_param is False:
+            dial_host = list(vetted.addresses)
+
         try:
             conn = await asyncpg.connect(
-                host=cfg.host,
+                host=dial_host,
                 port=cfg.port,
                 database=cfg.database,
                 user=cfg.username,
@@ -108,6 +120,16 @@ class PostgreSQLConnector(BaseConnector[Connection]):
                 timeout=cfg.connection_timeout,
                 command_timeout=cfg.query_timeout,
             )
+
+            try:
+                # asyncpg exposes the asyncio transport
+                transport = getattr(conn, "_transport", None)
+                verify_peer(
+                    cfg, vetted, transport.get_extra_info("peername") if transport else None
+                )
+            except ConnectionError:
+                conn.terminate()
+                raise
 
             # Enable TCP keepalives on the underlying socket. asyncpg's
             # command_timeout is enforced by sending a cancel request over the
@@ -134,6 +156,8 @@ class PostgreSQLConnector(BaseConnector[Connection]):
 
             return conn
 
+        except ConnectionError:
+            raise
         except asyncpg.InvalidPasswordError:
             raise ConnectionError(
                 "Invalid database credentials",
@@ -261,6 +285,81 @@ class PostgreSQLConnector(BaseConnector[Connection]):
                 query=query,
                 cause=e,
             )
+
+    # Set once a server has answered BEGIN READ ONLY with "no such syntax":
+    # a PostgreSQL-compatible engine without read-only transactions.
+    _read_only_unsupported: bool = False
+    # How long ending the transaction may take before the connection is dropped.
+    _END_TRANSACTION_TIMEOUT_S = 5.0
+
+    async def execute_read_only(
+        self,
+        conn: Connection,
+        query: str,
+        parameters: dict[str, Any] | None = None,
+    ) -> QueryResult:
+        """Execute a caller's query inside a READ ONLY transaction.
+
+        The database then refuses every write the SQL validator did not
+        recognise: DML, DDL, sequence changes, and the same inside any
+        function the query calls. The connection is reused, so the transaction
+        is always ended here; when that cannot be done (the caller's timeout
+        cancelled the query, or the server no longer answers) the connection is
+        dropped and the next query opens a new one.
+        """
+        if self._read_only_unsupported:
+            return await self.execute(conn, query, parameters)
+
+        transaction = conn.transaction(readonly=True)
+        try:
+            await transaction.start()
+        except (asyncpg.PostgresSyntaxError, asyncpg.FeatureNotSupportedError) as e:
+            self._read_only_unsupported = True
+            self._logger.warning(
+                "read_only_transaction_unsupported",
+                connection_id=self.connection_id,
+                error=str(e),
+            )
+            return await self.execute(conn, query, parameters)
+        except Exception as e:
+            raise SQLExecutionError(
+                f"Query execution failed: {e}",
+                query=query,
+                cause=e,
+            )
+
+        try:
+            result = await self.execute(conn, query, parameters)
+        except Exception:
+            try:
+                await asyncio.wait_for(
+                    transaction.rollback(), timeout=self._END_TRANSACTION_TIMEOUT_S
+                )
+            except Exception:
+                conn.terminate()
+            except BaseException:
+                conn.terminate()
+                raise
+            raise
+        except BaseException:
+            conn.terminate()
+            raise
+
+        try:
+            await asyncio.wait_for(
+                transaction.commit(), timeout=self._END_TRANSACTION_TIMEOUT_S
+            )
+        except Exception as e:
+            conn.terminate()
+            raise SQLExecutionError(
+                f"Query execution failed: {e}",
+                query=query,
+                cause=e,
+            )
+        except BaseException:
+            conn.terminate()
+            raise
+        return result
 
     async def execute_streaming(
         self,

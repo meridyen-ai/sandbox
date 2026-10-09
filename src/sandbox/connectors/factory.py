@@ -151,6 +151,7 @@ def _load_connector(db_type: DatabaseType) -> Type[BaseConnector] | None:
                 return None
 
         else:
+            _NOT_IMPLEMENTED.add(db_type)
             logger.warning(
                 "connector_not_implemented",
                 db_type=db_type.value,
@@ -184,6 +185,49 @@ def get_available_connectors() -> list[str]:
             pass
 
     return available
+
+
+# Database types this sandbox has no connector code for (as opposed to a
+# connector whose driver package is not installed in this image).
+_NOT_IMPLEMENTED: set[DatabaseType] = set()
+
+
+def is_supported(db_type: str) -> bool:
+    """
+    Whether this sandbox has connector code for the database type at all.
+
+    True also when the connector's driver is missing from this image — that is
+    something an operator can install; a type without connector code can never
+    connect, so a catalogue need not offer it.
+    """
+    from sandbox.core.config import normalize_db_type
+
+    try:
+        resolved = DatabaseType(normalize_db_type(db_type))
+    except ValueError:
+        return False
+    if resolved in _CONNECTOR_REGISTRY:
+        return True
+    _load_connector(resolved)
+    return resolved not in _NOT_IMPLEMENTED
+
+
+def has_connector(db_type: str) -> bool:
+    """
+    Whether this sandbox can open connections of the given database type.
+
+    Takes the name a client sends (aliases such as "postgres" or "sqlserver"
+    included). False for a type the sandbox does not know and for a known type
+    that has no connector here, so callers can say so before anything is
+    stored or dialled.
+    """
+    from sandbox.core.config import normalize_db_type
+
+    try:
+        resolved = DatabaseType(normalize_db_type(db_type))
+    except ValueError:
+        return False
+    return resolved in _CONNECTOR_REGISTRY or _load_connector(resolved) is not None
 
 
 # Pre-register core connectors

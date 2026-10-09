@@ -79,6 +79,20 @@ class BaseConnector(ABC, Generic[T]):
         """Execute a query and return results."""
         pass
 
+    async def execute_read_only(
+        self,
+        conn: T,
+        query: str,
+        parameters: dict[str, Any] | None = None,
+    ) -> QueryResult:
+        """Execute a caller's query that must not change anything.
+
+        Connectors whose database can enforce that for one statement (a READ
+        ONLY transaction) override this. Everywhere else the query runs as
+        ``execute`` runs it, and the SQL validator is the only guard.
+        """
+        return await self.execute(conn, query, parameters)
+
     @abstractmethod
     async def execute_streaming(
         self,
