@@ -69,6 +69,10 @@ def _add_months(d: date, months: int) -> date:
     return d.replace(year=year, month=month, day=min(d.day, monthrange(year, month)[1]))
 
 
+def _month_end(d: date) -> date:
+    return d.replace(day=monthrange(d.year, d.month)[1])
+
+
 def _base(name: str, now: datetime) -> date | datetime | int | str:
     today = now.date()
     if name == "year":
@@ -137,6 +141,13 @@ def resolve_token(value: str, now: datetime) -> date | datetime | int | str:
             result = _add_months(result, 12 * n) if not isinstance(result, datetime) else datetime.combine(
                 _add_months(result.date(), 12 * n), result.time()
             )
+        # An end-of-period token moved by whole months or years is still the END
+        # of a period: {{end_of_prev_month-1m}} in October is 31 August, not the
+        # 30th that "same day number" gives, and a February end moved by a year
+        # follows the leap day.
+        if unit in ("m", "y") and m.group("name").startswith("end_of_") and isinstance(result, date) \
+                and not isinstance(result, datetime):
+            result = _month_end(result)
     return result
 
 

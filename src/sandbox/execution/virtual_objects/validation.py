@@ -36,7 +36,7 @@ def validate_name(name: str, ctx: DialectContext) -> None:
             field="name",
         )
     probe = f"SELECT * FROM {name}"
-    errors = _validator().validate(probe)
+    errors = _validator().validate(probe, db_type=ctx.db_type)
     if errors:
         raise VirtualObjectError(
             f"'{name}' cannot be used as a name: it contains a reserved pattern", field="name"
@@ -100,7 +100,7 @@ def normalize_query_definition(sql_text: str, ctx: DialectContext) -> str:
     _check_projection_names(tree)
 
     normalized = render(tree, ctx.dialect)
-    errors = _validator().validate(normalized)
+    errors = _validator().validate(normalized, db_type=ctx.db_type)
     if errors:
         raise VirtualObjectError("; ".join(errors), field="sql_text")
     return normalized

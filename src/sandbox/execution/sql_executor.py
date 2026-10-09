@@ -15,6 +15,9 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
+import sqlglot
+from sqlglot.tokens import TokenType
+
 from sandbox.core.config import get_config, SecurityConfig, ResourceLimitsConfig
 from sandbox.core.exceptions import (
     SQLExecutionError,
@@ -32,6 +35,7 @@ from sandbox.execution.base import (
     ExecutionStatus,
 )
 from sandbox.execution.virtual_objects.errors import sanitize
+from sandbox.execution.virtual_objects.expander import DIALECTS
 from sandbox.execution.virtual_objects.models import ExpansionPlan
 from sandbox.execution.virtual_objects.runner import execute_plan, plan_query
 
@@ -95,6 +99,28 @@ class SQLValidator:
         r"WAITFOR\s+DELAY",  # Timing attack (MSSQL)
     ]
 
+    # Functions a query that starts with SELECT can call to do something other
+    # than read the connection's tables: read, list or write files on the
+    # database server, reach another server, run SQL handed over as text, or
+    # change the session and other sessions. A read-only transaction stops none
+    # of these, so they are refused by name, in every dialect.
+    REFUSED_FUNCTIONS = frozenset({
+        # PostgreSQL
+        "pg_read_file", "pg_read_binary_file", "pg_stat_file",
+        "lo_import", "lo_export",
+        "set_config", "pg_terminate_backend", "pg_cancel_backend", "pg_reload_conf",
+        # MySQL
+        "load_file",
+        # SQL Server
+        "openrowset", "openquery", "opendatasource",
+    })
+    REFUSED_FUNCTION_PREFIXES = (
+        # PostgreSQL
+        "pg_ls_", "pg_file_", "dblink",
+        "query_to_xml", "cursor_to_xml", "table_to_xml", "schema_to_xml", "database_to_xml",
+        # SQL Server
+        "xp_",
+    )
     def __init__(self, security_config: SecurityConfig | None = None) -> None:
         config = get_config()
         self.security = security_config or config.security
@@ -102,10 +128,72 @@ class SQLValidator:
             "|".join(self.INJECTION_PATTERNS),
             re.IGNORECASE,
         )
+        refused_names = "|".join(
+            [re.escape(name) for name in sorted(self.REFUSED_FUNCTIONS)]
+            + [re.escape(prefix) + r"\w*" for prefix in self.REFUSED_FUNCTION_PREFIXES]
+        )
+        # Only for a query the tokenizer cannot read (see _refused_forms): any
+        # refused call, INTO, a second statement, or a U&"..." identifier.
+        self._refused_text_re = re.compile(
+            rf"\b(?:{refused_names})\s*\(|\bINTO\b|;\s*\S|\bU&\"",
+            re.IGNORECASE,
+        )
 
-    def validate(self, query: str) -> list[str]:
+    @classmethod
+    def _is_refused_function(cls, name: str) -> bool:
+        name = name.lower()
+        return name in cls.REFUSED_FUNCTIONS or name.startswith(cls.REFUSED_FUNCTION_PREFIXES)
+
+    def _refused_forms(self, query: str, db_type: str | None) -> list[str]:
+        """Forms that pass the keyword checks but do more than read tables.
+
+        Read from the query's tokens, in the connection's dialect, so a name
+        inside a string literal or as part of a longer identifier is not
+        mistaken for a call. A query the tokenizer cannot read (an unterminated
+        string, usually) is checked as plain text instead, which only refuses
+        more.
+        """
+        try:
+            tokens = sqlglot.tokenize(query, read=DIALECTS.get(db_type or ""))
+        except Exception:
+            if self._refused_text_re.search(query):
+                return ["Query contains a form that is not allowed in a read-only query"]
+            return []
+
+        allowed = {statement.upper() for statement in self.security.allowed_sql_statements}
+        errors: list[str] = []
+        for i, token in enumerate(tokens):
+            following = tokens[i + 1] if i + 1 < len(tokens) else None
+            if following is not None and following.token_type == TokenType.L_PAREN:
+                if self._is_refused_function(token.text):
+                    errors.append(f"Query calls a function that is not allowed: {token.text}")
+            if token.token_type == TokenType.INTO:
+                errors.append("SELECT ... INTO is not allowed")
+            if (
+                token.token_type == TokenType.SEMICOLON
+                and following is not None
+                and following.token_type != TokenType.SEMICOLON
+                and following.text.upper() not in allowed
+            ):
+                errors.append(
+                    f"Only {', '.join(self.security.allowed_sql_statements)} statements are allowed"
+                )
+            if (
+                token.token_type == TokenType.IDENTIFIER
+                and i >= 2
+                and tokens[i - 1].token_type == TokenType.AMP
+                and tokens[i - 2].text.upper() == "U"
+            ):
+                # U&"..." spells an identifier in escapes, hiding its name.
+                errors.append("Unicode-escaped identifiers are not allowed")
+        return list(dict.fromkeys(errors))
+
+    def validate(self, query: str, db_type: str | None = None) -> list[str]:
         """
         Validate a SQL query.
+
+        ``db_type`` is the connection's database type; it selects the dialect
+        the query is tokenized in (generic SQL when not given).
 
         Returns list of validation errors (empty if valid).
         """
@@ -149,6 +237,15 @@ class SQLValidator:
             errors.append("Query contains potential SQL injection pattern")
             log_security_event(
                 "sql_injection_detected",
+            )
+
+        # Check forms that read like a SELECT but do more than read tables
+        refused = self._refused_forms(query, db_type)
+        if refused:
+            errors.extend(refused)
+            log_security_event(
+                "blocked_sql_form",
+                forms=refused,
             )
 
         return errors
@@ -300,11 +397,16 @@ class SQLExecutor(BaseExecutor[SQLExecutionResult]):
             errors.append("Query must be a string")
             return errors
 
-        # Validate query content
-        errors.extend(self.validator.validate(query))
+        # Validate query content, read in the connection's dialect
+        connection_id = context.connection_id
+        conn_cfg = get_config().get_connection(connection_id or "")
+        errors.extend(
+            self.validator.validate(
+                query, db_type=conn_cfg.db_type.value if conn_cfg is not None else None
+            )
+        )
 
         # Validate connection
-        connection_id = context.connection_id
         if not connection_id:
             errors.append("Connection ID is required")
 
@@ -508,7 +610,11 @@ class SQLExecutor(BaseExecutor[SQLExecutionResult]):
         regardless of database type (PostgreSQL, MySQL, MSSQL, etc.).
         """
         if plan is None or plan.noop:
-            result = await connector.execute(connection, query, parameters)
+            # The caller's own SQL, unchanged: held read-only by the database
+            # where the connector can (PostgreSQL, MySQL). A query that uses a
+            # virtual object runs as before - a stored procedure or function
+            # behind one may legitimately write (temp tables, its own logs).
+            result = await connector.execute_read_only(connection, query, parameters)
         else:
             result = await execute_plan(
                 connector, connection, plan, original_sql=query, parameters=parameters
