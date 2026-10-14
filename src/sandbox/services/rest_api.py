@@ -5171,6 +5171,9 @@ def register_routes(app: FastAPI) -> None:
                 logger.info("chunk_count_query_failed", doc_id=doc_id, reason=str(e)[:120])
 
             logger.info("llamaindex_indexing_done", doc_id=doc_id, chunks=chunk_count, table=table_name)
+            # The query side caches whether a knowledge base's table exists.
+            from sandbox.services import kb_vector_search
+            kb_vector_search.invalidate(table_name)
             _update_prog(85)
 
             # ── Step 5: Generate summary ──
@@ -5221,8 +5224,9 @@ def register_routes(app: FastAPI) -> None:
         token_data: dict = Depends(verify_sandbox_token),
     ):
         """
-        Search for similar document chunks using LlamaIndex's VectorStoreIndex.
-        Supports path-based filtering (search within specific directories).
+        Search for similar document chunks in the knowledge bases' vector
+        tables (the ones LlamaIndex writes). Supports path-based filtering
+        (search within specific directories) and a file allow-list.
         """
         body = await request.json()
         query_embedding = body.get("query_embedding", [])
@@ -5245,108 +5249,68 @@ def register_routes(app: FastAPI) -> None:
         if file_ids is not None and not file_ids:
             return {"chunks": []}
 
-        from llama_index.core import VectorStoreIndex, Settings
-        from llama_index.core.vector_stores.types import (
-            VectorStoreQuery,
-            VectorStoreQueryMode,
-            MetadataFilters,
-            MetadataFilter,
-            FilterOperator,
-        )
-        from llama_index.vector_stores.postgres import PGVectorStore
+        from sandbox.services import kb_vector_search
 
         # The caller supplies the query vector; its width says which model made
         # it and therefore which table holds comparable vectors.
         embed_dim = len(query_embedding)
+        try:
+            top_k = max(1, min(int(top_k), 200))
+            threshold = float(threshold)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="top_k and similarity_threshold must be numbers")
 
-        db_host = os.environ.get("SANDBOX_UPLOAD_DB_HOST", "sandbox-postgres")
-        db_port = os.environ.get("SANDBOX_UPLOAD_DB_PORT", "5432")
-        db_name = os.environ.get("SANDBOX_UPLOAD_DB_NAME", "sandbox_uploads")
-        db_user = os.environ.get("SANDBOX_UPLOAD_DB_USER", "sandbox")
-        db_pass = os.environ.get("SANDBOX_UPLOAD_DB_PASSWORD", "sandbox_password")
+        # One pooled engine, the knowledge bases at the same time, filters as
+        # bound parameters; filtered searches use pgvector's iterative scan so
+        # they still return the full top_k (services/kb_vector_search.py).
+        tables = [(kb_id, f"data_{_kb_vector_table(kb_id, embed_dim)}") for kb_id in kb_ids]
+        found = await kb_vector_search.search_tables(
+            tables, query_embedding, top_k,
+            file_ids=list(file_ids) if file_ids else None,
+            path_filter=path_filter or "",
+        )
 
         all_chunks = []
-
-        for kb_id in kb_ids:
-            table_name = _kb_vector_table(kb_id, embed_dim)
-
-            try:
-                # Same hnsw_kwargs as the write path: this is what applies
-                # `hnsw.ef_search` to the session, which governs recall when the
-                # ANN index is used. Without it a query against an HNSW-indexed
-                # table falls back to the server default.
-                vector_store = PGVectorStore.from_params(
-                    host=db_host, port=db_port, database=db_name,
-                    user=db_user, password=db_pass,
-                    table_name=table_name, embed_dim=embed_dim,
-                    hnsw_kwargs=HNSW_KWARGS,
-                )
-
-                # Build metadata filters
-                filters = []
-                if path_filter:
-                    filters.append(MetadataFilter(
-                        key="source_path", value=path_filter, operator=FilterOperator.CONTAINS,
-                    ))
-                if file_ids:
-                    # Applied inside the vector query rather than after it, so
-                    # similarity_top_k is spent only on files the caller can see.
-                    # Backed by the metadata_->>'file_id' index created with the table.
-                    filters.append(MetadataFilter(
-                        key="file_id", value=list(file_ids), operator=FilterOperator.IN,
-                    ))
-
-                # Query using LlamaIndex's vector store directly
-                query = VectorStoreQuery(
-                    query_embedding=query_embedding,
-                    similarity_top_k=top_k,
-                    mode=VectorStoreQueryMode.DEFAULT,
-                    filters=MetadataFilters(filters=filters) if filters else None,
-                )
-
-                result = vector_store.query(query)
-
-                for node, similarity in zip(result.nodes or [], result.similarities or []):
-                    if similarity < threshold:
-                        continue
-                    meta = node.metadata or {}
-                    all_chunks.append({
-                        "chunk_id": node.node_id,
-                        "document_id": str(meta.get("doc_id", "")),
-                        "kb_id": str(kb_id),
-                        "content": node.get_content(),
-                        "similarity": float(similarity),
-                        "page_num": meta.get("page_num"),
-                        "word_positions": _json_parse_safe(meta.get("word_positions_json")),
-                        "filename": meta.get("filename", ""),
-                        "source_path": meta.get("source_path", ""),
-                        "source_type": meta.get("source_type", ""),
-                        "directory": meta.get("directory", ""),
-                        "element_type": meta.get("element_type", ""),
-                        # Text highlight offsets — from LlamaIndex node or element metadata
-                        "start_char": node.start_char_idx if node.start_char_idx is not None else meta.get("start_char"),
-                        "end_char": node.end_char_idx if node.end_char_idx is not None else meta.get("end_char"),
-                        # PDF bounding box [x0, y0, x1, y1] in page coordinates
-                        "bbox": meta.get("bbox"),
-                        "page_width": meta.get("page_width"),
-                        "page_height": meta.get("page_height"),
-                        # Sheet name (XLSX) or slide label (PPTX)
-                        "page_name": meta.get("page_name"),
-                        # Audio/video timestamp offsets
-                        "timestamp_start": meta.get("timestamp_start"),
-                        "timestamp_end": meta.get("timestamp_end"),
-                        "timestamp": meta.get("timestamp"),
-                        "file_type": meta.get("file_type", ""),
-                        # Stable file identity — the sandbox storage UUID, used by
-                        # the backend to serve the raw file via /files/{file_id}.
-                        "file_id": meta.get("file_id", ""),
-                        # Position of this chunk within its file — lets the agent
-                        # request surrounding context via /chunks/neighbors.
-                        "chunk_index": meta.get("chunk_index"),
-                    })
-
-            except Exception as e:
-                logger.warning("kb_query_failed", kb_id=kb_id, error=str(e))
+        for kb_id, row in found:
+            similarity = row.similarity
+            if similarity < threshold:
+                continue
+            node = kb_vector_search.row_to_node(row)
+            meta = node.metadata or {}
+            all_chunks.append({
+                "chunk_id": node.node_id,
+                "document_id": str(meta.get("doc_id", "")),
+                "kb_id": str(kb_id),
+                "content": node.get_content(),
+                "similarity": float(similarity),
+                "page_num": meta.get("page_num"),
+                "word_positions": _json_parse_safe(meta.get("word_positions_json")),
+                "filename": meta.get("filename", ""),
+                "source_path": meta.get("source_path", ""),
+                "source_type": meta.get("source_type", ""),
+                "directory": meta.get("directory", ""),
+                "element_type": meta.get("element_type", ""),
+                # Text highlight offsets — from LlamaIndex node or element metadata
+                "start_char": node.start_char_idx if node.start_char_idx is not None else meta.get("start_char"),
+                "end_char": node.end_char_idx if node.end_char_idx is not None else meta.get("end_char"),
+                # PDF bounding box [x0, y0, x1, y1] in page coordinates
+                "bbox": meta.get("bbox"),
+                "page_width": meta.get("page_width"),
+                "page_height": meta.get("page_height"),
+                # Sheet name (XLSX) or slide label (PPTX)
+                "page_name": meta.get("page_name"),
+                # Audio/video timestamp offsets
+                "timestamp_start": meta.get("timestamp_start"),
+                "timestamp_end": meta.get("timestamp_end"),
+                "timestamp": meta.get("timestamp"),
+                "file_type": meta.get("file_type", ""),
+                # Stable file identity — the sandbox storage UUID, used by
+                # the backend to serve the raw file via /files/{file_id}.
+                "file_id": meta.get("file_id", ""),
+                # Position of this chunk within its file — lets the agent
+                # request surrounding context via /chunks/neighbors.
+                "chunk_index": meta.get("chunk_index"),
+            })
 
         # Sort by similarity descending, take top_k
         all_chunks.sort(key=lambda c: c["similarity"], reverse=True)
