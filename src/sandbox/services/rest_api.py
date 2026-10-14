@@ -8,6 +8,7 @@ Alternative to gRPC for simpler integrations.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import os
@@ -21,7 +22,7 @@ from decimal import Decimal
 from enum import Enum
 from ipaddress import IPv4Address, IPv6Address, IPv4Network, IPv6Network
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Literal
 from uuid import UUID
 
 from fastapi import FastAPI, Cookie, File, Form, HTTPException, Depends, Header, Request, Response, UploadFile, status
@@ -51,6 +52,7 @@ from sandbox.services.schema_sql import (
     virtual_columns,
 )
 from sandbox.execution.python_executor import PythonExecutor
+from sandbox.services.document_cleanup import remove_stored_files, vector_tables_for
 from sandbox.visualization.generator import VisualizationGenerator, ChartType
 
 logger = get_logger(__name__)
@@ -382,11 +384,41 @@ def _stored_documents(file_id: Any, space: str | None) -> list[Path]:
     return [p for p in root.rglob(f"{_stored_file_id(file_id)}*") if p.is_file()]
 
 
-def _make_json_safe(value: Any) -> Any:
+# How a binary value is returned when the caller asks for it as binary
+# (``context.binary_format = "base64"``): ``{"$binary": "<base64>"}``.
+BINARY_MARKER = "$binary"
+BINARY_FORMATS = ("text", "base64")
+
+
+def _delete_file_vectors(conn: Any, kb_id: Any, file_id: str) -> int:
+    """Delete one file's passages from every vector table of a knowledge base.
+    In the caller's transaction. Returns how many were deleted."""
+    from sqlalchemy import text as sql_text
+
+    names = [r[0] for r in conn.execute(
+        sql_text("SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename LIKE :p"),
+        {"p": f"data_llamaindex_kb_{int(kb_id)}%"},
+    ).fetchall()]
+    deleted = 0
+    for table in vector_tables_for(kb_id, names):
+        result = conn.execute(
+            sql_text(f'DELETE FROM "{table}" WHERE metadata_->>\'file_id\' = :fid'), {"fid": file_id}
+        )
+        deleted += result.rowcount or 0
+    return deleted
+
+
+def _make_json_safe(value: Any, binary_format: str = "text") -> Any:
     """Convert any database value to a JSON-serializable type.
 
     Handles types from all supported databases (PostgreSQL, MySQL, MSSQL,
     Snowflake, BigQuery, etc.) so the API response is database-agnostic.
+
+    Binary values (bytea, varbinary, BLOB) are decoded as UTF-8 text by
+    default, which is what callers have always received and which keeps text
+    stored in binary columns readable. A caller that needs the bytes asks for
+    ``binary_format="base64"`` and gets ``{"$binary": "<base64>"}`` instead,
+    exactly the bytes the database returned.
     """
     if value is None:
         return None
@@ -410,8 +442,9 @@ def _make_json_safe(value: Any) -> Any:
         return str(value)
     # Binary data
     if isinstance(value, (bytes, bytearray, memoryview)):
-        if isinstance(value, memoryview):
-            value = bytes(value)
+        value = bytes(value)
+        if binary_format == "base64":
+            return {BINARY_MARKER: base64.b64encode(value).decode("ascii")}
         return value.decode("utf-8", errors="replace")
     # Network types (PostgreSQL)
     if isinstance(value, (IPv4Address, IPv6Address, IPv4Network, IPv6Network)):
@@ -424,11 +457,11 @@ def _make_json_safe(value: Any) -> Any:
         return str(value)
     # Collections
     if isinstance(value, dict):
-        return {str(k): _make_json_safe(v) for k, v in value.items()}
+        return {str(k): _make_json_safe(v, binary_format) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
-        return [_make_json_safe(v) for v in value]
+        return [_make_json_safe(v, binary_format) for v in value]
     if isinstance(value, (set, frozenset)):
-        return [_make_json_safe(v) for v in value]
+        return [_make_json_safe(v, binary_format) for v in value]
     # Fallback — convert anything else to string
     try:
         return str(value)
@@ -451,6 +484,9 @@ class ExecutionContextModel(BaseModel):
     timeout_seconds: int | None = None
     max_memory_mb: int | None = None
     max_output_size_kb: int | None = None
+    # "text" (default, as before): binary values come back decoded as UTF-8.
+    # "base64": they come back as {"$binary": "<base64>"} (see _make_json_safe).
+    binary_format: Literal["text", "base64"] = "text"
 
 
 class SQLExecutionRequest(BaseModel):
@@ -1227,7 +1263,7 @@ def register_routes(app: FastAPI) -> None:
                             {"name": c.name, "type": c.data_type, "masked": c.is_masked}
                             for c in result.columns
                         ],
-                        "rows": [_make_json_safe(row) for row in result.rows],
+                        "rows": [_make_json_safe(row, request.context.binary_format) for row in result.rows],
                         "row_count": result.row_count,
                         "total_rows_available": result.total_rows_available,
                     },
@@ -5919,11 +5955,32 @@ def register_routes(app: FastAPI) -> None:
             if owner is not None and str(owner[0] or "") != space:
                 logger.warning("document_not_in_space", doc_id=doc_id, space_id=space)
                 raise HTTPException(status_code=404, detail="Document not found")
+            doc = conn.execute(
+                sql_text("SELECT knowledge_base_id, file_id FROM document_kb_documents WHERE id = :id"),
+                {"id": int(doc_id)},
+            ).fetchone()
+            vectors_deleted = 0
+            if doc is not None and doc[1]:
+                # The search index: every vector table of the knowledge base
+                # (one per embedding width) holds this file's passages.
+                vectors_deleted = _delete_file_vectors(conn, doc[0], doc[1])
             conn.execute(sql_text("DELETE FROM document_kb_chunks WHERE document_id = :id"), {"id": int(doc_id)})
             conn.execute(sql_text("DELETE FROM document_kb_documents WHERE id = :id"), {"id": int(doc_id)})
             conn.commit()
+            # The stored file goes once no other document (another knowledge
+            # base indexing the same upload) still refers to it.
+            still_used = doc is not None and doc[1] and conn.execute(
+                sql_text("SELECT 1 FROM document_kb_documents WHERE file_id = :fid LIMIT 1"),
+                {"fid": doc[1]},
+            ).fetchone() is not None
 
-        return {"status": "deleted", "doc_id": doc_id}
+        files_deleted = 0
+        if doc is not None and doc[1] and not still_used:
+            files_deleted = remove_stored_files(_DOCUMENTS_DIR, space, doc[1])
+        if doc is not None:
+            logger.info("document_deleted", doc_id=doc_id, vectors=vectors_deleted, files=files_deleted)
+        return {"status": "deleted", "doc_id": doc_id,
+                "vectors_deleted": vectors_deleted, "files_deleted": files_deleted}
 
     # ==========================================================================
     # Metrics
