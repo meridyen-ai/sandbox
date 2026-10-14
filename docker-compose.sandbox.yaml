@@ -16,7 +16,12 @@ services:
   # Sandbox PostgreSQL - Dedicated database for uploaded file data
   # ---------------------------------------------------------------------------
   sandbox-postgres:
-    image: postgres:16-alpine
+    # pgvector: the document knowledge bases keep their vectors here. Pinned to
+    # an exact pgvector release (0.8 brings the iterative index scans filtered
+    # searches rely on). An existing volume made by postgres:16-alpine starts
+    # under this image as-is (same major version), but alpine and Debian sort
+    # text differently: run REINDEX DATABASE sandbox_uploads once after switching.
+    image: pgvector/pgvector:0.8.5-pg16
     container_name: sandbox-standalone-postgres
     restart: unless-stopped
 

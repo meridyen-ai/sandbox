@@ -15,7 +15,7 @@ services:
   # Sandbox PostgreSQL - Dedicated database for uploaded file data
   # ---------------------------------------------------------------------------
   sandbox-postgres:
-    image: pgvector/pgvector:pg16
+    image: pgvector/pgvector:0.8.5-pg16  # exact pgvector release; same digest as pg16 today
     container_name: meridyen-sandbox-postgres
     restart: unless-stopped
 
