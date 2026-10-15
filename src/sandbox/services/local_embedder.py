@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import threading
+from collections import OrderedDict
 from typing import Any, List, Optional
 
 import structlog
@@ -92,11 +93,15 @@ class _OnnxEmbedder:
         names = {o.name for o in self._sess.get_outputs()}
         self._out = "pooler_output" if "pooler_output" in names else self._sess.get_outputs()[0].name
         self._inputs = {i.name for i in self._sess.get_inputs()}
-        # One forward pass at a time: the session already spreads a pass over
+        # One ingestion pass at a time: the session already spreads a pass over
         # intra_op threads, so concurrent passes only fight for the same cores.
+        # A query (one short text) does not take this lock: it runs at once, and
+        # the next ingestion pass waits until no query is running (the query lane).
         self._run_lock = threading.Lock()
+        self._lane = threading.Condition()
+        self._queries = 0
 
-    def encode(self, texts: List[str]) -> List[List[float]]:
+    def encode(self, texts: List[str], *, query: bool = False) -> List[List[float]]:
         import numpy as np
 
         enc = [self._tok.encode(t or " ") for t in texts]
@@ -108,8 +113,20 @@ class _OnnxEmbedder:
         feed = {"input_ids": ids, "attention_mask": mask}
         if "token_type_ids" in self._inputs:
             feed["token_type_ids"] = np.zeros_like(ids)
-        with self._run_lock:
-            out = self._sess.run([self._out], feed)[0]
+        if query:
+            with self._lane:
+                self._queries += 1
+            try:
+                out = self._sess.run([self._out], feed)[0]
+            finally:
+                with self._lane:
+                    self._queries -= 1
+                    self._lane.notify_all()
+        else:
+            with self._run_lock:
+                with self._lane:
+                    self._lane.wait_for(lambda: self._queries == 0, timeout=5.0)
+                out = self._sess.run([self._out], feed)[0]
         if out.ndim == 3:  # last_hidden_state → mean-pool over real tokens
             m = mask[..., None].astype(out.dtype)
             out = (out * m).sum(axis=1) / np.clip(m.sum(axis=1), 1e-9, None)
@@ -127,6 +144,38 @@ def _get_model() -> _OnnxEmbedder:
                 _model = _OnnxEmbedder(MODEL_NAME)
                 logger.info("local_embedder_loaded", model=MODEL_NAME, dims=EMBEDDING_DIMENSIONS)
     return _model
+
+
+_QUERY_MEMO: "OrderedDict[str, List[float]]" = OrderedDict()
+_QUERY_MEMO_LOCK = threading.Lock()
+_QUERY_MEMO_SIZE = int(os.getenv("LOCAL_EMBEDDING_MEMO", "256"))
+
+
+def embed_query(text: str) -> List[float]:
+    """One question, on the query lane (never behind an ingestion batch), and
+    remembered: the same question is embedded once."""
+    key = " ".join((text or "").split())
+    with _QUERY_MEMO_LOCK:
+        hit = _QUERY_MEMO.get(key)
+        if hit is not None:
+            _QUERY_MEMO.move_to_end(key)
+            return hit
+    vec = _get_model().encode([text], query=True)[0]
+    with _QUERY_MEMO_LOCK:
+        _QUERY_MEMO[key] = vec
+        while len(_QUERY_MEMO) > _QUERY_MEMO_SIZE:
+            _QUERY_MEMO.popitem(last=False)
+    return vec
+
+
+def warm() -> None:
+    """Load the model and run it once (LOCAL_EMBEDDING_WARM=on at start; off by
+    default: a sandbox that never indexes should not hold the model)."""
+    try:
+        _get_model().encode(["warm up"], query=True)
+        logger.info("local_embedder_warm")
+    except Exception as e:  # noqa: BLE001 — the first search loads it instead
+        logger.warning("local_embedder_warm_failed", error=f"{type(e).__name__}: {e}")
 
 
 def embed_texts(texts: List[str]) -> List[List[float]]:
@@ -156,7 +205,7 @@ class LocalEmbedding(BaseEmbedding):
         return embed_texts(texts)
 
     def _get_query_embedding(self, query: str) -> List[float]:
-        return embed_texts([query])[0]
+        return embed_query(query)
 
     async def _aget_text_embedding(self, text: str) -> List[float]:
         return self._get_text_embedding(text)

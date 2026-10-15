@@ -900,6 +900,13 @@ def create_rest_app() -> FastAPI:
         app.state.viz_generator = VisualizationGenerator()
         app.state.start_time = datetime.now(timezone.utc)
 
+        # Optional: load the local embedder now rather than on the first search
+        # (off by default: a per-space sandbox should not hold the model idle).
+        if os.getenv("LOCAL_EMBEDDING_WARM", "off").strip().lower() in ("1", "on", "true", "yes"):
+            import threading
+            from sandbox.services import local_embedder
+            threading.Thread(target=local_embedder.warm, name="embedder-warm-up", daemon=True).start()
+
         yield
 
         # Shutdown
