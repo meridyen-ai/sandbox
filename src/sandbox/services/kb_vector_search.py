@@ -33,7 +33,7 @@ import structlog
 
 logger = structlog.get_logger(__name__)
 
-_TABLE = re.compile(r"^data_llamaindex_kb_\d+(?:_e\d+)?$")
+_TABLE = re.compile(r"^data_llamaindex_kb_\d+(?:_e\d+(?:_c\d+)?)?$")
 
 
 def _env_int(name: str, default: int, *, lo: int, hi: int) -> int:
@@ -114,6 +114,19 @@ def _table_exists(conn, table: str) -> bool:
     with _exists_lock:
         _exists[table] = (present, now)
     return present
+
+
+def first_existing(tables: Sequence[str]) -> str:
+    """The first of ``tables`` that exists (the last one when none does): a
+    vector table of new chunk settings, until it is filled, falls back to the
+    current one (services/chunking.py)."""
+    if len(tables) == 1:
+        return tables[0]
+    with get_engine().connect() as conn:
+        for t in tables:
+            if _table_exists(conn, t):
+                return t
+    return tables[-1]
 
 
 def _pgvector_version(conn) -> Tuple[int, ...]:

@@ -240,8 +240,11 @@ def _blocks_to_pseudo_elements(blocks: list[dict], max_characters: int = 1000) -
     max_characters, and never across a page boundary so page/bbox metadata stays
     truthful. The bbox of a merged chunk is the union of its blocks' boxes.
     """
+    from sandbox.services import chunking
+
     out: list[_PseudoElement] = []
     cur: list[dict] = []
+    chunk_settings = chunking.settings()
 
     def flush() -> None:
         if not cur:
@@ -257,6 +260,13 @@ def _blocks_to_pseudo_elements(blocks: list[dict], max_characters: int = 1000) -
         ))
         cur.clear()
 
+    if chunk_settings.mode == chunking.SECTIONS:
+        # headings start a chunk, long blocks are cut between sentences
+        for group in chunking.group_blocks(blocks, chunk_settings,
+                                           flush_on=lambda a, b: a["page_num"] != b["page_num"]):
+            cur.extend(group)
+            flush()
+        return out
     for b in blocks:
         pending = sum(len(x["text"]) + 1 for x in cur)
         if cur and (cur[0]["page_num"] != b["page_num"]
@@ -316,18 +326,11 @@ def _rebuild_li_documents_from_text(text: str, prior: list, *, filename: str,
         parts = source_path.rsplit("/", 1)
         base_meta["directory"] = parts[0] if len(parts) > 1 else ""
 
-    # Paragraph-ish blocks, packed to roughly the size the Unstructured path targets.
-    blocks = [b.strip() for b in text.split("\n\n") if b.strip()]
-    chunks: list[str] = []
-    cur = ""
-    for b in blocks:
-        if cur and len(cur) + len(b) + 2 > 1000:
-            chunks.append(cur)
-            cur = b
-        else:
-            cur = f"{cur}\n\n{b}" if cur else b
-    if cur:
-        chunks.append(cur)
+    # Paragraph-ish blocks, packed to the size the other paths target
+    # (services/chunking.py; today: paragraphs up to 1000 characters).
+    from sandbox.services import chunking
+
+    chunks: list[str] = chunking.split_text(text)
 
     out = []
     offset = 0
@@ -3335,7 +3338,18 @@ def register_routes(app: FastAPI) -> None:
     def _kb_vector_table(kb_id, embed_dim: int) -> str:
         if embed_dim == LEGACY_EMBED_DIM:
             return f"llamaindex_kb_{kb_id}"
-        return f"llamaindex_kb_{kb_id}_e{embed_dim}"
+        # Chunk settings other than today's fill a table of their own
+        # (``…_c<tag>``), side by side with the current one.
+        from sandbox.services import chunking
+
+        return f"llamaindex_kb_{kb_id}_e{embed_dim}{chunking.table_suffix()}"
+
+    def _kb_vector_tables_for_search(kb_id, embed_dim: int) -> list:
+        """The vector table to search: the one of the current chunk settings,
+        else (not filled yet) the default one."""
+        preferred = _kb_vector_table(kb_id, embed_dim)
+        base = f"llamaindex_kb_{kb_id}_e{embed_dim}" if embed_dim != LEGACY_EMBED_DIM else preferred
+        return [preferred] if preferred == base else [preferred, base]
 
     def _get_doc_db_engine():
         """Reuse the sandbox's upload DB engine for document KB storage."""
@@ -4634,14 +4648,16 @@ def register_routes(app: FastAPI) -> None:
                 # re-discovering them from plain text downstream. "by_title" starts
                 # a new chunk at each heading, merges short sections, and keeps
                 # tables intact.
+                # Sizes from services/chunking.py (DOCUMENT_CHUNK_*); today:
+                # max 1000 (~250 tokens), soft cap 900, sections under 500
+                # merged into neighbours, 100 characters of overlap.
+                from sandbox.services import chunking as _chunking
+
                 partition_kwargs = {
                     "filename": file_path,
                     "strategy": "hi_res",
                     "chunking_strategy": "by_title",
-                    "max_characters": 1000,              # hard cap per chunk (~250 tokens)
-                    "new_after_n_chars": 900,            # soft cap — try to break earlier
-                    "combine_text_under_n_chars": 500,   # merge tiny sections into neighbors
-                    "overlap": 100,                      # char overlap between consecutive chunks
+                    **_chunking.unstructured_kwargs(),
                 }
 
                 if ocr_strategy == "google_vision" and google_vision_credentials:
@@ -5263,7 +5279,8 @@ def register_routes(app: FastAPI) -> None:
         # One pooled engine, the knowledge bases at the same time, filters as
         # bound parameters; filtered searches use pgvector's iterative scan so
         # they still return the full top_k (services/kb_vector_search.py).
-        tables = [(kb_id, f"data_{_kb_vector_table(kb_id, embed_dim)}") for kb_id in kb_ids]
+        tables = [(kb_id, kb_vector_search.first_existing(
+            [f"data_{t}" for t in _kb_vector_tables_for_search(kb_id, embed_dim)])) for kb_id in kb_ids]
         found = await kb_vector_search.search_tables(
             tables, query_embedding, top_k,
             file_ids=list(file_ids) if file_ids else None,
@@ -5358,8 +5375,8 @@ def register_routes(app: FastAPI) -> None:
         rows = []
         try:
             with engine.connect() as c:
-                for dim in (local_embedder.EMBEDDING_DIMENSIONS, LEGACY_EMBED_DIM):
-                    table_name = _kb_vector_table(kb_id, dim)
+                for table_name in (_kb_vector_tables_for_search(kb_id, local_embedder.EMBEDDING_DIMENSIONS)
+                                   + [_kb_vector_table(kb_id, LEGACY_EMBED_DIM)]):
                     if not c.execute(
                         sql_text("SELECT to_regclass(:t)"), {"t": f"public.data_{table_name}"}
                     ).scalar():
