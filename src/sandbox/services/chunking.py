@@ -2,12 +2,14 @@
 the Data app's lexical passages (data-analyst src/backend/services/chunking.py),
 so the two halves of a passage search see the same pieces of text.
 
-  DOCUMENT_CHUNKER          windows (today) | sections
-  DOCUMENT_CHUNK_CHARS      target size, characters (1000)
+  DOCUMENT_CHUNKER          sections (default) | windows (the earlier cut)
+  DOCUMENT_CHUNK_CHARS      target size, characters (600)
   DOCUMENT_CHUNK_OVERLAP    overlap inside a section (vector chunks: 100)
   DOCUMENT_CHUNK_MIN_CHARS  a smaller section joins the next (default: 40% of the target)
 
-Today (``windows``, the defaults): digital PDFs group PyMuPDF blocks up to
+The default is sections / 600 (the evaluation: recall@10 +3.0, MRR +3.9,
+nDCG@10 +3.1 over the earlier windows / 1000). The earlier cut (``windows``,
+1000): digital PDFs group PyMuPDF blocks up to
 1000 characters (never across a page); scans and Office files go through
 Unstructured's ``by_title`` chunker (max 1000, soft 900, combine under 500,
 overlap 100); a re-transcribed text is packed by paragraphs up to 1000. The
@@ -20,9 +22,10 @@ target, a block longer than the target is cut between sentences (never inside
 one), and a smaller section joins the next while both fit. Unstructured gets
 the same sizes.
 
-``table_suffix()`` names the vector table of non-default settings
-(``…_e<dim>_c<tag>``): a size change fills a table of its own, side by side
-with the current one, which search keeps using until the new one exists.
+``table_suffix()`` names the vector table of any settings but the earlier
+windows / 1000 (``…_e<dim>_c<tag>``): a size change fills a table of its own,
+side by side with the earlier one. Search reads both; a file re-indexed into
+the new table leaves the earlier one, so each file is in exactly one.
 """
 from __future__ import annotations
 
@@ -33,13 +36,14 @@ from dataclasses import dataclass
 from typing import Callable, List, Optional, Sequence, Tuple
 
 WINDOWS, SECTIONS = "windows", "sections"
-DEFAULT_CHARS = 1000
+DEFAULT_MODE = SECTIONS
+DEFAULT_CHARS = 600
 DEFAULT_OVERLAP = 100
 
 
 @dataclass(frozen=True)
 class ChunkSettings:
-    mode: str = WINDOWS
+    mode: str = DEFAULT_MODE
     chars: int = DEFAULT_CHARS
     overlap: int = DEFAULT_OVERLAP
     min_chars: Optional[int] = None
@@ -58,17 +62,21 @@ def _env_int(name: str) -> Optional[int]:
 
 
 def settings() -> ChunkSettings:
-    mode = (os.environ.get("DOCUMENT_CHUNKER") or WINDOWS).strip().lower()
+    mode = (os.environ.get("DOCUMENT_CHUNKER") or DEFAULT_MODE).strip().lower()
     chars = max(200, _env_int("DOCUMENT_CHUNK_CHARS") or DEFAULT_CHARS)
     overlap = _env_int("DOCUMENT_CHUNK_OVERLAP")
-    return ChunkSettings(mode=mode if mode in (WINDOWS, SECTIONS) else WINDOWS, chars=chars,
+    return ChunkSettings(mode=mode if mode in (WINDOWS, SECTIONS) else DEFAULT_MODE, chars=chars,
                          overlap=min(DEFAULT_OVERLAP if overlap is None else overlap, chars // 2),
                          min_chars=_env_int("DOCUMENT_CHUNK_MIN_CHARS"))
 
 
+# The earlier cut, whose vectors live in the table without a suffix.
+EARLIER = ChunkSettings(mode=WINDOWS, chars=1000, overlap=DEFAULT_OVERLAP)
+
+
 def index_tag(s: Optional[ChunkSettings] = None) -> int:
     s = s or settings()
-    if s == ChunkSettings():
+    if s == EARLIER:
         return 0
     return 1 + zlib.crc32(f"{s.mode}:{s.chars}:{s.overlap}:{s.min_chars}".encode()) % 999_999
 
@@ -84,7 +92,7 @@ def unstructured_kwargs(s: Optional[ChunkSettings] = None) -> dict:
     return {
         "max_characters": s.chars,
         "new_after_n_chars": int(s.chars * 0.9),
-        "combine_text_under_n_chars": s.min_chars if s.min_chars is not None else (500 if s == ChunkSettings()
+        "combine_text_under_n_chars": s.min_chars if s.min_chars is not None else (500 if s == EARLIER
                                                                                    else s.min_size),
         "overlap": s.overlap,
     }

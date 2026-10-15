@@ -3345,8 +3345,8 @@ def register_routes(app: FastAPI) -> None:
         return f"llamaindex_kb_{kb_id}_e{embed_dim}{chunking.table_suffix()}"
 
     def _kb_vector_tables_for_search(kb_id, embed_dim: int) -> list:
-        """The vector table to search: the one of the current chunk settings,
-        else (not filled yet) the default one."""
+        """The vector tables to search: the one of the current chunk settings
+        and, when that is not the earlier cut's, the earlier one too."""
         preferred = _kb_vector_table(kb_id, embed_dim)
         base = f"llamaindex_kb_{kb_id}_e{embed_dim}" if embed_dim != LEGACY_EMBED_DIM else preferred
         return [preferred] if preferred == base else [preferred, base]
@@ -5135,6 +5135,15 @@ def register_routes(app: FastAPI) -> None:
                             {"fid": file_id},
                         )
                         c.commit()
+                        # Re-indexed under new chunk settings: out of the earlier table too.
+                        _earlier = _kb_vector_tables_for_search(kb_id, embed_dim)[-1]
+                        if _earlier != table_name and c.execute(
+                                sql_text("SELECT to_regclass(:t)"), {"t": f"public.data_{_earlier}"}).scalar():
+                            c.execute(sql_text(f"DELETE FROM data_{_earlier} WHERE metadata_->>'file_id' = :fid"),
+                                      {"fid": file_id})
+                            c.commit()
+                            from sandbox.services import kb_vector_search as _kvs
+                            _kvs.invalidate(f"data_{_earlier}")
                         logger.info("vector_dedup_prereindex", doc_id=doc_id, file_id=file_id,
                                     deleted=deleted.rowcount if hasattr(deleted, 'rowcount') else 0)
                 except Exception as e:
@@ -5279,8 +5288,9 @@ def register_routes(app: FastAPI) -> None:
         # One pooled engine, the knowledge bases at the same time, filters as
         # bound parameters; filtered searches use pgvector's iterative scan so
         # they still return the full top_k (services/kb_vector_search.py).
-        tables = [(kb_id, kb_vector_search.first_existing(
-            [f"data_{t}" for t in _kb_vector_tables_for_search(kb_id, embed_dim)])) for kb_id in kb_ids]
+        # Both tables while chunk settings change: each file lives in exactly
+        # one of them (indexing into the new one removes it from the earlier).
+        tables = [(kb_id, f"data_{t}") for kb_id in kb_ids for t in _kb_vector_tables_for_search(kb_id, embed_dim)]
         found = await kb_vector_search.search_tables(
             tables, query_embedding, top_k,
             file_ids=list(file_ids) if file_ids else None,

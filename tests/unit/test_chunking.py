@@ -11,14 +11,16 @@ LAW = (
 )
 
 
-def test_defaults_are_today(monkeypatch):
+def test_defaults_are_sections_600_and_the_earlier_cut_keeps_its_table(monkeypatch):
     for k in ("DOCUMENT_CHUNKER", "DOCUMENT_CHUNK_CHARS", "DOCUMENT_CHUNK_OVERLAP", "DOCUMENT_CHUNK_MIN_CHARS"):
         monkeypatch.delenv(k, raising=False)
+    assert ch.settings() == ch.ChunkSettings(mode="sections", chars=600, overlap=100)
+    assert ch.table_suffix().startswith("_c") and ch.unstructured_kwargs()["max_characters"] == 600
+    monkeypatch.setenv("DOCUMENT_CHUNKER", "windows")
+    monkeypatch.setenv("DOCUMENT_CHUNK_CHARS", "1000")
     assert ch.index_tag() == 0 and ch.table_suffix() == ""
     assert ch.unstructured_kwargs() == {"max_characters": 1000, "new_after_n_chars": 900,
                                         "combine_text_under_n_chars": 500, "overlap": 100}
-    monkeypatch.setenv("DOCUMENT_CHUNK_CHARS", "600")
-    assert ch.table_suffix().startswith("_c") and ch.unstructured_kwargs()["max_characters"] == 600
 
 
 def test_articles_start_chunks_and_sentences_stay_whole(monkeypatch):
@@ -46,10 +48,10 @@ def test_long_block_keeps_its_metadata_and_page_breaks_hold(monkeypatch):
     assert groups[-1][0]["text"] == "Sayfa iki." and all(len(g) >= 1 for g in groups)
 
 
-def test_split_text_today_and_sections(monkeypatch):
+def test_split_text_earlier_and_sections(monkeypatch):
     text = "\n\n".join(f"Paragraf {i}. " + "Kelime cümlesi. " * 20 for i in range(10))
-    monkeypatch.delenv("DOCUMENT_CHUNKER", raising=False)
-    monkeypatch.delenv("DOCUMENT_CHUNK_CHARS", raising=False)
+    monkeypatch.setenv("DOCUMENT_CHUNKER", "windows")
+    monkeypatch.setenv("DOCUMENT_CHUNK_CHARS", "1000")
     today = ch.split_text(text)
     assert all(len(c) <= 1000 for c in today) and len(today) >= 3
     monkeypatch.setenv("DOCUMENT_CHUNKER", "sections")
