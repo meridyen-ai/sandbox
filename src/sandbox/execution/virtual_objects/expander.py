@@ -50,6 +50,7 @@ DIALECTS: dict[str, str | None] = {
     "mssql": "tsql",
     "postgresql": "postgres",
     "mysql": "mysql",
+    "oracle": "oracle",
     "saphana": None,
 }
 

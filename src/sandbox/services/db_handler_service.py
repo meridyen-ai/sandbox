@@ -962,14 +962,36 @@ class OracleHandler(BaseDBHandler):
     description = "Oracle Database"
     icon = "oracle"
     connection_args = [
+        # The fields every connection is created with (connectors/oracle.py):
+        # the service name goes in "database".
         ConnectionArg("host", "string", "Host", "The hostname or IP address of the Oracle server", required=True),
-        ConnectionArg("port", "integer", "Port", "The port number (default: 1521)", required=False, default=1521),
-        ConnectionArg("user", "string", "Username", "The username for the Oracle database", required=True),
+        ConnectionArg("port", "integer", "Port", "The listener port (default: 1521)", required=False, default=1521),
+        ConnectionArg("database", "string", "Service name", "The service name of the database (e.g. ORCLPDB1)", required=True),
+        ConnectionArg("username", "string", "Username", "The username for the Oracle database", required=True),
         ConnectionArg("password", "password", "Password", "The password for the Oracle database", required=True, secret=True),
-        ConnectionArg("service_name", "string", "Service Name", "The service name of the Oracle database", required=False),
-        ConnectionArg("sid", "string", "SID", "The system identifier (SID) of the Oracle database", required=False),
-        ConnectionArg("dsn", "string", "DSN", "The data source name (alternative to host/port/sid)", required=False),
+        ConnectionArg("schema_name", "string", "Schema", "The schema to read (default: the user's own)", required=False),
     ]
+
+    @staticmethod
+    def _conn_params(connection_data: Dict[str, Any]) -> Dict[str, Any]:
+        """oracledb.connect arguments from the form fields (host, port,
+        database = service name, username), or the older names (user,
+        service_name, sid, dsn)."""
+        params: Dict[str, Any] = {
+            "user": connection_data.get("username") or connection_data.get("user"),
+            "password": connection_data.get("password"),
+        }
+        if connection_data.get("dsn"):
+            params["dsn"] = connection_data["dsn"]
+            return params
+        params["host"] = connection_data.get("host")
+        params["port"] = connection_data.get("port") or 1521
+        service = connection_data.get("service_name") or connection_data.get("database")
+        if service:
+            params["service_name"] = service
+        elif connection_data.get("sid"):
+            params["sid"] = connection_data["sid"]
+        return params
 
     @classmethod
     def is_available(cls) -> bool:
@@ -984,21 +1006,7 @@ class OracleHandler(BaseDBHandler):
         try:
             import oracledb
 
-            # Build connection params
-            conn_params = {
-                "user": connection_data.get("user"),
-                "password": connection_data.get("password"),
-            }
-
-            if connection_data.get("dsn"):
-                conn_params["dsn"] = connection_data["dsn"]
-            else:
-                conn_params["host"] = connection_data.get("host")
-                conn_params["port"] = connection_data.get("port", 1521)
-                if connection_data.get("service_name"):
-                    conn_params["service_name"] = connection_data["service_name"]
-                elif connection_data.get("sid"):
-                    conn_params["sid"] = connection_data["sid"]
+            conn_params = cls._conn_params(connection_data)
 
             conn = oracledb.connect(**conn_params)
             conn.ping()
@@ -1013,19 +1021,7 @@ class OracleHandler(BaseDBHandler):
     def get_tables(cls, connection_data: Dict[str, Any]) -> List[Dict[str, Any]]:
         import oracledb
 
-        conn_params = {
-            "user": connection_data.get("user"),
-            "password": connection_data.get("password"),
-        }
-        if connection_data.get("dsn"):
-            conn_params["dsn"] = connection_data["dsn"]
-        else:
-            conn_params["host"] = connection_data.get("host")
-            conn_params["port"] = connection_data.get("port", 1521)
-            if connection_data.get("service_name"):
-                conn_params["service_name"] = connection_data["service_name"]
-            elif connection_data.get("sid"):
-                conn_params["sid"] = connection_data["sid"]
+        conn_params = cls._conn_params(connection_data)
 
         conn = oracledb.connect(**conn_params)
         try:
@@ -1049,19 +1045,7 @@ class OracleHandler(BaseDBHandler):
     def get_columns(cls, connection_data: Dict[str, Any], table_name: str) -> List[Dict[str, Any]]:
         import oracledb
 
-        conn_params = {
-            "user": connection_data.get("user"),
-            "password": connection_data.get("password"),
-        }
-        if connection_data.get("dsn"):
-            conn_params["dsn"] = connection_data["dsn"]
-        else:
-            conn_params["host"] = connection_data.get("host")
-            conn_params["port"] = connection_data.get("port", 1521)
-            if connection_data.get("service_name"):
-                conn_params["service_name"] = connection_data["service_name"]
-            elif connection_data.get("sid"):
-                conn_params["sid"] = connection_data["sid"]
+        conn_params = cls._conn_params(connection_data)
 
         conn = oracledb.connect(**conn_params)
         try:
@@ -1070,7 +1054,7 @@ class OracleHandler(BaseDBHandler):
             if "." in table_name:
                 schema, table = table_name.split(".", 1)
             else:
-                schema = connection_data.get("user", "").upper()
+                schema = (connection_data.get("username") or connection_data.get("user") or "").upper()
                 table = table_name.upper()
 
             cursor.execute("""

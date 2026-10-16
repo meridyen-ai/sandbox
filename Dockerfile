@@ -85,9 +85,8 @@ RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
 #      _features.so) and can overwrite it, deleting `fitz` — PDF indexing then
 #      fails with ModuleNotFoundError while the container still reports healthy.
 #   2. It hijacks pymupdf4llm.to_markdown into rasterise+Tesseract OCR mode even
-#      for PDFs that HAVE a text layer. With the eng-only traineddata in this
-#      image that turns Arabic documents into Latin mojibake, replacing a
-#      perfectly good text layer with garbage.
+#      for PDFs that HAVE a text layer, replacing a perfectly good text layer
+#      (Arabic in particular) with OCR output.
 # Keep this immediately after the dependency install so it can never ship.
 RUN SP="$(python -c 'import site; print(site.getsitepackages()[0])')" && \
     rm -rf "$SP/pymupdf_layout" "$SP"/pymupdf_layout-*.dist-info \
@@ -146,9 +145,19 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     curl \
     # Security: CA certificates
     ca-certificates \
-    # Unstructured document processing: OCR + PDF rendering
+    # Unstructured document processing: OCR + PDF rendering.
+    # Tesseract language packs (Debian ships the small "tessdata_fast" models,
+    # ~1-4 MB each). The OCR language of each document is chosen at run time
+    # from this installed set (sandbox/services/ocr_languages.py); a language
+    # missing here is skipped, never an error. Add a pack here to support it.
     tesseract-ocr \
     tesseract-ocr-eng \
+    tesseract-ocr-tur \
+    tesseract-ocr-ara \
+    tesseract-ocr-deu \
+    tesseract-ocr-fra \
+    tesseract-ocr-spa \
+    tesseract-ocr-rus \
     poppler-utils \
     libmagic1 \
     pandoc \

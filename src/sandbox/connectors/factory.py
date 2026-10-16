@@ -137,6 +137,20 @@ def _load_connector(db_type: DatabaseType) -> Type[BaseConnector] | None:
                 )
                 return None
 
+        elif db_type == DatabaseType.ORACLE:
+            # Oracle connector (python-oracledb, thin mode)
+            try:
+                import oracledb  # noqa: F401 — the driver this connector needs
+                from sandbox.connectors.oracle import OracleConnector
+                register_connector(db_type, OracleConnector)
+                return OracleConnector
+            except ImportError:
+                logger.warning(
+                    "oracle_connector_not_available",
+                    message="Install oracledb to use Oracle",
+                )
+                return None
+
         elif db_type == DatabaseType.SAPHANA:
             # SAP HANA connector
             try:

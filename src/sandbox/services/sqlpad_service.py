@@ -136,11 +136,14 @@ class SQLPadService:
             "snowflake": "snowflake",
             "bigquery": "bigquery",
             "redshift": "postgres",  # Redshift uses postgres driver
-            "oracle": "oracle",
             "sap_hana": "hana",
             "trino": "trino",
         }
 
+        if db_type.lower() == "oracle":
+            # SQL Pad has no Oracle driver; a connection made under another
+            # driver's name could never open. Oracle is queried in the app.
+            raise SandboxError("SQL Pad cannot open Oracle connections")
         driver = driver_map.get(db_type.lower(), "postgres")
 
         connection_data = {
@@ -151,7 +154,7 @@ class SQLPadService:
         }
 
         # Add connection-specific fields based on driver
-        if driver in ["postgres", "mysql"]:
+        if driver in ["postgres", "mysql", "sqlserver"]:
             connection_data.update({
                 "host": host,
                 "port": str(port),
@@ -164,8 +167,13 @@ class SQLPadService:
                 connection_data["postgresSchema"] = schema
         else:
             # Build connection string for other drivers
+            from urllib.parse import quote
+
+            # Credentials escaped: a password with "@", ":" or "/" would
+            # otherwise end up in the host part of the URL.
             connection_data["connectionString"] = (
-                f"{driver}://{username}:{password}@{host}:{port}/{database}"
+                f"{driver}://{quote(username, safe='')}:{quote(password, safe='')}@{host}:{port}/"
+                f"{quote(database, safe='')}"
             )
 
         try:

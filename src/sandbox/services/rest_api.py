@@ -106,27 +106,49 @@ def _normalize_arabic_presentation_forms(text: str) -> str:
     subscripts ("x²"→"x2", "H₂O"→"H2O") and Latin ligatures ("ﬁle"→"file"),
     silently corrupting scientific and technical documents. Only codepoints in
     the Arabic presentation blocks are touched; everything else is returned
-    byte-identical.
+    byte-identical, except that the text is put in composed form (NFC, below).
     """
     if not text:
         return text
+    import unicodedata
+
     # PyMuPDF emits NUL for glyphs it cannot map to a character. Postgres rejects
     # NUL in text values ("A string literal cannot contain NUL (0x00)
     # characters"), which aborts the whole document UPDATE — so strip them here,
     # before any value derived from this text reaches the database.
     if "\x00" in text:
         text = text.replace("\x00", "")
+    # Composed letters (NFC, canonical — unlike NFKC it leaves superscripts and
+    # ligatures alone). Tesseract and some PDF text layers emit a letter as base
+    # + combining mark ("s" + U+0327 for "ş", "I" + U+0307 for "İ"); queries and
+    # the lexical index hold the composed letter, so the decomposed one would
+    # never match.
+    if not unicodedata.is_normalized("NFC", text):
+        text = unicodedata.normalize("NFC", text)
     # Fast path: most documents contain no presentation forms at all, so scan
     # once and return the original string untouched rather than rebuilding it.
     if not any(_is_arabic_presentation_form(c) for c in text):
         return text
 
-    import unicodedata
-
     return "".join(
         unicodedata.normalize("NFKC", c) if _is_arabic_presentation_form(c) else c
         for c in text
     )
+
+
+def _pdf_to_markdown(file_path: str, ocr_language: str) -> str:
+    """A PDF as Markdown via pymupdf4llm (Tier 1 of the Markdown rendition).
+
+    pymupdf4llm OCRs pages itself only in its layout mode (pymupdf_layout,
+    which the image removes — see the Dockerfile). Should that mode ever be
+    active, it reads in the document's OCR languages instead of its English
+    default; in the plain mode the OCR options do not exist and are not passed
+    (it would print a warning for each).
+    """
+    import pymupdf4llm
+
+    kwargs = {"ocr_language": ocr_language} if getattr(pymupdf4llm, "_use_layout", False) else {}
+    return (pymupdf4llm.to_markdown(file_path, **kwargs) or "").strip()
 
 
 def _pymupdf_text_blocks(file_path: str) -> list[dict] | None:
@@ -4129,6 +4151,8 @@ def register_routes(app: FastAPI) -> None:
         """
         Process a document using Unstructured (parsing) + the local model (embeddings).
         Supports OCR strategies: "local" (Tesseract) or "google_vision".
+        ``language_hint`` (optional, e.g. "tr"): the caller's language, one of
+        the inputs to the Tesseract languages of a scan (services/ocr_languages.py).
         """
         from sqlalchemy import text as sql_text
 
@@ -4145,6 +4169,11 @@ def register_routes(app: FastAPI) -> None:
         # Indexing job id — forwarded to backend vision callbacks so tokens
         # are attributed to the user/space/org that triggered the job.
         job_id = body.get("job_id", "") or ""
+        # The caller's language (the organization's), used as an OCR hint.
+        # Anything that names no language is ignored there.
+        language_hint = body.get("language_hint")
+        if not isinstance(language_hint, str):
+            language_hint = None
 
         # Find the uploaded file — search recursively because files are stored
         # at /app/data/documents/{space_id}/{folder_path}/{file_id}.ext. Only
@@ -4227,7 +4256,7 @@ def register_routes(app: FastAPI) -> None:
                 _run_unstructured_pipeline,
                 engine, doc_id, str(file_path), file_type, kb_id, filename,
                 ocr_strategy, google_vision_credentials, source_path,
-                file_id, job_id,
+                file_id, job_id, language_hint,
             )
         except Exception as e:
             logger.error("document_processing_failed", doc_id=doc_id, error=str(e))
@@ -4526,6 +4555,7 @@ def register_routes(app: FastAPI) -> None:
         source_path: str = "",
         file_id: str = "",
         job_id: str = "",
+        language_hint: str | None = None,
     ):
         """
         Document processing pipeline using Unstructured (parsing) + LlamaIndex (indexing).
@@ -4534,7 +4564,9 @@ def register_routes(app: FastAPI) -> None:
         - LlamaIndex: chunks with metadata, embeds with OpenAI, stores in PGVectorStore
 
         OCR strategies for scanned/non-digital documents:
-          - "local": Tesseract OCR (free, on-premise)
+          - "local": Tesseract OCR (free, on-premise), in the languages chosen
+            per document by services/ocr_languages.py (``language_hint`` is the
+            caller's language, one input to that choice)
           - "google_vision": Google Cloud Vision OCR (best accuracy)
 
         LlamaIndex automatically tracks file paths, page numbers, and element types
@@ -4553,6 +4585,12 @@ def register_routes(app: FastAPI) -> None:
 
         try:
             _update_prog(5)
+
+            from sandbox.services import ocr_languages as _ocr_languages_mod
+
+            # The Tesseract languages of this document once it is OCRed (None
+            # until then; see services/ocr_languages.py).
+            ocr_langs = None
 
             from llama_index.core.schema import Document as LIDocument
             li_documents = []
@@ -4699,6 +4737,13 @@ def register_routes(app: FastAPI) -> None:
                     logger.info("pdf_text_layer_via_pymupdf", doc_id=doc_id,
                                 blocks=len(pymupdf_blocks), chunks=len(elements))
                 else:
+                    if ocr_strategy != "google_vision" and file_type.lower() in _ocr_languages_mod.OCR_FILE_TYPES:
+                        # A scan or an image: Unstructured OCRs it, in the
+                        # languages chosen for this document.
+                        ocr_langs = _ocr_languages_mod.for_document(
+                            str(file_path), file_type, hint=language_hint
+                        )
+                        partition_kwargs["languages"] = list(ocr_langs.codes)
                     elements = partition(**partition_kwargs)
 
                 if not elements and not pymupdf_blocks:
@@ -4988,8 +5033,10 @@ def register_routes(app: FastAPI) -> None:
             md_source = "none"
             if file_type.lower() == "pdf":
                 try:
-                    import pymupdf4llm
-                    extracted_markdown = (pymupdf4llm.to_markdown(file_path) or "").strip()
+                    extracted_markdown = _pdf_to_markdown(
+                        file_path,
+                        (ocr_langs or _ocr_languages_mod.without_probe(language_hint)).tesseract,
+                    )
                     if extracted_markdown:
                         md_source = "pymupdf4llm"
                         logger.info("pymupdf4llm_markdown_ok", doc_id=doc_id,
@@ -5033,10 +5080,11 @@ def register_routes(app: FastAPI) -> None:
 
             # Scanned PDFs: adopt the Tier-3 VLM transcription as the TEXT rendition
             # too. Without this, extracted_text (and the chunks embedded from it)
-            # keep Tesseract's output, which is eng-only in this image and turns
-            # Arabic into Latin look-alikes ("ols gle _3la gylb") — the document
-            # then reads as garbage and is unsearchable in its own language, even
-            # though a correct transcription already exists in extracted_markdown.
+            # keep Tesseract's output, which for a hard scan (and any language
+            # whose pack is not installed) can turn the text into look-alikes
+            # ("ols gle _3la gylb") — the document then reads as garbage and is
+            # unsearchable in its own language, even though a better
+            # transcription already exists in extracted_markdown.
             # Guarded on md_source so this only ever applies to pages the VLM
             # actually transcribed, never to digital PDFs.
             if md_source == "vlm_ocr" and extracted_markdown.strip():
@@ -5614,8 +5662,9 @@ def register_routes(app: FastAPI) -> None:
             # Tier-1 backfill for PDFs whose file is still on disk.
             if ftype and ftype.lower() == "pdf" and storage_path and os.path.exists(storage_path):
                 try:
-                    import pymupdf4llm
-                    md = (pymupdf4llm.to_markdown(storage_path) or "").strip()
+                    from sandbox.services import ocr_languages as _ocr_languages_mod
+
+                    md = _pdf_to_markdown(storage_path, _ocr_languages_mod.without_probe().tesseract)
                 except Exception as e:
                     logger.warning("transcript_md_backfill_failed", file_id=file_id, error=str(e))
             # Fall back to plain text so callers always get something.
