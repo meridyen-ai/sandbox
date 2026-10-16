@@ -22,7 +22,7 @@ from sandbox.core.exceptions import ConnectionError, SQLExecutionError
 def _cfg(**kw) -> DatabaseConnectionConfig:
     base = dict(
         id="ora-1", name="ora", db_type=DatabaseType.ORACLE, host="db.example.com",
-        port=1521, database="FREEPDB1", username="qdms", password=SecretStr("pw"),
+        port=1521, database="FREEPDB1", username="docs", password=SecretStr("pw"),
         query_timeout=120, connection_timeout=7,
     )
     base.update(kw)
@@ -108,7 +108,7 @@ def test_oracle_is_a_connector_type():
 
 
 def test_identifier_folding():
-    assert oracle_identifier("qdms") == "QDMS"
+    assert oracle_identifier("docs") == "DOCS"
     assert oracle_identifier('"MixedCase"') == "MixedCase"
     assert oracle_identifier("weird name") == "weird name"
 
@@ -133,12 +133,12 @@ def test_connect_params_tls(mode, dn_match):
 @pytest.mark.asyncio
 async def test_connect_dials_checked_address_and_sets_timeout_and_schema(fake_driver):
     calls, conn = fake_driver
-    c = OracleConnector(_cfg(schema_name="qdms_docs"))
+    c = OracleConnector(_cfg(schema_name="docs_store"))
     got = await c.connect()
     assert got is conn
     assert calls["host"] == "203.0.113.9"  # the vetted address, not the name
     assert conn.call_timeout == 120_000
-    assert conn.log[0][0] == 'ALTER SESSION SET CURRENT_SCHEMA = "QDMS_DOCS"'
+    assert conn.log[0][0] == 'ALTER SESSION SET CURRENT_SCHEMA = "DOCS_STORE"'
 
 
 @pytest.mark.asyncio
@@ -187,9 +187,9 @@ async def test_errors_are_sql_execution_errors_and_still_roll_back():
 @pytest.mark.asyncio
 async def test_catalog_is_scoped_to_the_schema():
     conn = FakeConn()
-    c = OracleConnector(_cfg(schema_name="qdms"))
+    c = OracleConnector(_cfg(schema_name="docs"))
     await c.get_table_entries(conn)
     sql, params, _ = conn.log[-1]
-    assert "OWNER = :owner" in sql and params == {"owner": "QDMS"}
+    assert "OWNER = :owner" in sql and params == {"owner": "DOCS"}
     await OracleConnector(_cfg()).get_table_entries(conn)
     assert "SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')" in conn.log[-1][0]
