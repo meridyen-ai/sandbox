@@ -62,3 +62,24 @@ def test_query_does_not_wait_for_the_ingestion_lock():
         start = time.monotonic()
         m.encode(["q"], query=True)
         assert time.monotonic() - start < 1.0
+
+
+def test_session_options_follow_the_environment():
+    import types
+
+    class Options(types.SimpleNamespace):
+        def __init__(self):
+            super().__init__(config={})
+
+        def add_session_config_entry(self, key, value):
+            self.config[key] = value
+
+    ort = types.SimpleNamespace(
+        SessionOptions=Options,
+        ExecutionMode=types.SimpleNamespace(ORT_SEQUENTIAL="sequential"),
+        GraphOptimizationLevel=types.SimpleNamespace(ORT_ENABLE_ALL="all"))
+    opts = le.session_options(ort)
+    assert opts.intra_op_num_threads == le.THREADS and opts.inter_op_num_threads == 1
+    assert opts.execution_mode == "sequential" and opts.graph_optimization_level == "all"
+    assert opts.enable_cpu_mem_arena is False and opts.enable_mem_pattern is False
+    assert opts.config["session.intra_op.allow_spinning"] == ("1" if le.SPINNING else "0")

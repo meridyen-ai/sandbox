@@ -45,6 +45,34 @@ BATCH_SIZE = int(os.getenv("LOCAL_EMBEDDING_BATCH_SIZE", "1"))
 #: Texts LlamaIndex hands over per call — bookkeeping only, not a forward pass.
 LLAMAINDEX_BATCH_SIZE = 32
 
+#: Intra-op threads of a pass (8: what the sandbox's CPU limit is sized for).
+THREADS = max(1, int(os.getenv("LOCAL_EMBEDDING_THREADS", "8")))
+#: Off by default: spinning worker threads between operators only pays when
+#: the cores are free. Measured on the shared host (load ~30, 18 vCPUs, 8
+#: threads, corpus chunks one per pass, two interleaved rounds): off 0.133 /
+#: 0.143 chunks/s, on 0.092 / 0.102; a Data-app question embedded beside it
+#: was the same either way within noise. "on" restores onnxruntime's default.
+SPINNING = os.getenv("LOCAL_EMBEDDING_SPINNING", "off").strip().lower() in ("1", "on", "true", "yes")
+
+
+def session_options(ort):
+    opts = ort.SessionOptions()
+    opts.log_severity_level = 3
+    # Input shapes change with every chunk. The arena keeps the high-water
+    # mark of each shape it has seen and never returns it, so resident memory
+    # only ratchets up over a long indexing run.
+    opts.enable_cpu_mem_arena = False
+    opts.enable_mem_pattern = False
+    opts.intra_op_num_threads = THREADS
+    # The graph is a chain of fused transformer operators: parallelism is
+    # inside them, so an inter-op pool would only add idle threads.
+    opts.inter_op_num_threads = 1
+    opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    opts.add_session_config_entry("session.intra_op.allow_spinning", "1" if SPINNING else "0")
+    return opts
+
+
 _model: Optional["_OnnxEmbedder"] = None
 _lock = threading.Lock()
 
@@ -81,15 +109,7 @@ class _OnnxEmbedder:
         self._tok = Tokenizer.from_file(_get("tokenizer.json"))
         self._tok.enable_truncation(max_length=MAX_TOKENS)
 
-        opts = ort.SessionOptions()
-        opts.log_severity_level = 3
-        # Input shapes change with every chunk. The arena keeps the high-water
-        # mark of each shape it has seen and never returns it, so resident memory
-        # only ratchets up over a long indexing run.
-        opts.enable_cpu_mem_arena = False
-        opts.enable_mem_pattern = False
-        opts.intra_op_num_threads = int(os.getenv("LOCAL_EMBEDDING_THREADS", "8"))
-        self._sess = ort.InferenceSession(model_path, opts, providers=["CPUExecutionProvider"])
+        self._sess = ort.InferenceSession(model_path, session_options(ort), providers=["CPUExecutionProvider"])
         names = {o.name for o in self._sess.get_outputs()}
         self._out = "pooler_output" if "pooler_output" in names else self._sess.get_outputs()[0].name
         self._inputs = {i.name for i in self._sess.get_inputs()}
