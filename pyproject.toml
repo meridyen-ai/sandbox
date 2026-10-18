@@ -39,6 +39,12 @@ dependencies = [
     # Data processing
     "pandas>=2.1.0",
     "numpy>=1.26.0",
+    # What executed Python may import beyond pandas/numpy (see
+    # allowed_python_imports) and what the executor preloads. Declared, so the
+    # image has them: an allowed import that is not installed fails every time.
+    "scipy>=1.11.0",
+    "scikit-learn>=1.4.0",
+    "statsmodels>=0.14.0",
     # Unstructured leaves numba unconstrained and can resolve to 0.53/llvmlite 0.36,
     # which cannot install on this image's Python 3.12. Keep the resolver on a
     # Python-3.12-compatible numba/llvmlite pair for reproducible full builds.

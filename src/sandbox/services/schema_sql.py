@@ -16,10 +16,18 @@ from sandbox.execution.virtual_objects.models import KIND_PROCEDURE, VirtualObje
 from sandbox.execution.virtual_objects.registry import VirtualObjectSet
 
 
+# How each engine quotes a name that is not a plain identifier. Everything
+# not listed uses the standard double quote.
+_BRACKET_QUOTED = frozenset({"mssql", "azuresynapse"})
+_BACKTICK_QUOTED = frozenset(
+    {"mysql", "mariadb", "singlestore", "bigquery", "databricks", "clickhouse"}
+)
+
+
 def quote_ident(db_type: str, name: str) -> str:
-    if db_type == "mssql":
+    if db_type in _BRACKET_QUOTED:
         return "[" + str(name).replace("]", "]]") + "]"
-    if db_type == "mysql":
+    if db_type in _BACKTICK_QUOTED:
         return "`" + str(name).replace("`", "``") + "`"
     return '"' + str(name).replace('"', '""') + '"'
 
@@ -35,9 +43,13 @@ def build_sample_query(
     cols = ", ".join(quote_ident(db_type, c) for c in columns) if columns else "*"
     ref = quote_ident(db_type, table)
     if schema:
-        ref = f"{quote_ident(db_type, schema)}.{ref}"
-    if db_type == "mssql":
+        # Dremio's schema is a dotted path of several names.
+        parts = schema.split(".") if db_type == "dremio" else [schema]
+        ref = ".".join(quote_ident(db_type, part) for part in parts) + "." + ref
+    if db_type in _BRACKET_QUOTED or db_type == "teradata":
         return f"SELECT TOP {limit} {cols} FROM {ref}"
+    if db_type == "oracle":
+        return f"SELECT {cols} FROM {ref} FETCH FIRST {limit} ROWS ONLY"
     return f"SELECT {cols} FROM {ref} LIMIT {limit}"
 
 

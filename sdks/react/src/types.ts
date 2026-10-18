@@ -26,6 +26,8 @@ export interface ConnectionConfig {
   ssl_mode?: string
   /** CA certificate (PEM) the verifying SSL modes check the server against. */
   ssl_ca_cert?: string
+  /** The fields of a source's form that are not one of the above. */
+  extra_params?: Record<string, unknown>
 }
 
 export interface TableColumn {

@@ -13,7 +13,12 @@ import re
 from sqlglot import exp
 
 from sandbox.execution.virtual_objects.errors import VirtualObjectError
-from sandbox.execution.virtual_objects.expander import DialectContext, parse_single, render
+from sandbox.execution.virtual_objects.expander import (
+    TSQL_TYPES,
+    DialectContext,
+    parse_single,
+    render,
+)
 
 NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,99}$")
 # Database types are copied into generated SQL (temp-table DDL, CASTs), so they
@@ -89,7 +94,7 @@ def normalize_query_definition(sql_text: str, ctx: DialectContext) -> str:
                 field="sql_text",
             )
 
-    if ctx.db_type == "mssql" and tree.args.get("order") is not None:
+    if ctx.db_type in TSQL_TYPES and tree.args.get("order") is not None:
         if tree.args.get("limit") is None and tree.args.get("offset") is None:
             raise VirtualObjectError(
                 "SQL Server does not allow ORDER BY in a custom query without TOP or OFFSET; "

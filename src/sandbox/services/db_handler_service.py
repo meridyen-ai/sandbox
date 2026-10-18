@@ -100,26 +100,16 @@ class BaseDBHandler(ABC):
     @classmethod
     def get_info(cls) -> HandlerInfo:
         """Get handler information."""
-        # `available` in the catalog reflects optional drivers unless we are in airgapped mode or
-        # SANDBOX_HANDLERS_CATALOG_MARK_ALL_AVAILABLE=1 — minimal images omit DB packages but the UI
-        # should still list every source type; connection attempts validate drivers at runtime.
-        from sandbox.core.config import get_config
-
-        cfg = get_config()
-        mark_all = cfg.handlers_catalog_mark_all_available or cfg.is_airgapped()
-        available = True if mark_all else cls.is_available()
-        # A database type is only offered when this sandbox has a connector for
-        # it: connections are tested, stored and queried through the connectors,
-        # so a type without one fails on its first test whatever was typed in
-        # its form. File sources are loaded by the upload routes instead.
-        if available and cls.type != "file":
-            from sandbox.connectors.factory import has_connector
-
-            available = has_connector(cls.name)
+        # File sources are loaded by the upload routes, so the handler's own
+        # driver check decides. Every other type is tested, stored and queried
+        # through its connector: it is offered when the sandbox has one and
+        # its driver is installed, and listed as unsupported when it has none.
+        available = cls.is_available()
         supported = True
         if cls.type != "file":
-            from sandbox.connectors.factory import is_supported
+            from sandbox.connectors.factory import has_connector, is_supported
 
+            available = has_connector(cls.name)
             supported = is_supported(cls.name)
         return HandlerInfo(
             name=cls.name,
@@ -1590,6 +1580,7 @@ class DremioHandler(BaseDBHandler):
         ConnectionArg("port", "integer", "Port", "The port that Dremio is running on (default: 9047)", required=False, default=9047),
         ConnectionArg("username", "string", "Username", "The username for Dremio", required=True),
         ConnectionArg("password", "password", "Password", "The password for Dremio", required=True, secret=True),
+        ConnectionArg("schema", "string", "Schema", "The space, source or folder whose tables to use (e.g., Sales or lake.sales)", required=True),
         ConnectionArg("ssl", "boolean", "Use SSL", "Use HTTPS for connection", required=False, default=False),
     ]
 
@@ -2605,7 +2596,7 @@ class DenodoHandler(BaseDBHandler):
     icon = "denodo"
     connection_args = [
         ConnectionArg("host", "string", "Host", "Denodo server hostname", required=True),
-        ConnectionArg("port", "integer", "Port", "Denodo port (default: 9999)", required=False, default=9999),
+        ConnectionArg("port", "integer", "Port", "Denodo ODBC port (default: 9996)", required=False, default=9996),
         ConnectionArg("database", "string", "Database", "Virtual database name", required=True),
         ConnectionArg("username", "string", "Username", "Denodo username", required=True),
         ConnectionArg("password", "password", "Password", "Denodo password", required=True, secret=True),

@@ -97,6 +97,10 @@ def connect_params(cfg: Any, *, host: str, ssl_mode: str, ssl_context: Any) -> d
 class OracleConnector(BaseConnector[Any]):
     """Oracle connector using python-oracledb (thin mode)."""
 
+    # The driver this connector imports when it dials (connectors/factory.py
+    # checks it, so a missing driver is reported instead of failing on connect).
+    driver_modules = ("oracledb",)
+
     async def connect(self) -> Any:
         cfg = self.config
         ssl_mode = resolve_ssl_mode(cfg)

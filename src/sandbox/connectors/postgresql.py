@@ -408,6 +408,7 @@ class PostgreSQLConnector(BaseConnector[Connection]):
         Read from pg_class rather than information_schema.tables because the
         latter never lists materialized views. has_table_privilege keeps the
         set limited to what the login can read, matching information_schema.
+        (CockroachDB leaves relispartition NULL, hence IS NOT TRUE.)
         """
         schema = schema or self.config.schema_name or "public"
 
@@ -417,7 +418,7 @@ class PostgreSQLConnector(BaseConnector[Connection]):
             JOIN pg_namespace n ON n.oid = c.relnamespace
             WHERE n.nspname = $1
               AND c.relkind IN ('r', 'p', 'f', 'v', 'm')
-              AND NOT c.relispartition
+              AND c.relispartition IS NOT TRUE
               AND has_table_privilege(c.oid, 'SELECT')
             ORDER BY c.relname
         """

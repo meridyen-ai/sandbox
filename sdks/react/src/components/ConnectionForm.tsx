@@ -65,6 +65,23 @@ const SSL_MODE_HINTS: Record<string, { key: string; text: string }> = {
 /** Modes that verify the server certificate, and so take a CA certificate. */
 const SSL_MODE_VERIFIES = ['verify-ca', 'verify-full']
 
+/** Form fields that have a place of their own in a connection. */
+const SHARED_CONNECTION_FIELDS = new Set([
+  'host',
+  'port',
+  'database',
+  'user',
+  'username',
+  'password',
+  'schema',
+  'schema_name',
+  'ssl_enabled',
+  'ssl_mode',
+  'ssl_ca_cert',
+  'encrypt',
+  'ssl',
+])
+
 /** One or more PEM certificate blocks and nothing else. */
 const CA_CERTIFICATE_RE =
   /^(\s*-----BEGIN CERTIFICATE-----[A-Za-z0-9+/=\s]+?-----END CERTIFICATE-----\s*)+$/
@@ -297,6 +314,8 @@ export const ConnectionForm: React.FC<ConnectionFormProps> = ({
         return
       }
 
+      // Some sources call their Encrypt switch "Use SSL".
+      const encryptSwitch = connArgs.encrypt ?? connArgs.ssl
       // The SSL mode the person chose travels with the connection. Services
       // that only know "SSL on/off" get the switch that mode implies. A
       // source with an Encrypt switch instead of modes means: on = require.
@@ -304,8 +323,8 @@ export const ConnectionForm: React.FC<ConnectionFormProps> = ({
         typeof connArgs.ssl_mode === 'string' &&
         connArgs.ssl_mode in SSL_MODE_ENCRYPTS
           ? connArgs.ssl_mode
-          : typeof connArgs.encrypt === 'boolean'
-            ? connArgs.encrypt
+          : typeof encryptSwitch === 'boolean'
+            ? encryptSwitch
               ? 'require'
               : 'disable'
             : undefined
@@ -317,15 +336,39 @@ export const ConnectionForm: React.FC<ConnectionFormProps> = ({
         connArgs.ssl_ca_cert
           ? connArgs.ssl_ca_cert
           : undefined
+      // A source whose secret is not called a password (a token, a key file)
+      // sends it as the password: it is the one secret every service keeps.
+      const secretArg =
+        connArgs.password === undefined
+          ? connectionArgs.find(
+              (arg) => arg.secret && connArgs[arg.name] !== undefined
+            )
+          : undefined
+      // The fields every source shares travel by name. Whatever else a
+      // source's form asks for (a Snowflake warehouse, a Trino catalog, an
+      // Athena region) goes along as it was entered.
+      const extraParams: Record<string, unknown> = {}
+      Object.entries(connArgs).forEach(([key, value]) => {
+        if (!SHARED_CONNECTION_FIELDS.has(key) && key !== secretArg?.name) {
+          extraParams[key] = value
+        }
+      })
+      const hasPort = connectionArgs.some((arg) => arg.name === 'port')
       const connectionConfig = {
         name: connectionName.trim(),
         db_type: handler.name,
         host: (connArgs.host as string) || '',
-        port: parseInt((connArgs.port as string) || '5432'),
+        // A source with no Port field has no port to send.
+        port: hasPort ? parseInt((connArgs.port as string) || '5432') : 0,
         database: (connArgs.database as string) || '',
         username:
           (connArgs.user as string) || (connArgs.username as string) || '',
-        password: (connArgs.password as string) || '',
+        password:
+          (connArgs.password as string) ||
+          (secretArg ? (connArgs[secretArg.name] as string) : '') ||
+          '',
+        extra_params:
+          Object.keys(extraParams).length > 0 ? extraParams : undefined,
         schema_name:
           (connArgs.schema as string) || (connArgs.schema_name as string),
         ssl_enabled:

@@ -562,6 +562,10 @@ class ConnectionConfig(BaseModel):
     # CA certificate (PEM) the verifying modes check the server against.
     # Configuration, not a secret.
     ssl_ca_cert: str | None = None
+    # The fields of a type's form that are not one of the above (a Snowflake
+    # warehouse, a Trino catalog, an Athena region). Left out on an update:
+    # the stored ones are kept.
+    extra_params: dict[str, Any] | None = None
 
     @field_validator("ssl_mode")
     @classmethod
@@ -1550,6 +1554,7 @@ def register_routes(app: FastAPI) -> None:
             "ssl_enabled": connection.stored_ssl_enabled,
             "ssl_mode": connection.ssl_mode,
             "ssl_ca_cert": connection.ssl_ca_cert,
+            "extra_params": connection.extra_params or {},
         })
 
         # Also add to in-memory config so queries work immediately
@@ -1567,6 +1572,7 @@ def register_routes(app: FastAPI) -> None:
             ssl_enabled=connection.stored_ssl_enabled,
             ssl_mode=connection.ssl_mode,
             ssl_ca_cert=connection.ssl_ca_cert,
+            extra_params=connection.extra_params or {},
             created_at=row["created_at"] if row else None,
             updated_at=row["updated_at"] if row else None,
         )
@@ -1610,19 +1616,27 @@ def register_routes(app: FastAPI) -> None:
         # server would hand the password to that address, and another database
         # or user on the same server is not what it was entered to open.
         password = connection.password
+        extra_params = (
+            connection.extra_params
+            if connection.extra_params is not None
+            else (stored.get("extra_params") or {})
+        )
         if not password:
+            # The type-specific fields can name the server too (a Snowflake
+            # account, an Athena endpoint), so they count.
             same_account = (
                 connection.host.strip().lower() == (stored.get("host") or "").strip().lower()
                 and connection.port == stored.get("port")
                 and connection.database == stored.get("database")
                 and connection.username == stored.get("username")
+                and extra_params == (stored.get("extra_params") or {})
             )
             if stored.get("password") and not same_account:
                 raise HTTPException(
                     status_code=400,
                     detail=(
                         "Enter the password again to change this connection's "
-                        "host, port, database or user"
+                        "host, port, database, user or account settings"
                     ),
                 )
             password = stored.get("password") or ""
@@ -1636,6 +1650,7 @@ def register_routes(app: FastAPI) -> None:
             "username": connection.username,
             "password": password,
             "schema_name": connection.schema_name,
+            "extra_params": extra_params,
         }
         if "ssl_mode" in connection.model_fields_set:
             changes["ssl_enabled"] = connection.stored_ssl_enabled
@@ -1677,6 +1692,7 @@ def register_routes(app: FastAPI) -> None:
                     ssl_enabled=row.get("ssl_enabled", False),
                     ssl_mode=row.get("ssl_mode"),
                     ssl_ca_cert=row.get("ssl_ca_cert"),
+                    extra_params=extra_params,
                     created_at=row.get("created_at"),
                     updated_at=row.get("updated_at"),
                 )
@@ -1826,6 +1842,7 @@ def register_routes(app: FastAPI) -> None:
                 ssl_enabled=connection.stored_ssl_enabled,
                 ssl_mode=connection.ssl_mode,
                 ssl_ca_cert=connection.ssl_ca_cert,
+                extra_params=connection.extra_params or {},
             )
 
             # Get connector and test
@@ -4595,7 +4612,10 @@ def register_routes(app: FastAPI) -> None:
             from llama_index.core.schema import Document as LIDocument
             li_documents = []
             extracted_text_parts = []
-            is_media = file_type.lower() in (AUDIO_TYPES | VIDEO_TYPES)
+            # Element-derived Markdown (Tier 2). Only the document branch fills
+            # it; a transcript has none and falls through to its plain text.
+            md_parts: list[str] = []
+            is_media =file_type.lower() in (AUDIO_TYPES | VIDEO_TYPES)
 
             if is_media:
                 # ── Audio/Video: Transcribe with faster-whisper ──
@@ -4838,7 +4858,6 @@ def register_routes(app: FastAPI) -> None:
                 #   Tier 2 (DOCX/PPTX/other): map each Unstructured element to
                 #     Markdown by its element type, accumulated in md_parts here.
                 # Tier-1 output, when available, wins over the element-derived one.
-                md_parts: list[str] = []
 
                 def _element_to_markdown(el_obj, el_type_name: str, plain_text: str) -> str:
                     """Render a single Unstructured element to Markdown by its type.

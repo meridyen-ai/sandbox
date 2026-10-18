@@ -45,14 +45,35 @@ from sandbox.execution.virtual_objects.tokens import now_in, resolve_params, res
 
 MAX_DEPTH = 4
 
-# sandbox db_type → sqlglot dialect. None = sqlglot's generic dialect (HANA).
+# sandbox db_type → sqlglot dialect. None = sqlglot's generic dialect (HANA,
+# and Denodo's VQL, which sqlglot has no dialect for).
 DIALECTS: dict[str, str | None] = {
     "mssql": "tsql",
+    "azuresynapse": "tsql",
     "postgresql": "postgres",
+    "cockroachdb": "postgres",
     "mysql": "mysql",
+    "mariadb": "mysql",
+    "singlestore": "singlestore",
     "oracle": "oracle",
     "saphana": None,
+    "denodo": None,
+    "teradata": "teradata",
+    "clickhouse": "clickhouse",
+    "snowflake": "snowflake",
+    "bigquery": "bigquery",
+    "redshift": "redshift",
+    "databricks": "databricks",
+    "athena": "athena",
+    "trino": "trino",
+    "starburst": "trino",
+    "presto": "presto",
+    "dremio": "dremio",
 }
+
+# Engines that are another one on the wire and share its connector.
+TSQL_TYPES = frozenset({"mssql", "azuresynapse"})
+MYSQL_TYPES = frozenset({"mysql", "mariadb", "singlestore"})
 
 
 @dataclass(frozen=True)
@@ -83,12 +104,18 @@ def effective_schema(conn_cfg: Any) -> str:
     db_type = getattr(conn_cfg.db_type, "value", conn_cfg.db_type)
     if conn_cfg.schema_name:
         return conn_cfg.schema_name
-    if db_type == "mssql":
+    if db_type in TSQL_TYPES:
         return "dbo"
-    if db_type == "postgresql":
+    if db_type in ("postgresql", "cockroachdb", "redshift"):
         return "public"
-    if db_type == "mysql":
+    if db_type in MYSQL_TYPES or db_type in ("clickhouse", "teradata", "denodo", "athena"):
         return conn_cfg.database or ""
+    if db_type == "snowflake":
+        return "PUBLIC"
+    if db_type == "oracle":
+        return (conn_cfg.username or "").upper()
+    if db_type in ("trino", "starburst", "presto", "databricks"):
+        return "default"
     return ""
 
 

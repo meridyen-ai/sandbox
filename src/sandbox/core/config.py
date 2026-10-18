@@ -48,6 +48,17 @@ class DatabaseType(str, Enum):
     REDSHIFT = "redshift"
     CLICKHOUSE = "clickhouse"
     SAPHANA = "saphana"
+    MARIADB = "mariadb"
+    SINGLESTORE = "singlestore"
+    COCKROACHDB = "cockroachdb"
+    AZURESYNAPSE = "azuresynapse"
+    TERADATA = "teradata"
+    ATHENA = "athena"
+    TRINO = "trino"
+    PRESTO = "presto"
+    STARBURST = "starburst"
+    DREMIO = "dremio"
+    DENODO = "denodo"
 
 
 # Aliases for db_type strings that arrive from other services / older persisted rows.
@@ -57,6 +68,8 @@ _DB_TYPE_ALIASES = {
     "postgres": "postgresql", "pg": "postgresql",
     "mssql_server": "mssql", "sqlserver": "mssql",
     "sap_hana": "saphana", "hana": "saphana",
+    "azure_synapse": "azuresynapse", "synapse": "azuresynapse",
+    "cockroach": "cockroachdb", "memsql": "singlestore",
     "csv": "postgresql", "excel": "postgresql", "xlsx": "postgresql", "xls": "postgresql",
     "sheet": "postgresql", "google_sheet": "postgresql", "gsheet": "postgresql",
 }

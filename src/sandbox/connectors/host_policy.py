@@ -21,7 +21,9 @@ Allowed:
   behind a VPN live there. A VPN tunnel is a point-to-point interface, so the
   network behind it is not one of the sandbox's own;
 - the sandbox's own upload database server, for the per-upload databases the
-  file loader creates (``upload_*``) and nothing else on that server.
+  file loader creates (``upload_*``), for the databases an operator has put on
+  that server and named in ``SANDBOX_UPLOAD_DB_HOSTED_DATABASES`` (a customer's
+  data kept as a copy next to its sandbox), and nothing else on that server.
 
 A host name is checked on every address it resolves to. Where the driver can
 be handed an address, the connector dials the checked address instead of
@@ -58,6 +60,13 @@ _UPLOAD_DB_HOST = os.environ.get("SANDBOX_UPLOAD_DB_HOST", "sandbox-postgres")
 _UPLOAD_DB_PORT = int(os.environ.get("SANDBOX_UPLOAD_DB_PORT", "5432"))
 # The database names file_loader.sanitize_db_name produces.
 _UPLOAD_DB_NAME = re.compile(r"upload_[a-z0-9_]{1,56}")
+# Databases an operator hosts on the upload server for this sandbox, by exact
+# name (comma-separated). The server's other databases stay out of reach.
+_HOSTED_DB_NAMES = frozenset(
+    name.strip()
+    for name in os.environ.get("SANDBOX_UPLOAD_DB_HOSTED_DATABASES", "").split(",")
+    if name.strip()
+)
 
 _PORT_SUFFIX = re.compile(r"[,:]\d{1,5}$")
 
@@ -83,13 +92,15 @@ class VettedHost:
 
 
 def is_upload_database(cfg: Any) -> bool:
-    """True for a connection to a per-upload database on the upload server."""
+    """True for a connection to a per-upload database on the upload server,
+    or to a database the operator hosts there for this sandbox."""
     db_type = getattr(cfg.db_type, "value", cfg.db_type)
+    database = cfg.database or ""
     return (
         db_type == DatabaseType.POSTGRESQL.value
         and (cfg.host or "").strip().lower() == _UPLOAD_DB_HOST.strip().lower()
         and int(cfg.port or 0) == _UPLOAD_DB_PORT
-        and _UPLOAD_DB_NAME.fullmatch(cfg.database or "") is not None
+        and (_UPLOAD_DB_NAME.fullmatch(database) is not None or database in _HOSTED_DB_NAMES)
     )
 
 

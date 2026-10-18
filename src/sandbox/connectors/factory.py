@@ -80,98 +80,66 @@ def get_connector(
     return connector_class(config)
 
 
+# Where each database type's connector lives: (module, class). A module is
+# imported the first time its type is asked for, so a sandbox does not load
+# every driver at startup.
+_CONNECTORS: dict[DatabaseType, tuple[str, str]] = {
+    DatabaseType.POSTGRESQL: ("postgresql", "PostgreSQLConnector"),
+    DatabaseType.COCKROACHDB: ("postgresql", "PostgreSQLConnector"),
+    DatabaseType.MYSQL: ("mysql", "MySQLConnector"),
+    DatabaseType.MARIADB: ("mysql", "MySQLConnector"),
+    DatabaseType.SINGLESTORE: ("mysql", "MySQLConnector"),
+    DatabaseType.MSSQL: ("mssql", "MSSQLConnector"),
+    DatabaseType.AZURESYNAPSE: ("mssql", "MSSQLConnector"),
+    DatabaseType.SAPHANA: ("saphana", "SAPHANAConnector"),
+    DatabaseType.ORACLE: ("oracle", "OracleConnector"),
+    DatabaseType.TERADATA: ("teradata", "TeradataConnector"),
+    DatabaseType.CLICKHOUSE: ("clickhouse", "ClickHouseConnector"),
+    DatabaseType.SNOWFLAKE: ("snowflake", "SnowflakeConnector"),
+    DatabaseType.BIGQUERY: ("bigquery", "BigQueryConnector"),
+    DatabaseType.REDSHIFT: ("redshift", "RedshiftConnector"),
+    DatabaseType.DATABRICKS: ("databricks", "DatabricksConnector"),
+    DatabaseType.ATHENA: ("athena", "AthenaConnector"),
+    DatabaseType.TRINO: ("trino", "TrinoConnector"),
+    DatabaseType.STARBURST: ("trino", "StarburstConnector"),
+    DatabaseType.PRESTO: ("trino", "PrestoConnector"),
+    DatabaseType.DREMIO: ("dremio", "DremioConnector"),
+    DatabaseType.DENODO: ("denodo", "DenodoConnector"),
+}
+
+
 def _load_connector(db_type: DatabaseType) -> Type[BaseConnector] | None:
     """
     Dynamically load a connector for the given database type.
 
     This allows connectors to be loaded on-demand without importing
-    all database drivers at startup.
+    all database drivers at startup. None when the sandbox has no connector
+    for the type, or when the connector's driver is not installed here.
     """
+    import importlib
+    import importlib.util
+
+    location = _CONNECTORS.get(db_type)
+    if location is None:
+        _NOT_IMPLEMENTED.add(db_type)
+        logger.warning("connector_not_implemented", db_type=db_type.value)
+        return None
+
+    module_name, class_name = location
     try:
-        if db_type == DatabaseType.POSTGRESQL:
-            from sandbox.connectors.postgresql import PostgreSQLConnector
-            register_connector(db_type, PostgreSQLConnector)
-            return PostgreSQLConnector
-
-        elif db_type == DatabaseType.MYSQL:
-            from sandbox.connectors.mysql import MySQLConnector
-            register_connector(db_type, MySQLConnector)
-            return MySQLConnector
-
-        elif db_type == DatabaseType.SNOWFLAKE:
-            # Snowflake connector (optional dependency)
-            try:
-                from sandbox.connectors.snowflake import SnowflakeConnector
-                register_connector(db_type, SnowflakeConnector)
-                return SnowflakeConnector
-            except ImportError:
-                logger.warning(
-                    "snowflake_connector_not_available",
-                    message="Install snowflake-connector-python to use Snowflake",
-                )
-                return None
-
-        elif db_type == DatabaseType.BIGQUERY:
-            # BigQuery connector (optional dependency)
-            try:
-                from sandbox.connectors.bigquery import BigQueryConnector
-                register_connector(db_type, BigQueryConnector)
-                return BigQueryConnector
-            except ImportError:
-                logger.warning(
-                    "bigquery_connector_not_available",
-                    message="Install google-cloud-bigquery to use BigQuery",
-                )
-                return None
-
-        elif db_type == DatabaseType.MSSQL:
-            # MSSQL connector
-            try:
-                from sandbox.connectors.mssql import MSSQLConnector
-                register_connector(db_type, MSSQLConnector)
-                return MSSQLConnector
-            except ImportError:
-                logger.warning(
-                    "mssql_connector_not_available",
-                    message="Install pymssql to use MSSQL",
-                )
-                return None
-
-        elif db_type == DatabaseType.ORACLE:
-            # Oracle connector (python-oracledb, thin mode)
-            try:
-                import oracledb  # noqa: F401 — the driver this connector needs
-                from sandbox.connectors.oracle import OracleConnector
-                register_connector(db_type, OracleConnector)
-                return OracleConnector
-            except ImportError:
-                logger.warning(
-                    "oracle_connector_not_available",
-                    message="Install oracledb to use Oracle",
-                )
-                return None
-
-        elif db_type == DatabaseType.SAPHANA:
-            # SAP HANA connector
-            try:
-                from sandbox.connectors.saphana import SAPHANAConnector
-                register_connector(db_type, SAPHANAConnector)
-                return SAPHANAConnector
-            except ImportError:
-                logger.warning(
-                    "saphana_connector_not_available",
-                    message="Install hdbcli to use SAP HANA",
-                )
-                return None
-
-        else:
-            _NOT_IMPLEMENTED.add(db_type)
-            logger.warning(
-                "connector_not_implemented",
-                db_type=db_type.value,
-            )
-            return None
-
+        module = importlib.import_module(f"sandbox.connectors.{module_name}")
+        connector_class = getattr(module, class_name)
+        # Connectors that import their driver when they dial name it here.
+        for driver in getattr(connector_class, "driver_modules", ()):
+            if importlib.util.find_spec(driver) is None:
+                raise ImportError(driver)
+    except ImportError as e:
+        logger.warning(
+            "connector_driver_not_installed",
+            db_type=db_type.value,
+            missing=e.name or str(e),
+        )
+        return None
     except Exception as e:
         logger.error(
             "connector_load_failed",
@@ -179,6 +147,9 @@ def _load_connector(db_type: DatabaseType) -> Type[BaseConnector] | None:
             error=str(e),
         )
         return None
+
+    register_connector(db_type, connector_class)
+    return connector_class
 
 
 def get_available_connectors() -> list[str]:
