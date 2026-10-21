@@ -803,6 +803,13 @@ class PythonExecutor(BaseExecutor[PythonExecutionResult]):
         self.security = security_config or sandbox_config.security
         self.validator = CodeValidator(security_config)
         self.allowed_imports = set(self.security.allowed_python_imports)
+        # Each run is a child forked from this process, and a module this
+        # process has imported is already in the child's memory. Imported here
+        # once, the preloaded libraries (pandas, numpy and plotly: about four
+        # seconds of imports) stop being paid on every run. What the code may
+        # use is unchanged: the child still sees only what preload_modules and
+        # its allow-listing importer give it.
+        SafeImporter(self.allowed_imports).preload_modules()
 
     async def validate(self, context: ExecutionContext, **kwargs: Any) -> list[str]:
         """Validate Python execution request."""
