@@ -16,6 +16,7 @@ neighbours rather than an error.
 from __future__ import annotations
 
 import os
+import shutil
 import threading
 from collections import OrderedDict
 from typing import Any, List, Optional
@@ -31,6 +32,10 @@ ONNX_FILE = os.getenv("LOCAL_EMBEDDING_ONNX_FILE", "onnx/model.onnx")
 #: Baked into the image at build time (see Dockerfile) so an air-gapped sandbox
 #: never reaches for the network; a missing file falls back to a hub download.
 MODEL_CACHE = os.getenv("LOCAL_EMBEDDING_CACHE", "/opt/embedding_models")
+#: Where the graph and its weights are put side by side when the cache keeps
+#: them in different directories (see open_session). /app/data is the
+#: sandbox's own volume, so the copy is made once, not on every start.
+STAGE_DIR = os.getenv("LOCAL_EMBEDDING_STAGE_DIR", "/app/data/embedding_models_flat")
 #: Chunks are ~300 tokens; the cap only guards against a pathological element
 #: slipping through the splitter (attention cost grows with the square of it).
 MAX_TOKENS = int(os.getenv("LOCAL_EMBEDDING_MAX_TOKENS", "2048"))
@@ -73,6 +78,75 @@ def session_options(ort):
     return opts
 
 
+def open_session(ort, model_path: str, sidecars: List[str]):
+    """The inference session for a graph and its external-weight sidecars.
+
+    Returns ``(session, mapped)``; ``mapped`` holds memory maps that must live
+    as long as the session (only on the last-resort in-memory path, else []).
+
+    The model is baked as a Hugging Face cache: every snapshot file is a
+    symlink to a content-addressed blob, and huggingface_hub 2.x shards the
+    blobs by hash, so the graph and its weights really live in DIFFERENT
+    directories. onnxruntime (1.31 here) resolves both links and refuses an
+    external-data file whose real location is not beside the graph's real
+    location ("External data path escapes model directory") — the model never
+    loaded and every document failed to index (Data Scientist r004/r006).
+
+    For that layout the graph and its sidecars are put side by side, as real
+    files, in STAGE_DIR once (a hard link where allowed, else a copy; reused
+    while the sizes match) and loaded from there by path — which keeps
+    onnxruntime's own loading (measured on pplx-embed: 1.9 GB resident). Handing
+    the weights over in memory also works but holds ~5.6 GB, so it is only the
+    fallback for a box with nowhere to write.
+    """
+    providers = ["CPUExecutionProvider"]
+    graph_dir = os.path.dirname(os.path.realpath(model_path))
+    if all(os.path.dirname(os.path.realpath(p)) == graph_dir for p in sidecars):
+        return ort.InferenceSession(model_path, session_options(ort), providers=providers), []
+
+    try:
+        staged = _stage_side_by_side(model_path, sidecars)
+    except OSError as e:
+        logger.warning("local_embedder_stage_failed", error=f"{type(e).__name__}: {e}", stage_dir=STAGE_DIR)
+    else:
+        return ort.InferenceSession(staged, session_options(ort), providers=providers), []
+
+    import mmap
+
+    opts = session_options(ort)
+    names, mapped = [], []
+    for path in sidecars:
+        with open(path, "rb") as fh:
+            mapped.append(mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ))
+        # The graph names each sidecar by its file name ("model.onnx_data"),
+        # which is the snapshot link's name, not the blob's hash.
+        names.append(os.path.basename(path))
+    opts.add_external_initializers_from_files_in_memory(names, mapped, [len(m) for m in mapped])
+    with open(model_path, "rb") as fh:
+        graph = fh.read()
+    return ort.InferenceSession(graph, opts, providers=providers), mapped
+
+
+def _stage_side_by_side(model_path: str, sidecars: List[str]) -> str:
+    """Real files, under the names the graph uses, in one directory keyed by the
+    graph's blob (so a new model revision gets its own). Returns the graph path."""
+    real_graph = os.path.realpath(model_path)
+    target = os.path.join(STAGE_DIR, os.path.basename(real_graph)[:24] or "model")
+    os.makedirs(target, exist_ok=True)
+    for src in [model_path, *sidecars]:
+        real = os.path.realpath(src)
+        dest = os.path.join(target, os.path.basename(src))
+        if os.path.isfile(dest) and not os.path.islink(dest) and os.path.getsize(dest) == os.path.getsize(real):
+            continue
+        part = f"{dest}.{os.getpid()}.part"
+        try:
+            os.link(real, part)
+        except OSError:
+            shutil.copyfile(real, part)
+        os.replace(part, dest)
+    return os.path.join(target, os.path.basename(model_path))
+
+
 _model: Optional["_OnnxEmbedder"] = None
 _lock = threading.Lock()
 
@@ -103,13 +177,12 @@ class _OnnxEmbedder:
         model_path = _get(ONNX_FILE)
         # External-weight sidecars (>2GB graphs are split); onnxruntime loads
         # them by name at session init, so they must sit beside the graph.
-        for suffix in ("_data", "_data_1", "_data_2"):
-            _get(ONNX_FILE + suffix, optional=True)
+        sidecars = [p for p in (_get(ONNX_FILE + s, optional=True) for s in ("_data", "_data_1", "_data_2")) if p]
 
         self._tok = Tokenizer.from_file(_get("tokenizer.json"))
         self._tok.enable_truncation(max_length=MAX_TOKENS)
 
-        self._sess = ort.InferenceSession(model_path, session_options(ort), providers=["CPUExecutionProvider"])
+        self._sess, self._weights = open_session(ort, model_path, sidecars)
         names = {o.name for o in self._sess.get_outputs()}
         self._out = "pooler_output" if "pooler_output" in names else self._sess.get_outputs()[0].name
         self._inputs = {i.name for i in self._sess.get_inputs()}

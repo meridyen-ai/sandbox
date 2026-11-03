@@ -53,6 +53,7 @@ from sandbox.services.schema_sql import (
 )
 from sandbox.execution.python_executor import PythonExecutor
 from sandbox.services.document_cleanup import remove_stored_files, vector_tables_for
+from sandbox.services.legacy_documents import claim_legacy_knowledge_bases, link_legacy_files
 from sandbox.visualization.generator import VisualizationGenerator, ChartType
 
 logger = get_logger(__name__)
@@ -3880,6 +3881,29 @@ def register_routes(app: FastAPI) -> None:
             "folder_path": folder_path,
         }
 
+    # --- Claim Documents Stored Before Calls Named Their Space ---
+    @app.post("/api/v1/documents/claim-legacy", tags=["Documents"])
+    async def claim_legacy_documents(
+        request: Request,
+        token_data: dict = Depends(verify_sandbox_token),
+    ):
+        """
+        Claim for ``space_id`` the documents stored before a call named its
+        space (services/legacy_documents.py): the knowledge bases made for
+        ``connection_ids`` that record no space take it, and ``file_ids``
+        stored outside every space's folder are linked into its folder. The
+        caller (the backend) names only the space's own connections and files.
+        """
+        body = await request.json()
+        space = _document_space(body.get("space_id"))
+        with _get_doc_db_engine().begin() as conn:
+            knowledge_bases = claim_legacy_knowledge_bases(conn, space, body.get("connection_ids"))
+        files = await asyncio.to_thread(link_legacy_files, _DOCUMENTS_DIR, space, body.get("file_ids"))
+        if knowledge_bases or files["linked"]:
+            logger.info("legacy_documents_claimed", space_id=space,
+                        knowledge_bases=knowledge_bases, **files)
+        return {"space_id": space, "knowledge_bases": knowledge_bases, "files": files}
+
     # --- Load Spreadsheet (Excel/CSV) into PostgreSQL ---
     @app.post("/api/v1/documents/load-spreadsheet", tags=["Documents"])
     async def load_spreadsheet(
@@ -5771,6 +5795,43 @@ def register_routes(app: FastAPI) -> None:
             logger.error("video_transcode_failed", error=str(e.stderr[:500]) if e.stderr else "unknown")
             return src
 
+    _FILE_CONTENT_TYPES = {
+        ".pdf": "application/pdf",
+        ".txt": "text/plain; charset=utf-8",
+        ".md": "text/plain; charset=utf-8",
+        ".csv": "text/csv; charset=utf-8",
+        ".html": "text/html; charset=utf-8",
+        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".xlsb": "application/vnd.ms-excel.sheet.binary.macroEnabled.12",
+        ".xls": "application/vnd.ms-excel",
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".doc": "application/msword",
+        ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".gif": "image/gif",
+        ".webp": "image/webp",
+        ".svg": "image/svg+xml",
+        ".mp3": "audio/mpeg",
+        ".wav": "audio/wav",
+        ".m4a": "audio/mp4",
+        ".ogg": "audio/ogg",
+        ".flac": "audio/flac",
+        ".mp4": "video/mp4",
+        ".webm": "video/webm",
+        ".mkv": "video/x-matroska",
+        ".mov": "video/quicktime",
+    }
+
+    def _serve_original_file(file_path):
+        """The stored bytes exactly as uploaded, for a download: a Word file
+        stays a Word file and a video keeps its own codec."""
+        return FileResponse(
+            path=str(file_path),
+            media_type=_FILE_CONTENT_TYPES.get(Path(file_path).suffix.lower(), "application/octet-stream"),
+        )
+
     def _serve_file_with_viewer_conversion(file_path, original_filename: str = ""):
         """
         Serve a file, converting DOCX/XLSX to browser-viewable HTML.
@@ -5848,33 +5909,7 @@ def register_routes(app: FastAPI) -> None:
                 # Fall through to raw download
 
         # Default: serve with correct MIME
-        ct_map = {
-            ".pdf": "application/pdf",
-            ".txt": "text/plain; charset=utf-8",
-            ".md": "text/plain; charset=utf-8",
-            ".csv": "text/csv; charset=utf-8",
-            ".html": "text/html; charset=utf-8",
-            ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            ".xlsb": "application/vnd.ms-excel.sheet.binary.macroEnabled.12",
-            ".xls": "application/vnd.ms-excel",
-            ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-            ".png": "image/png",
-            ".jpg": "image/jpeg",
-            ".jpeg": "image/jpeg",
-            ".gif": "image/gif",
-            ".webp": "image/webp",
-            ".svg": "image/svg+xml",
-            ".mp3": "audio/mpeg",
-            ".wav": "audio/wav",
-            ".m4a": "audio/mp4",
-            ".ogg": "audio/ogg",
-            ".flac": "audio/flac",
-            ".mp4": "video/mp4",
-            ".webm": "video/webm",
-            ".mkv": "video/x-matroska",
-            ".mov": "video/quicktime",
-        }
-        media_type = ct_map.get(ext, "application/octet-stream")
+        media_type = _FILE_CONTENT_TYPES.get(ext, "application/octet-stream")
 
         # For media files (video/audio) and large files, use FileResponse which
         # supports HTTP range requests natively — browsers need this to seek
@@ -5902,9 +5937,11 @@ def register_routes(app: FastAPI) -> None:
     async def get_document_file(
         file_id: str,
         space_id: str = "",
+        raw: bool = False,
         token_data: dict = Depends(verify_sandbox_token),
     ):
-        """Serve a document file from sandbox storage."""
+        """Serve a document file from sandbox storage: shaped for the in-app
+        viewer, or with ``raw`` the original bytes (a download)."""
         # Find the file by matching the stem (filename without extensions)
         # Use strict matching: filename must START with file_id and have ONE extension after
         # This prevents matching side-files like "{uuid}.mp4.wav" when looking for "{uuid}.mp4"
@@ -5922,7 +5959,7 @@ def register_routes(app: FastAPI) -> None:
                 best_match = p
 
         if best_match:
-            return _serve_file_with_viewer_conversion(best_match)
+            return _serve_original_file(best_match) if raw else _serve_file_with_viewer_conversion(best_match)
 
         # Fall back to DB storage_path lookup (for files stored via storage_path column)
         from sqlalchemy import text as sql_text
@@ -5935,6 +5972,8 @@ def register_routes(app: FastAPI) -> None:
             if result and result[0]:
                 stored_file = (_DOCUMENTS_DIR / result[0]).resolve()
                 if stored_file.is_relative_to(_DOCUMENTS_DIR / space) and stored_file.is_file():
+                    if raw:
+                        return _serve_original_file(stored_file)
                     return _serve_file_with_viewer_conversion(stored_file, original_filename=result[1])
 
         raise HTTPException(status_code=404, detail="File not found")
