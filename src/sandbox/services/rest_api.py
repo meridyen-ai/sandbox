@@ -415,6 +415,11 @@ def _stored_documents(file_id: Any, space: str | None) -> list[Path]:
 BINARY_MARKER = "$binary"
 BINARY_FORMATS = ("text", "base64")
 
+# Control characters that do not occur in text (tab, line breaks and form feed do).
+_NOT_TEXT = re.compile(r"[\x00-\x08\x0e-\x1f\x7f]")
+# Hashes, rowversions and GUIDs fit; their bytes are worth showing. A file is not.
+_BINARY_HEX_MAX_BYTES = 32
+
 
 def _delete_file_vectors(conn: Any, kb_id: Any, file_id: str) -> int:
     """Delete one file's passages from every vector table of a knowledge base.
@@ -434,15 +439,32 @@ def _delete_file_vectors(conn: Any, kb_id: Any, file_id: str) -> int:
     return deleted
 
 
+def _binary_as_text(value: bytes) -> str:
+    """A binary value as something a person or an agent can read.
+
+    Text stored in a binary column comes back as that text. Anything else would
+    decode into control characters and U+FFFD, so a short value comes back as
+    hex and a long one (a stored file) as its size.
+    """
+    try:
+        text = value.decode("utf-8")
+    except UnicodeDecodeError:
+        text = None
+    if text is not None and not _NOT_TEXT.search(text):
+        return text
+    if len(value) <= _BINARY_HEX_MAX_BYTES:
+        return "0x" + value.hex()
+    return f"[binary, {len(value)} bytes]"
+
+
 def _make_json_safe(value: Any, binary_format: str = "text") -> Any:
     """Convert any database value to a JSON-serializable type.
 
     Handles types from all supported databases (PostgreSQL, MySQL, MSSQL,
     Snowflake, BigQuery, etc.) so the API response is database-agnostic.
 
-    Binary values (bytea, varbinary, BLOB) are decoded as UTF-8 text by
-    default, which is what callers have always received and which keeps text
-    stored in binary columns readable. A caller that needs the bytes asks for
+    Binary values (bytea, varbinary, BLOB) come back readable by default (see
+    ``_binary_as_text``). A caller that needs the bytes asks for
     ``binary_format="base64"`` and gets ``{"$binary": "<base64>"}`` instead,
     exactly the bytes the database returned.
     """
@@ -471,7 +493,7 @@ def _make_json_safe(value: Any, binary_format: str = "text") -> Any:
         value = bytes(value)
         if binary_format == "base64":
             return {BINARY_MARKER: base64.b64encode(value).decode("ascii")}
-        return value.decode("utf-8", errors="replace")
+        return _binary_as_text(value)
     # Network types (PostgreSQL)
     if isinstance(value, (IPv4Address, IPv6Address, IPv4Network, IPv6Network)):
         return str(value)
