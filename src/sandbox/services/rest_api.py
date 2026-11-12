@@ -58,6 +58,32 @@ from sandbox.visualization.generator import VisualizationGenerator, ChartType
 
 logger = get_logger(__name__)
 
+# ── Spreadsheet loads ────────────────────────────────────────────────────────
+# Loading an uploaded file into PostgreSQL (pandas, openpyxl) runs on a worker
+# thread so the event loop stays free, but a sheet is held in memory whole (many
+# times its file size), and concurrent uploads have already OOM-killed this
+# process once (see the whisper note below). So only a few loads run at a time;
+# the others wait here, before any parsing, holding nothing but their saved file.
+def _upload_load_slots() -> int:
+    try:
+        return max(1, int(os.environ.get("SANDBOX_UPLOAD_LOAD_CONCURRENCY", "2")))
+    except ValueError:
+        return 2
+
+
+_UPLOAD_GATE: "tuple[asyncio.AbstractEventLoop, asyncio.Semaphore] | None" = None
+
+
+async def _load_off_loop(fn, *args):
+    """Run a blocking file load on a worker thread, at most N at once."""
+    global _UPLOAD_GATE
+    loop = asyncio.get_running_loop()
+    if _UPLOAD_GATE is None or _UPLOAD_GATE[0] is not loop:
+        _UPLOAD_GATE = (loop, asyncio.Semaphore(_upload_load_slots()))
+    async with _UPLOAD_GATE[1]:
+        return await asyncio.to_thread(fn, *args)
+
+
 # ── Shared faster-whisper model ──────────────────────────────────────────────
 # Media transcription runs on worker threads (asyncio.to_thread), so building a
 # WhisperModel inside the request path meant every concurrent audio/video upload
@@ -1912,16 +1938,6 @@ def register_routes(app: FastAPI) -> None:
         Data is queryable via standard SQL after upload.
         """
         import os
-        import pandas as pd
-        from sandbox.core.config import (
-            DatabaseConnectionConfig, DatabaseType, get_config,
-        )
-        from sandbox.core.connection_store import create_connection as db_create_connection
-        from sandbox.services.file_loader import (
-            create_upload_database, sanitize_table_name,
-            load_csv_to_postgres, load_excel_sheet_to_postgres,
-        )
-        from pydantic import SecretStr
 
         if not file.filename:
             raise HTTPException(status_code=400, detail="No file provided")
@@ -1947,6 +1963,36 @@ def register_routes(app: FastAPI) -> None:
                     f.write(chunk)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}")
+
+        # Parsing the file and loading it into PostgreSQL is blocking work (pandas,
+        # SQLAlchemy): on a worker thread, so the one event loop keeps answering
+        # every other request meanwhile.
+        return await _load_off_loop(
+            _load_uploaded_file, file_path, file_ext, is_excel, name,
+            delimiter, has_header, selected_sheets,
+        )
+
+    def _load_uploaded_file(
+        file_path: str,
+        file_ext: str,
+        is_excel: bool,
+        name: str,
+        delimiter: str,
+        has_header: str,
+        selected_sheets: str,
+    ) -> JSONResponse:
+        """The blocking half of upload_file: load the saved file into its own database."""
+        import os
+        import pandas as pd
+        from sandbox.core.config import (
+            DatabaseConnectionConfig, DatabaseType, get_config,
+        )
+        from sandbox.core.connection_store import create_connection as db_create_connection
+        from sandbox.services.file_loader import (
+            create_upload_database, sanitize_table_name,
+            load_csv_to_postgres, load_excel_sheet_to_postgres,
+        )
+        from pydantic import SecretStr
 
         has_header_bool = has_header.lower() == "true"
         config = get_config()
@@ -3650,6 +3696,13 @@ def register_routes(app: FastAPI) -> None:
         backend's sandbox client expects (services/sandbox_client/client.py
         ``load_spreadsheet``).
         """
+        body = await request.json()
+        # Blocking work (pandas, SQLAlchemy): on a worker thread, so the one event
+        # loop keeps answering every other request meanwhile.
+        return await _load_off_loop(_load_spreadsheet_document, body)
+
+    def _load_spreadsheet_document(body: dict):
+        """The blocking half of load_spreadsheet_document."""
         import os
         import pandas as pd
         from sandbox.core.config import (
@@ -3662,7 +3715,6 @@ def register_routes(app: FastAPI) -> None:
         )
         from pydantic import SecretStr
 
-        body = await request.json()
         file_id = (body.get("file_id") or "").strip()
         filename = body.get("filename") or "spreadsheet"
         connection_name = (body.get("connection_name") or filename or "spreadsheet").strip()
@@ -3884,12 +3936,15 @@ def register_routes(app: FastAPI) -> None:
             safe_folder = Path(folder_path.replace("..", "").strip("/"))
             base_dir = base_dir / safe_folder
 
-        base_dir.mkdir(parents=True, exist_ok=True)
-
         # Use file_id + original extension for uniqueness, but keep original name accessible
         storage_filename = f"{file_id}{ext}"
         file_path = base_dir / storage_filename
-        file_path.write_bytes(content)
+
+        def _store():
+            base_dir.mkdir(parents=True, exist_ok=True)
+            file_path.write_bytes(content)
+
+        await asyncio.to_thread(_store)
 
         # Full path relative to /app/data/documents for retrieval
         relative_path = str(file_path.relative_to(Path("/app/data/documents")))
