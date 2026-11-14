@@ -11,6 +11,17 @@ def test_only_the_knowledge_bases_own_vector_tables():
     assert vector_tables_for("12", names) == ["data_llamaindex_kb_12", "data_llamaindex_kb_12_e1024"]
 
 
+def test_the_tables_of_other_chunk_settings_are_the_knowledge_bases_too():
+    # Indexing writes to ``…_e<dim>_c<tag>`` (services/chunking.table_suffix):
+    # a deleted document must leave that table as well.
+    names = ["data_llamaindex_kb_4", "data_llamaindex_kb_4_e1024", "data_llamaindex_kb_4_e1024_c371538",
+             "data_llamaindex_kb_41_e1024_c371538", "data_llamaindex_kb_4_e1024_c1; DROP TABLE x",
+             "data_llamaindex_kb_4_e1024_cabc"]
+    assert vector_tables_for(4, names) == [
+        "data_llamaindex_kb_4", "data_llamaindex_kb_4_e1024", "data_llamaindex_kb_4_e1024_c371538"]
+    assert vector_tables_for(41, names) == ["data_llamaindex_kb_41_e1024_c371538"]
+
+
 def test_stored_files_of_one_id_in_one_space(tmp_path: Path):
     space = tmp_path / "s1" / "Folder"
     space.mkdir(parents=True)

@@ -4692,6 +4692,12 @@ def register_routes(app: FastAPI) -> None:
         """
         from sqlalchemy import text as sql_text
         import json as _json
+        import time as _time
+        from sandbox.services import indexing_budget
+
+        # The caller waits a bounded time for this job; the embedding step is
+        # ended once that time is used (see indexing_budget).
+        job_started = _time.monotonic()
 
         def _update_prog(prog):
             with engine.connect() as c:
@@ -5333,17 +5339,38 @@ def register_routes(app: FastAPI) -> None:
             # self-contained enough to answer a question without needing neighbors.
             node_parser = SentenceSplitter(chunk_size=1024, chunk_overlap=128)
 
-            logger.info("llamaindex_indexing_start", doc_id=doc_id, documents=len(li_documents))
+            # Split first (what from_documents does itself), so the number of
+            # passages to embed is known before the first one is embedded.
+            nodes = node_parser.get_nodes_from_documents(li_documents)
 
-            index = VectorStoreIndex.from_documents(
-                li_documents,
-                storage_context=storage_context,
-                transformations=[node_parser],
-                show_progress=False,
-                # Local CPU model: one forward pass already uses every embedding
-                # thread, so overlapping batches would only contend for cores.
-                use_async=False,
-            )
+            logger.info("llamaindex_indexing_start", doc_id=doc_id,
+                        documents=len(li_documents), passages=len(nodes))
+
+            def _embedding_progress(done: int, total: int) -> bool:
+                """Progress of the embedding step (40 → 85). False once the
+                document was deleted or is no longer marked as processing."""
+                with engine.connect() as c:
+                    still_wanted = c.execute(
+                        sql_text(
+                            "UPDATE document_kb_documents SET progress=:p, updated_at=NOW() "
+                            "WHERE id=:id AND status='processing' RETURNING id"
+                        ),
+                        {"p": 40 + (45 * done) // max(total, 1), "id": doc_id},
+                    ).fetchone() is not None
+                    c.commit()
+                return still_wanted
+
+            watch = indexing_budget.EmbeddingWatch(len(nodes), job_started, _embedding_progress)
+            with local_embedder.after_each_pass(watch):
+                index = VectorStoreIndex(
+                    nodes=nodes,
+                    storage_context=storage_context,
+                    transformations=[node_parser],
+                    show_progress=False,
+                    # Local CPU model: one forward pass already uses every embedding
+                    # thread, so overlapping batches would only contend for cores.
+                    use_async=False,
+                )
 
             # Count the rows that actually landed in the vector table for this
             # file. The previous implementation read index.docstore.docs, which
@@ -5393,6 +5420,31 @@ def register_routes(app: FastAPI) -> None:
 
             logger.info("document_processed", doc_id=doc_id, filename=filename,
                         chunks=chunk_count, ocr=ocr_strategy, source_path=source_path)
+
+        except (indexing_budget.IndexingStopped, indexing_budget.TooLargeToIndex) as e:
+            # Ended between two embedding passes. Passages are stored in large
+            # batches, so some of this file's may already be in the search
+            # index: a stopped document keeps none.
+            too_large = isinstance(e, indexing_budget.TooLargeToIndex)
+            logger.warning("document_indexing_ended", doc_id=doc_id, filename=filename,
+                           reason="too_large" if too_large else "no_longer_wanted", detail=str(e))
+            with engine.connect() as c:
+                row = c.execute(
+                    sql_text("SELECT status FROM document_kb_documents WHERE id=:id"), {"id": doc_id}
+                ).fetchone()
+                # A row that is 'ready' was indexed again by a later job while
+                # this one ran: those passages are that job's and stay.
+                if file_id and (row is None or row[0] != "ready"):
+                    _delete_file_vectors(c, kb_id, file_id)
+                if too_large:
+                    c.execute(
+                        sql_text(
+                            "UPDATE document_kb_documents SET status='failed', error_message=:err, "
+                            "updated_at=NOW() WHERE id=:id AND status='processing'"
+                        ),
+                        {"err": str(e), "id": doc_id},
+                    )
+                c.commit()
 
         except Exception as e:
             import traceback

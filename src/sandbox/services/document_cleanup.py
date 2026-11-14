@@ -22,9 +22,11 @@ def vector_tables_for(kb_id: Any, table_names: Iterable[str]) -> List[str]:
 
     Exact names only: ``kb_1`` must not reach ``kb_12``. The names come from
     the catalog and are interpolated into SQL, so anything else is ignored.
+    A knowledge base has one table per embedding width (``_e<dim>``) and, under
+    it, one per chunk settings (``_c<tag>``, services/chunking.table_suffix).
     """
     kb = int(kb_id)
-    pattern = re.compile(rf"^data_llamaindex_kb_{kb}(?:_e\d+)?$")
+    pattern = re.compile(rf"^data_llamaindex_kb_{kb}(?:_e\d+)?(?:_c\d+)?$")
     return sorted({name for name in table_names if pattern.match(str(name))})
 
 

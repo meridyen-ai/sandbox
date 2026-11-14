@@ -19,7 +19,8 @@ import os
 import shutil
 import threading
 from collections import OrderedDict
-from typing import Any, List, Optional
+from contextlib import contextmanager
+from typing import Any, Callable, Iterator, List, Optional
 
 import structlog
 from llama_index.core.embeddings import BaseEmbedding
@@ -271,11 +272,30 @@ def warm() -> None:
         logger.warning("local_embedder_warm_failed", error=f"{type(e).__name__}: {e}")
 
 
+_after_pass = threading.local()
+
+
+@contextmanager
+def after_each_pass(hook: Callable[[int], None]) -> Iterator[None]:
+    """Inside the block, ``hook(passages)`` runs on this thread after every
+    ingestion pass. An exception from it ends the embedding: that is how a
+    document's job is stopped between passes (see indexing_budget)."""
+    _after_pass.hook = hook
+    try:
+        yield
+    finally:
+        _after_pass.hook = None
+
+
 def embed_texts(texts: List[str]) -> List[List[float]]:
     model = _get_model()
+    hook = getattr(_after_pass, "hook", None)
     out: List[List[float]] = []
     for i in range(0, len(texts), BATCH_SIZE):
-        out.extend(model.encode(texts[i:i + BATCH_SIZE]))
+        batch = texts[i:i + BATCH_SIZE]
+        out.extend(model.encode(batch))
+        if hook is not None:
+            hook(len(batch))
     return out
 
 
