@@ -224,6 +224,12 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
 # Entry point
 ENTRYPOINT ["python", "-m", "sandbox.main"]
 
+# Build stamp: the source commit this image was built from (read by scripts/release/live_vs_main.py).
+# Kept at the end of the stage that is run, so it never changes the cache of anything above it.
+ARG SOURCE_COMMIT=unknown
+LABEL org.opencontainers.image.revision="${SOURCE_COMMIT}" \
+      org.opencontainers.image.source="sandbox:apps/meridyen-sandbox"
+
 # -----------------------------------------------------------------------------
 # Stage 3: Development (optional)
 # -----------------------------------------------------------------------------

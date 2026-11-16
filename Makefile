@@ -70,7 +70,7 @@ rebuild-sandbox-full: build-ui
 	@echo "✅ Full rebuild done (compose: $(SANDBOX_COMPOSE)) — DB volume kept; use 'make clean' first to wipe DB data"
 
 build:
-	docker build -t meridyen/sandbox:latest .
+	docker build --build-arg SOURCE_COMMIT=$$(git rev-parse HEAD) -t meridyen/sandbox:latest .
 	@echo "✅ Build complete: meridyen/sandbox:latest"
 
 build-airgapped:
@@ -78,7 +78,7 @@ build-airgapped:
 	@echo "✅ Build complete: meridyen/sandbox-airgapped:latest"
 
 build-dev:
-	docker build --target development -t meridyen/sandbox:dev .
+	docker build --build-arg SOURCE_COMMIT=$$(git rev-parse HEAD) --target development -t meridyen/sandbox:dev .
 	@echo "✅ Development build complete: meridyen/sandbox:dev"
 
 push:
