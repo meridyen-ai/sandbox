@@ -54,6 +54,8 @@ from sandbox.services.schema_sql import (
 from sandbox.execution.python_executor import PythonExecutor
 from sandbox.services.document_cleanup import remove_stored_files, vector_tables_for
 from sandbox.services.legacy_documents import claim_legacy_knowledge_bases, link_legacy_files
+from sandbox.services.text_files import download_media_type as text_download_media_type
+from sandbox.services.text_files import is_text_file, viewer_text
 from sandbox.visualization.generator import VisualizationGenerator, ChartType
 
 logger = get_logger(__name__)
@@ -5924,6 +5926,9 @@ def register_routes(app: FastAPI) -> None:
             logger.error("video_transcode_failed", error=str(e.stderr[:500]) if e.stderr else "unknown")
             return src
 
+    # A text file the viewer gets re-encoded as UTF-8 (larger ones are sent as stored).
+    _VIEWER_TEXT_MAX_BYTES = 50 * 1024 * 1024
+
     _FILE_CONTENT_TYPES = {
         ".pdf": "application/pdf",
         ".txt": "text/plain; charset=utf-8",
@@ -5956,10 +5961,13 @@ def register_routes(app: FastAPI) -> None:
     def _serve_original_file(file_path):
         """The stored bytes exactly as uploaded, for a download: a Word file
         stays a Word file and a video keeps its own codec."""
-        return FileResponse(
-            path=str(file_path),
-            media_type=_FILE_CONTENT_TYPES.get(Path(file_path).suffix.lower(), "application/octet-stream"),
-        )
+        ext = Path(file_path).suffix.lower()
+        media_type = _FILE_CONTENT_TYPES.get(ext, "application/octet-stream")
+        if is_text_file(ext):
+            # The bytes stay as stored; the label names their real charset.
+            with open(file_path, "rb") as fh:
+                media_type = text_download_media_type(fh.read(8192), ext)
+        return FileResponse(path=str(file_path), media_type=media_type)
 
     def _serve_file_with_viewer_conversion(file_path, original_filename: str = ""):
         """
@@ -6037,8 +6045,18 @@ def register_routes(app: FastAPI) -> None:
                 logger.warning("docx_conversion_failed", error=str(e))
                 # Fall through to raw download
 
+        # Text: whatever encoding it was stored in (a SQL Server nvarchar
+        # column gives UTF-16), the viewer gets UTF-8 labelled as UTF-8.
+        if is_text_file(ext) and Path(file_path).stat().st_size <= _VIEWER_TEXT_MAX_BYTES:
+            body, text_type = viewer_text(Path(file_path).read_bytes(), ext)
+            return Response(content=body, media_type=text_type, headers={"Content-Disposition": "inline"})
+
         # Default: serve with correct MIME
         media_type = _FILE_CONTENT_TYPES.get(ext, "application/octet-stream")
+        if is_text_file(ext):
+            # Too big to re-encode in memory: label the bytes with their real charset.
+            with open(file_path, "rb") as fh:
+                media_type = text_download_media_type(fh.read(8192), ext)
 
         # For media files (video/audio) and large files, use FileResponse which
         # supports HTTP range requests natively — browsers need this to seek
